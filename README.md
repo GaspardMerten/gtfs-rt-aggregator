@@ -12,7 +12,7 @@ This project provides a pipeline for fetching, storing, and aggregating GTFS-RT 
 
 ## Requirements
 
-- Python 3.8+
+- Python 3.11+
 - Required Python packages (see requirements.txt):
   - requests
   - gtfs-realtime-bindings
