@@ -1,0 +1,29 @@
+# Test configuration file for the GTFS-RT pipeline
+
+# Storage configuration
+[storage]
+type = "filesystem"
+params = { base_dir = "./test_data" }
+
+# Provider configuration
+[[providers]]
+name = "test_provider"
+timezone = "UTC"
+
+[[providers.apis]]
+url = "http://localhost:8788/vehicle_positions"
+refresh_seconds = 60
+services = ["VehiclePosition"]
+frequency_minutes = 15
+
+[[providers.apis]]
+url = "http://localhost:8788/trip_updates"
+refresh_seconds = 60
+services = ["TripUpdate"]
+frequency_minutes = 15
+
+[[providers.apis]]
+url = "http://localhost:8788/alerts"
+refresh_seconds = 60
+services = ["Alert"]
+frequency_minutes = 15 
