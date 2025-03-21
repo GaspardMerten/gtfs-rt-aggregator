@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=42", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gtfs_rt_aggregator"
+version = "0.1.0"
+description = "GTFS-RT Fetcher and Aggregator to Parquet format"
+readme = "README.md"
+authors = [
+    { name = "Gaspard Merten", email = "gaspard@norse.be" },
+]
+license  = "MIT"
+license-files = ["LICENSE"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: OS Independent",
+]
+requires-python = ">=3.8"
+dependencies = [
+    "pandas>=2.0.0",
+    "pyarrow>=14.0.0",
+    "protobuf>=4.25.0",
+    "pytz>=2023.3",
+    "schedule>=1.2.0",
+    "requests>=2.31.0",
+    "pydantic>=2.5.0",
+    "google-cloud-storage>=2.13.0",
+    "gtfs-realtime-bindings",
+    "minio"
+]
+
+[project.urls]
+"Homepage" = "https://github.com/yourusername/gtfs_rt_aggregator"
+"Bug Tracker" = "https://github.com/yourusername/gtfs_rt_aggregator/issues"
+
+
+[project.scripts]
+gtfs-rt-pipeline = "gtfs_rt_aggregator.utils.cli:main"

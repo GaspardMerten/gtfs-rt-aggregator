@@ -1,0 +1,8 @@
+requests
+gtfs-realtime-bindings
+pandas
+pyarrow
+schedule
+pydantic
+google-cloud-storage
+minio
