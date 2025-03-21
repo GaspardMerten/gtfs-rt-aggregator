@@ -29,7 +29,7 @@ jobs:
         python -m pip install --upgrade pip
         python -m pip install flake8
         if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-    
+        
     - name: Run unittests
       run: |
-        PYTHONPATH=$(pwd) python -m unittest discover -s tests -t .
+        PYTHONPATH=$(pwd)/src python -m unittest discover -s tests -t $(pwd)
