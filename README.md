@@ -73,6 +73,33 @@ timezone = "Europe/Amsterdam"
   refresh_seconds = 20  # Fetch every 20 seconds
 ```
 
+### Storage Backend Examples
+
+#### Google Cloud Storage
+
+```toml
+[storage]
+type = "gcs"
+[storage.params]
+bucket_name = "my-gtfs-bucket"
+base_path = "gtfs-data"  # Optional: subfolder within the bucket
+# Authentication is handled via the GOOGLE_APPLICATION_CREDENTIALS environment variable
+```
+
+#### MinIO Storage
+
+```toml
+[storage]
+type = "minio"
+[storage.params]
+endpoint = "minio.example.com:9000"
+access_key = "YOUR_ACCESS_KEY"
+secret_key = "YOUR_SECRET_KEY"
+bucket_name = "gtfs-data"
+secure = true  # Use HTTPS
+base_path = "gtfs-feeds"  # Optional: subfolder within the bucket
+```
+
 ### Configuration Options
 
 - **storage**: Global storage configuration

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "gtfs_rt_aggregator"
-version = "0.1.0"
+version = "0.1.1"
 description = "GTFS-RT Fetcher and Aggregator to Parquet format"
 readme = "README.md"
 authors = [
