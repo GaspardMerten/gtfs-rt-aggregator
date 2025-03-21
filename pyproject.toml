@@ -31,8 +31,8 @@ dependencies = [
 ]
 
 [project.urls]
-"Homepage" = "https://github.com/yourusername/gtfs_rt_aggregator"
-"Bug Tracker" = "https://github.com/yourusername/gtfs_rt_aggregator/issues"
+"Homepage" = "https://github.com/GaspardMerten/gtfs-rt-aggregator"
+"Bug Tracker" = "https://github.com/GaspardMerten/gtfs-rt-aggregator/issues"
 
 
 [project.scripts]
