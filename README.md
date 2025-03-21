@@ -26,7 +26,7 @@ Realtime) data from multiple providers.
 1. Clone this repository:
    ```
    git clone <repository-url>
-   cd gtfs-rt-pipeline
+   cd gtfs-rt-aggregator
    ```
 
 2. Install the required dependencies:
