@@ -1,10 +1,9 @@
 """Integration test for the full GTFS-RT pipeline."""
 
-import time
-import unittest
 import logging
+import unittest
 from datetime import datetime, timedelta
-from io import BytesIO, StringIO
+from io import BytesIO
 from unittest.mock import patch, MagicMock
 
 import pandas as pd
@@ -181,9 +180,12 @@ class TestFullPipeline(unittest.TestCase):
         Test the GtfsRtPipeline class that orchestrates the entire flow.
         """
         # Mock the storage factory and scheduler
-        with patch("src.gtfs_rt_aggregator.storage.create_storage") as mock_create, patch(
-            "src.gtfs_rt_aggregator.utils.scheduler.SchedulerClass"
-        ) as mock_scheduler_class:
+        with (
+            patch("src.gtfs_rt_aggregator.storage.create_storage") as mock_create,
+            patch(
+                "src.gtfs_rt_aggregator.utils.scheduler.SchedulerClass"
+            ) as mock_scheduler_class,
+        ):
 
             # Configure storage mock
             mock_create.return_value = self.storage

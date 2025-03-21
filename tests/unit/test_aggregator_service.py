@@ -96,11 +96,10 @@ class TestAggregatorService(unittest.TestCase):
         )
 
         # Mock _group_files_by_time and _aggregate_files to avoid actual processing
-        with patch.object(
-            self.aggregator, "_group_files_by_time"
-        ) as mock_group, patch.object(
-            self.aggregator, "_aggregate_files"
-        ) as mock_aggregate:
+        with (
+            patch.object(self.aggregator, "_group_files_by_time") as mock_group,
+            patch.object(self.aggregator, "_aggregate_files") as mock_aggregate,
+        ):
 
             # Set up the mock to return a dictionary with one timestamp and 5 files
             fake_timestamp = base_time
