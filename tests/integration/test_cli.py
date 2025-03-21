@@ -37,7 +37,7 @@ class TestCli(unittest.TestCase):
     @staticmethod
     def _update_test_config_port(port):
         """Update the test config file to use the actual port."""
-        config_path = os.path.join("data", "test_config.toml")
+        config_path = os.path.join("tests", "data", "test_config.toml")
         with open(config_path, "r") as f:
             content = f.read()
 
@@ -55,7 +55,7 @@ class TestCli(unittest.TestCase):
     @staticmethod
     def _restore_test_config():
         """Restore the original test config file."""
-        config_path = os.path.join("data", "test_config.toml")
+        config_path = os.path.join("tests", "data", "test_config.toml")
         original_path = config_path + ".original"
 
         if os.path.exists(original_path):
@@ -73,7 +73,7 @@ class TestCli(unittest.TestCase):
         # Mock sys.argv
         test_args = [
             "gtfs_rt_aggregator",
-            "data/test_config.toml",
+            "tests/data/test_config.toml",
             "--log-level",
             "DEBUG",
         ]
@@ -134,7 +134,7 @@ class TestCli(unittest.TestCase):
         mock_pipeline_class.return_value = mock_pipeline
 
         # Mock sys.argv
-        test_args = ["gtfs_rt_aggregator", "data/test_config.toml"]
+        test_args = ["gtfs_rt_aggregator", "tests/data/test_config.toml"]
         with patch.object(sys, "argv", test_args):
             # Run the CLI
             main()
