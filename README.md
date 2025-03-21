@@ -1,59 +1,48 @@
-# GTFS-RT Aggregator
+# GTFS-RT Pipeline
 
-This project provides a pipeline for fetching, storing, and aggregating GTFS-RT (General Transit Feed Specification - Realtime) data from multiple providers into Parquet format.
+This project provides a pipeline for fetching, storing, and aggregating GTFS-RT (General Transit Feed Specification -
+Realtime) data from multiple providers.
 
 ## Features
 
 - Fetch GTFS-RT data from multiple providers and APIs
-- Store individual data files in Parquet format with multiple storage backends (filesystem, Google Cloud Storage, MinIO)
+- Store individual data files in Parquet format
 - Aggregate data files based on configurable time intervals
-- Run fetcher and aggregator services in parallel
+- Run multiple fetchers in parallel using separate processes
 - Configurable via a single TOML configuration file
 
 ## Requirements
 
-- Python 3.8+
-- Required Python packages (see requirements.txt):
-  - requests
-  - gtfs-realtime-bindings
+- Python 3.7+
+- Required Python packages:
   - pandas
-  - pyarrow
-  - schedule
-  - pydantic
-  - google-cloud-storage (optional, for GCS storage)
-  - minio (optional, for MinIO storage)
+  - pytz
+  - requests
+  - protobuf
+  - toml
 
 ## Installation
 
-### From PyPI (recommended)
-
-```bash
-pip install gtfs-rt-aggregator
-```
-
-### From Source
-
 1. Clone this repository:
-   ```bash
+   ```
    git clone <repository-url>
-   cd GTFS-GTFS-RT-is-better-in-parquet
+   cd gtfs-rt-pipeline
    ```
 
-2. Install in development mode:
-   ```bash
-   pip install -e .
+2. Install the required dependencies:
+   ```
+   pip install pandas pytz requests protobuf toml
    ```
 
 ## Configuration
 
-The pipeline is configured using a TOML configuration file. Here's an example:
+The pipeline is configured using a `configuration.toml` file. Here's an example:
 
 ```toml
-# GTFS-RT Configuration File
-[storage]
-type = "filesystem"  # Options: "filesystem", "gcs", or "minio"
-[storage.params]
-base_directory = "data"  # Base directory for filesystem storage
+# Aggregation settings
+[aggregation]
+frequency_minutes = 15  # Group files in 15-minute intervals
+check_interval_seconds = 300  # Check for new files every 5 minutes
 
 # Provider configurations
 [[providers]]
@@ -64,110 +53,58 @@ timezone = "Europe/Amsterdam"
   url = "https://gtfs.ovapi.nl/nl/vehiclePositions.pb"
   services = ["VehiclePosition"]
   refresh_seconds = 20  # Fetch every 20 seconds
-  frequency_minutes = 60  # Group files in 60-minute intervals
-  check_interval_seconds = 300  # Check for new files every 5 minutes
 
   [[providers.apis]]
   url = "https://gtfs.ovapi.nl/nl/tripUpdates.pb"
   services = ["TripUpdate"]
-  refresh_seconds = 20  # Fetch every 20 seconds
-```
-
-### Storage Backend Examples
-
-#### Google Cloud Storage
-
-```toml
-[storage]
-type = "gcs"
-[storage.params]
-bucket_name = "my-gtfs-bucket"
-base_path = "gtfs-data"  # Optional: subfolder within the bucket
-# Authentication is handled via the GOOGLE_APPLICATION_CREDENTIALS environment variable
-```
-
-#### MinIO Storage
-
-```toml
-[storage]
-type = "minio"
-[storage.params]
-endpoint = "minio.example.com:9000"
-access_key = "YOUR_ACCESS_KEY"
-secret_key = "YOUR_SECRET_KEY"
-bucket_name = "gtfs-data"
-secure = true  # Use HTTPS
-base_path = "gtfs-feeds"  # Optional: subfolder within the bucket
+  refresh_seconds = 30  # Fetch every 30 seconds
 ```
 
 ### Configuration Options
 
-- **storage**: Global storage configuration
-  - **type**: Storage backend type ("filesystem", "gcs", or "minio")
-  - **params**: Backend-specific parameters
+- **aggregation**: Settings for the aggregation process
+  - **frequency_minutes**: The time interval (in minutes) for grouping files
+  - **check_interval_seconds**: How often to check for new files to aggregate
 
 - **providers**: List of GTFS-RT data providers
   - **name**: Name of the provider (used for directory structure)
   - **timezone**: Timezone for the provider's data
   - **apis**: List of API endpoints for this provider
     - **url**: URL of the GTFS-RT feed
-    - **services**: List of service types to extract from the feed (VehiclePosition, TripUpdate, Alert)
+    - **services**: List of service types to extract from the feed (VehiclePosition, TripUpdate, Alert,
+      TripModifications)
     - **refresh_seconds**: How often to fetch data from this API
-    - **frequency_minutes**: The time interval (in minutes) for grouping files
-    - **check_interval_seconds**: How often to check for new files to aggregate
 
 ## Usage
 
-### Command Line
-
-Run the pipeline with a configuration file:
-
-```bash
-gtfs-rt-pipeline configuration.toml
-```
-
-You can adjust the logging level with the `--log-level` parameter:
-
-```bash
-gtfs-rt-pipeline configuration.toml --log-level DEBUG
-```
-
-### Programmatic Usage
-
-```python
-from gtfs_rt_aggregator import run_pipeline_from_toml
-
-# Run pipeline from a TOML file
-run_pipeline_from_toml("configuration.toml")
-```
-
-Or with a configuration object:
-
-```python
-from gtfs_rt_aggregator.config.loader import load_config_from_toml
-from gtfs_rt_aggregator import run_pipeline
-
-# Load configuration
-config = load_config_from_toml("configuration.toml")
-
-# Run pipeline
-run_pipeline(config)
-```
-
-## Project Structure
+Run the main script to start the pipeline:
 
 ```
-src/gtfs_rt_aggregator/
-  ├── __init__.py                # Package initialization
-  ├── pipeline.py                # Main pipeline implementation
-  ├── aggregator/                # Aggregation functionality
-  ├── config/                    # Configuration loading and validation
-  ├── fetcher/                   # GTFS-RT data fetching functionality
-  ├── storage/                   # Storage backend implementations
-  └── utils/                     # Utility functions and helpers
-      ├── cli.py                 # Command-line interface
-      └── ...
+python run_gtfs_rt_pipeline.py
 ```
+
+This will start both the fetcher and aggregator processes. The fetcher will continuously fetch data from the configured
+APIs, and the aggregator will group the files based on the configured time intervals.
+
+## File Structure
+
+The pipeline creates the following directory structure:
+
+```
+<provider_name>/
+  ├── <service_type>/
+  │   ├── individual_YYYY-MM-DD_HH-MM-SS.parquet  # Individual data files
+  │   ├── processed_files.txt                     # List of processed files
+  │   └── grouped/
+  │       └── grouped_YYYY-MM-DD_HH-MM.parquet    # Grouped data files
+  └── ...
+```
+
+## Scripts
+
+- **run_gtfs_rt_pipeline.py**: Main script to run the entire pipeline
+- **gtfs_rt_fetcher.py**: Script to fetch GTFS-RT data from providers
+- **gtfs_rt_aggregator.py**: Script to aggregate individual files based on time intervals
 
 ## License
 
