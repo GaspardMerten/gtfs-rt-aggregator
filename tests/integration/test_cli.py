@@ -67,7 +67,7 @@ class TestCli(unittest.TestCase):
 
             os.remove(original_path)
 
-    @patch("gtfs_rt_aggregator.pipeline.run_pipeline")
+    @patch("src.gtfs_rt_aggregator.pipeline.run_pipeline")
     def test_cli_with_valid_config(self, mock_run_pipeline):
         """Test the CLI with a valid configuration file."""
         # Mock sys.argv
@@ -126,7 +126,7 @@ class TestCli(unittest.TestCase):
             f"Expected error message, got: {error_message}",
         )
 
-    @patch("gtfs_rt_aggregator.pipeline.GtfsRtPipeline")
+    @patch("src.gtfs_rt_aggregator.pipeline.GtfsRtPipeline")
     def test_cli_pipeline_creation(self, mock_pipeline_class):
         """Test that the CLI creates and starts the pipeline."""
         # Create a mock pipeline instance

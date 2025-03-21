@@ -1,11 +1,11 @@
 from typing import Dict, Type
 
-from gtfs_rt_aggregator.config.models import StorageConfig
-from gtfs_rt_aggregator.storage.base import StorageInterface
-from gtfs_rt_aggregator.storage.filesystem import FileSystemStorage
-from gtfs_rt_aggregator.storage.gcs import GoogleCloudStorage
-from gtfs_rt_aggregator.storage.minio import MinioStorage
-from gtfs_rt_aggregator.utils.log_helper import setup_logger
+from ..config.models import StorageConfig
+from ..storage.base import StorageInterface
+from ..storage.filesystem import FileSystemStorage
+from ..storage.gcs import GoogleCloudStorage
+from ..storage.minio import MinioStorage
+from ..utils.log_helper import setup_logger
 
 logger = setup_logger(__name__)
 

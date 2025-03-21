@@ -1,12 +1,12 @@
-from gtfs_rt_aggregator.storage.base import StorageInterface
-from gtfs_rt_aggregator.storage.factory import (
+from ..storage.base import StorageInterface
+from ..storage.factory import (
     StorageFactory,
     create_storage_from_config,
 )
-from gtfs_rt_aggregator.storage.filesystem import FileSystemStorage
-from gtfs_rt_aggregator.storage.gcs import GoogleCloudStorage
-from gtfs_rt_aggregator.storage.minio import MinioStorage
-from gtfs_rt_aggregator.utils.log_helper import setup_logger
+from ..storage.filesystem import FileSystemStorage
+from ..storage.gcs import GoogleCloudStorage
+from ..storage.minio import MinioStorage
+from ..utils.log_helper import setup_logger
 
 __all__ = [
     "StorageInterface",

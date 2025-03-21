@@ -181,8 +181,8 @@ class TestFullPipeline(unittest.TestCase):
         Test the GtfsRtPipeline class that orchestrates the entire flow.
         """
         # Mock the storage factory and scheduler
-        with patch("gtfs_rt_aggregator.storage.create_storage") as mock_create, patch(
-            "gtfs_rt_aggregator.utils.scheduler.SchedulerClass"
+        with patch("src.gtfs_rt_aggregator.storage.create_storage") as mock_create, patch(
+            "src.gtfs_rt_aggregator.utils.scheduler.SchedulerClass"
         ) as mock_scheduler_class:
 
             # Configure storage mock

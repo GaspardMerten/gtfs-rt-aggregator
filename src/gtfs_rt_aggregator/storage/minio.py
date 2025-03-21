@@ -6,7 +6,7 @@ from minio import Minio
 from minio.commonconfig import CopySource
 from minio.error import S3Error
 
-from gtfs_rt_aggregator.storage.base import StorageInterface
+from ..storage.base import StorageInterface
 
 
 class MinioStorage(StorageInterface):

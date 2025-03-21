@@ -1,7 +1,7 @@
 from abc import ABC, abstractmethod
 from typing import List, Optional
 
-from gtfs_rt_aggregator.utils.log_helper import setup_logger
+from ..utils.log_helper import setup_logger
 
 
 class StorageInterface(ABC):

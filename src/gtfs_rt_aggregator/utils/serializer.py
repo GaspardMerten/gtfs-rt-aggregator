@@ -4,7 +4,7 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from gtfs_rt_aggregator.utils.log_helper import setup_logger
+from ..utils.log_helper import setup_logger
 
 
 class ParquetSerializer:

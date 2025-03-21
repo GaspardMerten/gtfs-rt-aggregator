@@ -1,14 +1,14 @@
 from pathlib import Path
 from typing import Union, Dict, Optional
 
-from gtfs_rt_aggregator.aggregator.service import AggregatorService
-from gtfs_rt_aggregator.config.loader import load_config_from_toml
-from gtfs_rt_aggregator.config.models import GtfsRtConfig
-from gtfs_rt_aggregator.fetcher.service import FetcherService
-from gtfs_rt_aggregator.storage import create_storage
-from gtfs_rt_aggregator.storage.base import StorageInterface
-from gtfs_rt_aggregator.utils.log_helper import setup_logger
-from gtfs_rt_aggregator.utils.scheduler import SchedulerClass
+from .aggregator.service import AggregatorService
+from .config.loader import load_config_from_toml
+from .config.models import GtfsRtConfig
+from .fetcher.service import FetcherService
+from .storage import create_storage
+from .storage.base import StorageInterface
+from .utils.log_helper import setup_logger
+from .utils.scheduler import SchedulerClass
 
 
 class GtfsRtPipeline:

@@ -5,7 +5,7 @@ from typing import List, Tuple, Callable, Dict, Any
 
 import schedule
 
-from gtfs_rt_aggregator.utils import setup_logger
+from ..utils import setup_logger
 
 
 class SchedulerClass:

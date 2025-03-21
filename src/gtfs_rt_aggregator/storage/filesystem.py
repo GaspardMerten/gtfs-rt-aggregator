@@ -3,7 +3,7 @@ import os
 from pathlib import Path
 from typing import List, Optional
 
-from gtfs_rt_aggregator.storage.base import StorageInterface
+from ..storage.base import StorageInterface
 
 
 class FileSystemStorage(StorageInterface):

@@ -4,7 +4,7 @@ from typing import List, Optional
 
 from google.cloud import storage
 
-from gtfs_rt_aggregator.storage.base import StorageInterface
+from ..storage.base import StorageInterface
 
 
 class GoogleCloudStorage(StorageInterface):

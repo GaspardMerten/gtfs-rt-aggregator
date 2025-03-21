@@ -9,7 +9,7 @@ import requests
 from google.protobuf.json_format import MessageToDict
 from google.transit import gtfs_realtime_pb2
 
-from gtfs_rt_aggregator.utils.log_helper import setup_logger
+from ..utils.log_helper import setup_logger
 
 # Constants for GTFS-RT entity types and keys in the dictionary extracted from the feed
 VEHICLE_POSITIONS = "VehiclePosition", "vehicle"

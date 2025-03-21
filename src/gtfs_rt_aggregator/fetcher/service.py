@@ -3,11 +3,11 @@ from typing import Dict, List, Any, Tuple
 
 import pytz
 
-from gtfs_rt_aggregator.config.models import GtfsRtConfig
-from gtfs_rt_aggregator.fetcher.gtfs_rt import GtfsRtFetcher
-from gtfs_rt_aggregator.storage.base import StorageInterface
-from gtfs_rt_aggregator.utils.log_helper import setup_logger
-from gtfs_rt_aggregator.utils.serializer import ParquetSerializer
+from ..config.models import GtfsRtConfig
+from ..fetcher.gtfs_rt import GtfsRtFetcher
+from ..storage.base import StorageInterface
+from ..utils.log_helper import setup_logger
+from ..utils.serializer import ParquetSerializer
 
 
 class FetcherService:

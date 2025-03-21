@@ -2,13 +2,13 @@ import tomllib
 from pathlib import Path
 from typing import Dict, Any, Union, BinaryIO
 
-from gtfs_rt_aggregator.config.models import (
+from ..config.models import (
     GtfsRtConfig,
     StorageConfig,
     ProviderConfig,
     ApiConfig,
 )
-from gtfs_rt_aggregator.utils.log_helper import setup_logger
+from ..utils.log_helper import setup_logger
 
 logger = setup_logger(__name__)
 

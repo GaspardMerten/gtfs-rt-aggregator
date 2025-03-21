@@ -1,6 +1,6 @@
 """GTFS-RT fetcher module for the GTFS-RT Aggregator package."""
 
-from gtfs_rt_aggregator.fetcher.gtfs_rt import (
+from ..fetcher.gtfs_rt import (
     GtfsRtFetcher,
     GtfsRtError,
     GtfsRtFetchError,

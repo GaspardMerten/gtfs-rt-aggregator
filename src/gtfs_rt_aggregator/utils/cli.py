@@ -1,7 +1,7 @@
 import argparse
 import logging
 
-from gtfs_rt_aggregator import run_pipeline_from_toml
+from ..pipeline import run_pipeline_from_toml
 
 
 def main():

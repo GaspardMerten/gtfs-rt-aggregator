@@ -6,10 +6,10 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytz
 
-from gtfs_rt_aggregator.config.models import GtfsRtConfig
-from gtfs_rt_aggregator.storage.base import StorageInterface
-from gtfs_rt_aggregator.utils.log_helper import setup_logger
-from gtfs_rt_aggregator.utils.serializer import ParquetSerializer
+from ..config.models import GtfsRtConfig
+from ..storage.base import StorageInterface
+from ..utils.log_helper import setup_logger
+from ..utils.serializer import ParquetSerializer
 
 
 class AggregatorService:
