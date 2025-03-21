@@ -8,7 +8,7 @@ import time
 from pathlib import Path
 from typing import List, Optional
 
-from gtfs_rt_aggregator.storage.base import StorageInterface
+from src.gtfs_rt_aggregator.storage.base import StorageInterface
 
 
 class MockStorageInterface(StorageInterface):

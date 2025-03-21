@@ -6,7 +6,7 @@ import unittest
 from io import StringIO
 from unittest.mock import patch, MagicMock
 
-from gtfs_rt_aggregator.utils.cli import main
+from src.gtfs_rt_aggregator.utils.cli import main
 from tests.mocks import MockServerManager
 
 

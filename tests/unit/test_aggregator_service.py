@@ -4,8 +4,8 @@ from unittest.mock import patch
 
 import pytz
 
-from gtfs_rt_aggregator.aggregator.service import AggregatorService
-from gtfs_rt_aggregator.config.models import (
+from src.gtfs_rt_aggregator.aggregator.service import AggregatorService
+from src.gtfs_rt_aggregator.config.models import (
     GtfsRtConfig,
     ProviderConfig,
     ApiConfig,

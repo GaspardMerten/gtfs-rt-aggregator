@@ -4,13 +4,13 @@ from io import BytesIO
 
 import pandas as pd
 
-from gtfs_rt_aggregator.config.models import (
+from src.gtfs_rt_aggregator.config.models import (
     GtfsRtConfig,
     ProviderConfig,
     ApiConfig,
     StorageConfig,
 )
-from gtfs_rt_aggregator.fetcher.service import FetcherService
+from src.gtfs_rt_aggregator.fetcher.service import FetcherService
 from tests.mocks import MockStorageInterface, MockServerManager
 
 # Start with a base port, but the actual port may change

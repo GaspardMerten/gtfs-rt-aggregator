@@ -10,15 +10,15 @@ from unittest.mock import patch, MagicMock
 import pandas as pd
 import pytz
 
-from gtfs_rt_aggregator.aggregator.service import AggregatorService
-from gtfs_rt_aggregator.config.models import (
+from src.gtfs_rt_aggregator.aggregator.service import AggregatorService
+from src.gtfs_rt_aggregator.config.models import (
     GtfsRtConfig,
     ProviderConfig,
     ApiConfig,
     StorageConfig,
 )
-from gtfs_rt_aggregator.fetcher.service import FetcherService
-from gtfs_rt_aggregator.pipeline import GtfsRtPipeline
+from src.gtfs_rt_aggregator.fetcher.service import FetcherService
+from src.gtfs_rt_aggregator.pipeline import GtfsRtPipeline
 from tests.mocks import MockStorageInterface, MockServerManager
 
 
