@@ -1,0 +1,23 @@
+# Usual gitignore for python
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+*.pyz
+
+.env
+.venv
+
+data/
+
+configuration.toml
+
+*.log
+
+tests/test_provider
+
+src/gtfs_rt_aggregator.egg-info
+
+dist
+
+build

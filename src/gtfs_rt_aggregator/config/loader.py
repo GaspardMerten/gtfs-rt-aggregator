@@ -6,7 +6,7 @@ from ..config.models import (
     GtfsRtConfig,
     StorageConfig,
     ProviderConfig,
-    ApiConfig,
+    ApiConfig, OutputConfig,
 )
 from ..utils.log_helper import setup_logger
 
@@ -84,6 +84,15 @@ def _convert_toml_to_config(config_dict: Dict[str, Any]) -> GtfsRtConfig:
 
     logger.debug(f"Global storage configuration: type={storage_type}")
     storage_config = StorageConfig(type=storage_type, params=storage_params)
+
+    # Extract output format configuration
+    output_dict = config_dict.get("output", {})
+    output_filename_format = output_dict.get("filename_format", "{group_time}_to_{next_period}.parquet")
+    output_time_format = output_dict.get("time_format", "%H-%M-%S")
+
+    logger.debug(f"Output configuration: filename_format={output_filename_format}, time_format={output_time_format}")
+
+    output_config = OutputConfig(filename_format=output_filename_format, time_format=output_time_format)
 
     # Extract provider configurations
     providers_list = config_dict.get("providers", [])
@@ -186,35 +195,4 @@ def _convert_toml_to_config(config_dict: Dict[str, Any]) -> GtfsRtConfig:
 
     # Create the config
     logger.info(f"Successfully created configuration with {len(providers)} providers")
-    return GtfsRtConfig(storage=storage_config, providers=providers)
-
-
-def create_default_config() -> GtfsRtConfig:
-    """
-    Create a default configuration.
-
-    @return Default GtfsRtConfig object
-    """
-    logger.info("Creating default configuration")
-
-    # Create default storage
-    storage = StorageConfig(type="filesystem", params={"base_directory": "data"})
-
-    # Create a default provider
-    provider = ProviderConfig(
-        name="default",
-        timezone="UTC",
-        apis=[
-            ApiConfig(
-                url="https://example.com/gtfs-rt",
-                services=["VehiclePosition", "TripUpdate", "Alert"],
-                refresh_seconds=60,
-                frequency_minutes=60,
-                check_interval_seconds=300,
-            )
-        ],
-    )
-
-    # Create the config
-    logger.info("Created default configuration with 1 provider")
-    return GtfsRtConfig(storage=storage, providers=[provider])
+    return GtfsRtConfig(storage=storage_config, providers=providers, output=output_config)

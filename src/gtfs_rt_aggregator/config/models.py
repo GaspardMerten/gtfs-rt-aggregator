@@ -149,14 +149,28 @@ class ProviderConfig(BaseModel):
             pytz.timezone(v)
         except Exception as e:
             raise ValueError(f"Invalid timezone: {v}. {str(e)}")
-        return v
 
+
+class OutputConfig(BaseModel):
+    filename_format: str = Field(
+        "{group_time}_to_{next_period}.parquet",
+        description="Filename format for output files",
+    )
+
+    time_format: str = Field(
+        "%H-%M-%S",
+        description="Time format for filename timestamps",
+    )
 
 class GtfsRtConfig(BaseModel):
     """Main configuration for the GTFS-RT fetcher and aggregator."""
 
     storage: StorageConfig = Field(..., description="Global storage configuration")
     providers: List[ProviderConfig] = Field(..., description="List of providers")
+    output: OutputConfig = Field(OutputConfig(
+        filename_format="{group_time}_to_{next_period}.parquet",
+        time_format="%H-%M-%S"
+    ), description="Output configuration")
 
     @classmethod
     @field_validator("providers")

@@ -202,6 +202,7 @@ class AggregatorService:
                 service_type=service_type,
                 files=group_files,
                 group_time=group_time,
+                next_period=next_period,
                 storage=storage,
                 logger=logger,
             )
@@ -257,6 +258,7 @@ class AggregatorService:
         service_type: str,
         files: List[str],
         group_time: datetime,
+            next_period: datetime,
         storage: StorageInterface,
         logger=None,
     ):
@@ -315,9 +317,13 @@ class AggregatorService:
             parquet_bytes = ParquetSerializer.pyarrow_table_to_bytes(table)
 
             # Create path for the grouped file
-            filename = f"{group_time.strftime('%H-%M')}.parquet"
-            day = group_time.strftime("%Y-%m-%d")
-            path = f"{provider_name}/{service_type}/{day}/{filename}"
+            group_time_str = group_time.strftime(self.config.output.time_format)
+            next_period_str = next_period.strftime(self.config.output.time_format)
+            day_str = group_time.strftime("%Y-%m-%d")
+            filename = self.config.output.filename_format.format(
+                group_time=group_time_str, next_period=next_period_str
+            )
+            path = f"{provider_name}/{service_type}/{day_str}/{filename}"
 
             # Save to storage
             logger.debug(f"Saving grouped file to {path}")
