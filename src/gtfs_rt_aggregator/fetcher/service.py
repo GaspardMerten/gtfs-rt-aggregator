@@ -102,16 +102,15 @@ class FetcherService:
                         f"Service type {service_type} not in service types {service_types}"
                     )
                     continue
-                if df.empty:
-                    job_logger.debug(f"No data for service type {service_type}")
-                    continue
 
                 job_logger.debug(
                     f"Processing {len(df)} records for service type {service_type}"
                 )
 
                 # Convert to Parquet bytes
-                parquet_bytes = ParquetSerializer.dataframe_to_parquet_bytes(df)
+                parquet_bytes = ParquetSerializer.pyarrow_table_to_bytes(
+                    df, compression="snappy"
+                )
 
                 # Create path
                 filename = (

@@ -2,27 +2,71 @@ from collections import defaultdict
 from datetime import datetime
 from typing import Dict, List, Any
 
-import pandas as pd
+import pyarrow as pa
 import pytz
 import requests
 from google.protobuf.json_format import MessageToDict
 from google.transit import gtfs_realtime_pb2
 
+from ..schema.alert import alert_schema
+from ..schema.shape import shape_schema
+from ..schema.stop import stop_schema
+from ..schema.trip_update import trip_update_schema
+from ..schema.vehicle_position import vehicle_position_schema
 from ..utils import setup_logger
 
-# Constants for GTFS-RT entity types and keys in the dictionary extracted from the feed
-VEHICLE_POSITIONS = "VehiclePosition", 'vehicle'
-TRIP_UPDATE = "TripUpdate", 'tripUpdate'
-ALERT = "Alert", 'alert'
-TRIP_MODIFICATIONS = "TripModifications", 'tripModifications'
+VEHICLE_POSITIONS = "VehiclePosition", "vehicle", vehicle_position_schema
+TRIP_UPDATE = "TripUpdate", "tripUpdate", trip_update_schema
+ALERT = ("Alert", "alert", alert_schema)
+SHAPE = "Shape", "shape", shape_schema
+STOP = "Stop", "stop", stop_schema
+TRIP_MODIFICATIONS = "TripModifications", "tripModifications", trip_update_schema
 
-SERVICE_TYPES = [VEHICLE_POSITIONS, TRIP_UPDATE, ALERT, TRIP_MODIFICATIONS]
+SERVICE_TYPES = [VEHICLE_POSITIONS, TRIP_UPDATE, ALERT, TRIP_MODIFICATIONS, SHAPE, STOP]
+SERVICE_TYPE_TO_SCHEMA = {x[0]: x[2] for x in SERVICE_TYPES}
 
 
 class GtfsRtFetcher:
     """Class for fetching and parsing GTFS-RT data."""
 
     logger = setup_logger(f"{__name__}.GtfsRtFetcher")
+
+    @staticmethod
+    def parse_int(value):
+        if value is None:
+            return None
+
+        try:
+            return int(value)
+        except ValueError:
+            return None
+
+    @staticmethod
+    def convert_timestamp_to_int(entity, service):
+        if service == VEHICLE_POSITIONS[0]:
+            entity["timestamp"] = GtfsRtFetcher.parse_int(entity.get("timestamp"))
+        elif service == TRIP_UPDATE[0]:
+            entity["timestamp"] = GtfsRtFetcher.parse_int(entity.get("timestamp"))
+            for stop_time_update in entity.get("stopTimeUpdate", []):
+                if "arrival" in stop_time_update:
+                    stop_time_update["arrival"]["time"] = GtfsRtFetcher.parse_int(
+                        stop_time_update["arrival"].get("time")
+                    )
+                if "departure" in stop_time_update:
+                    stop_time_update["departure"]["time"] = GtfsRtFetcher.parse_int(
+                        stop_time_update["departure"].get("time")
+                    )
+        elif service == ALERT[0]:
+            if "activePeriod" in entity:
+                for active_period in entity["activePeriod"]:
+                    active_period["start"] = GtfsRtFetcher.parse_int(
+                        active_period.get("start")
+                    )
+                    active_period["end"] = GtfsRtFetcher.parse_int(
+                        active_period.get("end")
+                    )
+
+        return entity
 
     @staticmethod
     def fetch_feed(url: str) -> bytes:
@@ -66,25 +110,31 @@ class GtfsRtFetcher:
             feed_dict = MessageToDict(feed)
 
             # Extract entities
-            entities = feed_dict.get('entity', [])
+            entities = feed_dict.get("entity", [])
             logger.debug(f"Found {len(entities)} entities in feed")
 
             # Group by entity type
             result = defaultdict(list)
 
             for entity in entities:
-                entity_id = entity.get('id')
+                entity_id = entity.get("id")
 
-                for (service_name, service_key) in [VEHICLE_POSITIONS, TRIP_UPDATE, ALERT, TRIP_MODIFICATIONS]:
+                for service_name, service_key, schema in SERVICE_TYPES:
                     if service_key in entity:
-                        result[service_name].append({
-                            'entity_id': entity_id,
-                            **entity[service_key]
-                        })
+                        result[service_name].append(
+                            {
+                                "entityId": entity_id,
+                                **GtfsRtFetcher.convert_timestamp_to_int(
+                                    entity[service_key], service_name
+                                ),
+                            }
+                        )
 
             # Log counts by service type
             for service_name, entities_list in result.items():
-                logger.debug(f"Found {len(entities_list)} entities of type {service_name}")
+                logger.debug(
+                    f"Found {len(entities_list)} entities of type {service_name}"
+                )
 
             return result
         except Exception as e:
@@ -92,7 +142,9 @@ class GtfsRtFetcher:
             raise
 
     @staticmethod
-    def insert_fetch_time(entities: List[Dict[str, Any]], fetch_time: datetime) -> List[Dict[str, Any]]:
+    def insert_fetch_time(
+        entities: List[Dict[str, Any]], fetch_time: datetime
+    ) -> List[Dict[str, Any]]:
         """
         Add fetch time to entities.
 
@@ -101,49 +153,21 @@ class GtfsRtFetcher:
         @return List of entities with fetch time added
         """
         logger = GtfsRtFetcher.logger
-        logger.debug(f"Adding fetch time {fetch_time.isoformat()} to {len(entities)} entities")
+        logger.debug(
+            f"Adding fetch time {fetch_time.isoformat()} to {len(entities)} entities"
+        )
 
         result = []
         for entity in entities:
             entity_copy = entity.copy()
-            entity_copy['fetch_time'] = int(fetch_time.timestamp())
+            entity_copy["fetchTime"] = int(fetch_time.timestamp())
             result.append(entity_copy)
         return result
 
-    @staticmethod
-    def normalize_and_convert_to_df(entities: List[Dict[str, Any]]) -> pd.DataFrame:
-        """
-        Convert entities to a DataFrame.
-
-        @param entities: List of entities
-        @return DataFrame
-        """
-        logger = GtfsRtFetcher.logger
-
-        if not entities:
-            logger.debug("No entities to convert to DataFrame")
-            return pd.DataFrame()
-
-        logger.debug(f"Converting {len(entities)} entities to DataFrame")
-
-        try:
-            # Normalize the JSON structure
-            df = pd.json_normalize(
-                entities,
-                sep='_',
-                errors='ignore'
-            )
-
-            # Order columns alphabetically
-            df = df.reindex(sorted(df.columns), axis=1)
-
-            return df
-        except Exception as e:
-            logger.error(f"Error converting entities to DataFrame: {str(e)}", exc_info=True)
-            raise
-
     @classmethod
-    def fetch_and_parse(cls, url: str, service_types: List[str], timezone: str) -> Dict[str, pd.DataFrame]:
+    def fetch_and_parse(
+        cls, url: str, service_types: List[str], timezone: str
+    ) -> Dict[str, pa.Table]:
         """
         Fetch and parse GTFS-RT data.
 
@@ -153,7 +177,9 @@ class GtfsRtFetcher:
         @return Dictionary with service types as keys and DataFrames as values
         """
         logger = cls.logger
-        logger.info(f"Fetching and parsing GTFS-RT data from {url} for service types {service_types}")
+        logger.info(
+            f"Fetching and parsing GTFS-RT data from {url} for service types {service_types}"
+        )
 
         # Get timezone
         tz = pytz.timezone(timezone)
@@ -178,24 +204,34 @@ class GtfsRtFetcher:
                     logger.debug(f"Processing service type: {service_type}")
 
                     # Add fetch time
-                    entities_with_time = cls.insert_fetch_time(parsed_data[service_type], fetch_time)
+                    entities_with_time = cls.insert_fetch_time(
+                        parsed_data[service_type], fetch_time
+                    )
+                    table = pa.Table.from_pylist(
+                        entities_with_time,
+                        schema=SERVICE_TYPE_TO_SCHEMA[service_type],
+                    ).flatten()
 
-                    # Convert to DataFrame
-                    df = cls.normalize_and_convert_to_df(entities_with_time)
+                    table = table.rename_columns(
+                        [col.replace(".", "_") for col in table.column_names]
+                    )
 
-                    if not df.empty:
-                        logger.info(f"Successfully processed {len(df)} records for service type {service_type}")
+                    if table.num_rows > 0:
+                        logger.info(
+                            f"Successfully processed {table.num_rows} records for service type {service_type}"
+                        )
                     else:
                         logger.info(f"No data found for service type {service_type}")
 
-                    result[service_type] = df
+                    result[service_type] = table
                 else:
                     logger.warning(f"Service type {service_type} not found in feed")
-                    result[service_type] = pd.DataFrame()
 
             return result
 
         except Exception as e:
-            logger.error(f"Error fetching or parsing feed from {url}: {str(e)}", exc_info=True)
+            logger.error(
+                f"Error fetching or parsing feed from {url}: {str(e)}", exc_info=True
+            )
             # Return empty DataFrames for requested service types
-            return {service_type: pd.DataFrame() for service_type in service_types}
+            return {}

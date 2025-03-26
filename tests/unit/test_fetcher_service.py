@@ -134,7 +134,7 @@ class TestFetcherService(unittest.TestCase):
         self.assertFalse(df.empty)
 
         # Should have the expected columns for alerts
-        self.assertIn("fetch_time", df.columns)
+        self.assertIn("fetchTime", df.columns)
 
     def test_run_once_trip_updates(self):
         """Test fetching trip updates."""
@@ -171,7 +171,7 @@ class TestFetcherService(unittest.TestCase):
         self.assertFalse(df.empty)
 
         # Should have the expected columns for trip updates
-        self.assertIn("fetch_time", df.columns)
+        self.assertIn("fetchTime", df.columns)
 
     def test_run_once_vehicle_positions(self):
         """Test fetching vehicle positions."""
@@ -208,7 +208,7 @@ class TestFetcherService(unittest.TestCase):
         self.assertFalse(df.empty)
 
         # Should have the expected columns for vehicle positions
-        self.assertIn("fetch_time", df.columns)
+        self.assertIn("fetchTime", df.columns)
 
 
 if __name__ == "__main__":

@@ -112,7 +112,7 @@ class TestFullPipeline(unittest.TestCase):
                 data_bytes = self.storage.read_bytes(file_path)
                 df = pd.read_parquet(BytesIO(data_bytes))
                 self.assertFalse(df.empty)
-                self.assertIn("fetch_time", df.columns)
+                self.assertIn("fetchTime", df.columns)
                 # The actual data doesn't have a provider column, so we don't test for it
 
         # We'll create a few more timestamps for testing aggregation
