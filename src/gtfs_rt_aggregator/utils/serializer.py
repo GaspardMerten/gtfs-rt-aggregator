@@ -12,7 +12,7 @@ class ParquetSerializer:
     logger = setup_logger(f"{__name__}.ParquetSerializer")
 
     @staticmethod
-    def pyarrow_table_to_bytes(table: pa.Table, compression: str = "gzip") -> bytes:
+    def pyarrow_table_to_bytes(table: pa.Table, compression: str = "brotli") -> bytes:
         """
         Convert a PyArrow Table to bytes.
 
@@ -21,7 +21,13 @@ class ParquetSerializer:
         @return Bytes
         """
         buffer = io.BytesIO()
-        pq.write_table(table, buffer, compression=compression, use_dictionary=True)
+        pq.write_table(
+            table,
+            buffer,
+            compression=compression,
+            use_dictionary=True,
+            dictionary_pagesize_limit=5000,
+        )
 
         # Get bytes
         buffer.seek(0)
