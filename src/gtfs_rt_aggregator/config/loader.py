@@ -6,7 +6,8 @@ from ..config.models import (
     GtfsRtConfig,
     StorageConfig,
     ProviderConfig,
-    ApiConfig, OutputConfig,
+    ApiConfig,
+    OutputConfig,
 )
 from ..utils.log_helper import setup_logger
 
@@ -87,12 +88,18 @@ def _convert_toml_to_config(config_dict: Dict[str, Any]) -> GtfsRtConfig:
 
     # Extract output format configuration
     output_dict = config_dict.get("output", {})
-    output_filename_format = output_dict.get("filename_format", "{group_time}_to_{next_period}.parquet")
+    output_filename_format = output_dict.get(
+        "filename_format", "{group_time}_to_{next_period}.parquet"
+    )
     output_time_format = output_dict.get("time_format", "%H-%M-%S")
 
-    logger.debug(f"Output configuration: filename_format={output_filename_format}, time_format={output_time_format}")
+    logger.debug(
+        f"Output configuration: filename_format={output_filename_format}, time_format={output_time_format}"
+    )
 
-    output_config = OutputConfig(filename_format=output_filename_format, time_format=output_time_format)
+    output_config = OutputConfig(
+        filename_format=output_filename_format, time_format=output_time_format
+    )
 
     # Extract provider configurations
     providers_list = config_dict.get("providers", [])
@@ -156,6 +163,7 @@ def _convert_toml_to_config(config_dict: Dict[str, Any]) -> GtfsRtConfig:
             refresh_seconds = api_dict.get("refresh_seconds", 60)
             frequency_minutes = api_dict.get("frequency_minutes", 60)
             check_interval_seconds = api_dict.get("check_interval_seconds", 300)
+            accumulate_count = api_dict.get("accumulate_count", 0)
 
             logger.debug(
                 f"API for {name}: url={url}, services={services}, refresh={refresh_seconds}s, frequency={frequency_minutes}m, check_interval={check_interval_seconds}s"
@@ -167,6 +175,7 @@ def _convert_toml_to_config(config_dict: Dict[str, Any]) -> GtfsRtConfig:
                 refresh_seconds=refresh_seconds,
                 frequency_minutes=frequency_minutes,
                 check_interval_seconds=check_interval_seconds,
+                accumulate_count=accumulate_count,
             )
 
             apis.append(api)
@@ -195,4 +204,6 @@ def _convert_toml_to_config(config_dict: Dict[str, Any]) -> GtfsRtConfig:
 
     # Create the config
     logger.info(f"Successfully created configuration with {len(providers)} providers")
-    return GtfsRtConfig(storage=storage_config, providers=providers, output=output_config)
+    return GtfsRtConfig(
+        storage=storage_config, providers=providers, output=output_config
+    )

@@ -1,4 +1,5 @@
 from datetime import datetime
+from multiprocessing import Manager
 from typing import Dict, List, Any, Tuple
 
 import pytz
@@ -26,6 +27,9 @@ class FetcherService:
         self.storages = storages
         self.logger.debug("Fetcher service initialized")
 
+        self.manager = Manager()
+        self.accumulate_storage = self.manager.dict()
+
     def get_scheduling(self) -> List[Tuple[Any, callable, str, Dict[str, Any]]]:
         """
         Get the scheduling configuration for the fetcher service.
@@ -45,6 +49,7 @@ class FetcherService:
                     "url": api.url,
                     "service_types": api.services,
                     "timezone": provider.timezone,
+                    "accumulate_count": api.accumulate_count,
                 }
 
                 self.logger.debug(
@@ -67,7 +72,12 @@ class FetcherService:
         return schedules
 
     def run_once(
-        self, provider_name: str, url: str, service_types: List[str], timezone: str
+        self,
+        provider_name: str,
+        url: str,
+        service_types: List[str],
+        timezone: str,
+        accumulate_count: int = 0,
     ):
         """
         Run a fetch job once.
@@ -120,11 +130,30 @@ class FetcherService:
 
                 # Save to storage
                 job_logger.debug(f"Saving data to {path}")
-                saved_path = storage.save_bytes(parquet_bytes, path)
 
-                job_logger.info(
-                    f"Saved {service_type} data with {len(df)} records to {saved_path}"
-                )
+                if not accumulate_count:
+                    saved_path = storage.save_bytes(parquet_bytes, path)
+                    job_logger.info(
+                        f"Saved {service_type} data with {len(df)} records to {saved_path}"
+                    )
+
+                else:
+                    key = provider_name + service_type
+                    if key not in self.accumulate_storage:
+                        self.accumulate_storage[key] = self.manager.dict()
+                    self.accumulate_storage[key][path] = parquet_bytes
+
+                    # If we have enough accumulated data, save it
+                    if len(self.accumulate_storage[key]) >= accumulate_count:
+                        for (
+                            accumulated_path,
+                            accumulated_bytes,
+                        ) in self.accumulate_storage[key].items():
+                            storage.save_bytes(accumulated_bytes, accumulated_path)
+                        job_logger.info(
+                            f"Saved multiple {service_type} records to storage under {provider_name}"
+                        )
+                        self.accumulate_storage[key].clear()
 
         except Exception as e:
             job_logger.error(f"Error in fetch job: {str(e)}", exc_info=True)

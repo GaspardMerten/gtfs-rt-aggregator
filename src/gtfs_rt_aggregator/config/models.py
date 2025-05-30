@@ -65,6 +65,7 @@ class ApiConfig(BaseModel):
     check_interval_seconds: int = Field(
         300, description="How often to check for new files to aggregate (in seconds)"
     )
+    accumulate_count: Optional[int] = 0
 
     @classmethod
     @field_validator("services")
@@ -162,15 +163,19 @@ class OutputConfig(BaseModel):
         description="Time format for filename timestamps",
     )
 
+
 class GtfsRtConfig(BaseModel):
     """Main configuration for the GTFS-RT fetcher and aggregator."""
 
     storage: StorageConfig = Field(..., description="Global storage configuration")
     providers: List[ProviderConfig] = Field(..., description="List of providers")
-    output: OutputConfig = Field(OutputConfig(
-        filename_format="{group_time}_to_{next_period}.parquet",
-        time_format="%H-%M-%S"
-    ), description="Output configuration")
+    output: OutputConfig = Field(
+        OutputConfig(
+            filename_format="{group_time}_to_{next_period}.parquet",
+            time_format="%H-%M-%S",
+        ),
+        description="Output configuration",
+    )
 
     @classmethod
     @field_validator("providers")
