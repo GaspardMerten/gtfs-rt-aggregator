@@ -12,6 +12,7 @@ from google.transit import gtfs_realtime_pb2
 from ..schema.alert import alert_schema
 from ..schema.shape import shape_schema
 from ..schema.stop import stop_schema
+from ..schema.trip_modifications import trip_modifications_schema
 from ..schema.trip_update import trip_update_schema
 from ..schema.vehicle_position import vehicle_position_schema
 from ..utils import setup_logger
@@ -22,7 +23,11 @@ TRIP_UPDATE = "TripUpdate", "tripUpdate", trip_update_schema
 ALERT = ("Alert", "alert", alert_schema)
 SHAPE = "Shape", "shape", shape_schema
 STOP = "Stop", "stop", stop_schema
-TRIP_MODIFICATIONS = "TripModifications", "tripModifications", trip_update_schema
+TRIP_MODIFICATIONS = (
+    "TripModifications",
+    "tripModifications",
+    trip_modifications_schema,
+)
 
 SERVICE_TYPES = [VEHICLE_POSITIONS, TRIP_UPDATE, ALERT, TRIP_MODIFICATIONS, SHAPE, STOP]
 SERVICE_TYPE_TO_SCHEMA = {x[0]: x[2] for x in SERVICE_TYPES}
@@ -58,6 +63,11 @@ class GtfsRtFetcher:
                     stop_time_update["departure"]["time"] = GtfsRtFetcher.parse_int(
                         stop_time_update["departure"].get("time")
                     )
+        elif service == TRIP_MODIFICATIONS[0]:
+            for modification in entity.get("modifications", []):
+                modification["lastModifiedTime"] = GtfsRtFetcher.parse_int(
+                    modification.get("lastModifiedTime")
+                )
         elif service == ALERT[0]:
             if "activePeriod" in entity:
                 for active_period in entity["activePeriod"]:

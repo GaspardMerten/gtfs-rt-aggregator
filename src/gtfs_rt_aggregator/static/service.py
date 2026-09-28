@@ -1,3 +1,4 @@
+import html
 import importlib.metadata
 import itertools
 import importlib.util
@@ -87,9 +88,9 @@ class StaticService:
                     "Static feeds need gtfs-parquet: pip install 'gtfs_rt_aggregator[static]'"
                 )
             version = importlib.metadata.version("gtfs-parquet")
-            if _version_tuple(version) < (0, 5, 1):
+            if _version_tuple(version) < (0, 6, 1):
                 raise ImportError(
-                    f"Static feeds need gtfs-parquet 0.5.1 or later, found {version}: "
+                    f"Static feeds need gtfs-parquet 0.6.1 or later, found {version}: "
                     "pip install -U 'gtfs_rt_aggregator[static]'"
                 )
 
@@ -208,7 +209,8 @@ class StaticService:
                     if (
                         reuse_unchanged_tables
                         and latest
-                        and latest.get("files", {}).get(source) == files.get(source)
+                        and source in files
+                        and latest.get("files", {}).get(source) == files[source]
                         and table_name in manifest_tables(latest, base)
                     ):
                         tables[table_name] = manifest_tables(latest, base)[table_name]
@@ -270,7 +272,10 @@ class StaticService:
         Find the current zip URL on index_url: the greatest link matching
         url_pattern, so that dated URLs (e.g. gtfs-20260928.zip) give the newest.
         """
-        page = get_bytes(index_url, headers, retries, logger).decode("utf-8", "replace")
+        # Unescaped, so that links written with &amp; in HTML match
+        page = html.unescape(
+            get_bytes(index_url, headers, retries, logger).decode("utf-8", "replace")
+        )
         matches = {
             urljoin(index_url, m.group(0)) for m in re.finditer(url_pattern, page)
         }

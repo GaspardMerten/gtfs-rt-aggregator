@@ -141,8 +141,9 @@ base_path = "gtfs-feeds"  # Optional: subfolder within the bucket
   - **path_template**: Path of each aggregated file. Fields: `provider`, `service`, `start` and `end` (the period, in
     the provider's timezone, with `strftime` formats). Default:
     `"provider={provider}/service={service}/date={start:%Y-%m-%d}/{start:%H-%M-%S}_to_{end:%H-%M-%S}.parquet"`
-  - **compact_daily**: Once a day is over, merge its aggregated files into one file (default `false`). Needs one
-    folder per day in `path_template`. The whole day is read in memory.
+  - **compact_daily**: Merge the aggregated files of each finished day into one file (default `false`). Runs at
+    startup, then every 24 hours, on the last 7 days. Needs one folder per day in `path_template`. The whole day is
+    read in memory.
   - **compacted_name**: Name of that file, in the day's folder (default `"day.parquet"`)
   - **sort_by**: Columns the compacted file is sorted by (default `["entityId", "fetchTime"]`)
 
@@ -193,13 +194,13 @@ Besides the entity's fields, each row has:
 - with `deduplicate = true`, after aggregation: `firstSeen` and `lastSeen`
 
 **Unchanged fetches.** With `skip_unchanged` (the default), a fetch is not stored when its entities are exactly those of
-the previous fetch, in any order, even if the header time changed. Polling every 30 s a feed that updates every 2 min
-then stores one copy instead of four.
+the previous fetch, in any order, even if the header time changed. If you poll every 30 s and the feed changes every
+2 min, only one fetch in four is stored.
 
 **Deduplication.** With `deduplicate = true`, consecutive rows of the same entity with the same content become one row,
-with `firstSeen` and `lastSeen` its first and last `fetchTime`. A vehicle that stands still for ten minutes is one row,
-not twenty. If the entity changes and then comes back to an earlier state, that is a new row. Fetches skipped as
-unchanged are not counted, so `lastSeen` is the last *stored* fetch.
+with `firstSeen` and `lastSeen` its first and last `fetchTime`. Polling every 30 s, a vehicle that stands still for ten
+minutes is one row, not twenty. If the entity changes and then comes back to an earlier state, or is missing from a fetch in between, that
+is a new row. Fetches skipped as unchanged are not counted, so `lastSeen` is the last *stored* fetch.
 
 **Filter.** `[providers.realtime.filter]` keeps the rows matching any of:
 
@@ -208,13 +209,17 @@ unchanged are not counted, so `lastSeen` is the last *stored* fetch.
 - `trip_ids`: trip ids
 
 Realtime entities often carry only a trip id, so `route_types` and `route_ids` are resolved through the trips and
-routes of the provider's latest static version: the provider needs a `[[providers.static]]` feed. Trip updates and
+routes of the provider's latest static version (checked at most once a minute): the provider needs a
+`[[providers.static]]` feed. Trip updates and
 vehicle positions are matched by trip or route (a vehicle without a trip is dropped), alerts by any informed route,
 route type or trip; other entity types are kept. Until the first static version is stored, rows are not filtered.
 
 **Status.** After each fetch, `<provider>/_status/<services>-<id>.json` holds the last attempt, last success, last
 error, the feed's age (fetch time minus header time), the number of entities before and after the filter, and whether
 the fetch was unchanged. The URL is stored without its query string, which may hold a key.
+
+A period is aggregated once a file from the next period exists, or 5 minutes after it ended: a feed that stops
+changing stores no new files. Files that arrive later are added to the period's file.
 
 ### Storage Layout
 
@@ -232,7 +237,8 @@ Aggregated files are in Hive-style folders (`key=value`), so DuckDB, Polars or B
 skip folders when filtering on provider, service or date:
 
 ```sql
-SELECT * FROM read_parquet('data/provider=*/service=VehiclePosition/date=*/*.parquet', hive_partitioning = true)
+SELECT * FROM read_parquet('data/provider=*/service=VehiclePosition/date=*/*.parquet',
+                            hive_partitioning = true, union_by_name = true)
 WHERE date = '2026-09-28'
 ```
 
@@ -248,11 +254,16 @@ A new static version is stored only when a file inside the zip changed. The pipe
 - Fetches whose entities did not change are no longer stored (`skip_unchanged = false` to keep every fetch).
 - New columns: `feedTimestamp`, `staticVersion` and `contentHash`.
 - `manifest.json` gives each table's path in `tables` (it was a list of names).
-- Unknown options in `[[providers.realtime]]` and `[output]` are now rejected, like typos in `[[providers.static]]`.
+- Static feeds need gtfs-parquet 0.6.1 or later. Earlier versions stored extended route types of 128 and more (e.g.
+  700 for buses) as empty values; versions stored with them keep that until the feed changes.
+- Unknown options in providers, `[[providers.realtime]]` and `[output]` are now rejected.
+- A status file per realtime feed is written to `<provider>/_status/`.
+- The pipeline now always starts a `multiprocessing` Manager, whose socket lives in the temporary folder: keep
+  `TMPDIR` short (a long path fails with "AF_UNIX path too long").
 
 ### Upgrading to 0.4.0
 
-- Static feeds need gtfs-parquet 0.5.1 or later, and use much less memory (see above).
+- Static feeds use much less memory (see above).
 - Individual files and static versions are now named in UTC (`2026-09-28_14-00-20Z.parquet`) instead of local time with an offset, which had a `+` that some tools read as a space. Files named the old ways are still aggregated.
 - The configuration is now validated: invalid service types, timezones, non-positive intervals, duplicate provider names and missing GCS/MinIO parameters are rejected when the file is loaded.
 

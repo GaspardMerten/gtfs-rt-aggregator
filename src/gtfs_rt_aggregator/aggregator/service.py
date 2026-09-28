@@ -15,6 +15,10 @@ from ..utils.log_helper import setup_logger
 from ..utils.file_time import parse_file_time
 from ..utils.serializer import ParquetSerializer
 
+# How long after its end a period is aggregated even without a file from the
+# next period
+PERIOD_GRACE_SECONDS = 300
+
 
 class AggregatorService:
     """Service for aggregating GTFS-RT data."""
@@ -218,6 +222,14 @@ class AggregatorService:
                         has_next_period_file = True
                         break
 
+            # A feed that stopped changing produces no file for the next period
+            # (unchanged fetches are not stored): close the period anyway once
+            # it is well over. Files arriving later are added to its file.
+            if not has_next_period_file and datetime.now(
+                timezone
+            ) >= next_period + timedelta(seconds=PERIOD_GRACE_SECONDS):
+                has_next_period_file = True
+
             if not has_next_period_file:
                 logger.info(
                     f"Skipping group {group_time} for {service_type} - no files from next period yet"
@@ -331,7 +343,8 @@ class AggregatorService:
                     try:
                         table = pa.concat_tables(
                             [table, pq.read_table(BytesIO(data))],
-                            unicode_promote_options="default",
+                            # Files from different versions may have different columns
+                            promote_options="default",
                         )
                     except Exception as e:
                         logger.error(
@@ -458,7 +471,9 @@ class AggregatorService:
                         ParquetSerializer.pyarrow_table_to_bytes(table), compacted
                     )
                     for f in parts:
-                        storage.delete_file(f)
+                        if storage.delete_file(f) is False:
+                            # Left in place, it would be counted twice next time
+                            logger.error(f"Could not delete compacted file {f}")
                     logger.info(
                         f"Compacted {len(parts)} files into {compacted} ({table.num_rows} rows)"
                     )

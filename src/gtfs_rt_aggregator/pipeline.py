@@ -9,6 +9,7 @@ from .static.service import StaticService
 from .storage import create_storage
 from .storage.base import StorageInterface
 from .utils.log_helper import setup_logger
+from .utils.redact import install_redaction
 from .utils.scheduler import SchedulerClass
 
 
@@ -24,6 +25,9 @@ class GtfsRtPipeline:
         @param config: Configuration
         """
         self.logger = setup_logger(f"{__name__}.GtfsRtPipeline")
+        # Hide API keys (URL query strings, headers) in the logs of the
+        # handlers configured so far
+        install_redaction()
         self.logger.debug("Initializing GTFS-RT Pipeline")
 
         self.config = config

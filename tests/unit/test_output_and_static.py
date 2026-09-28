@@ -111,6 +111,12 @@ class TestOutputPaths(unittest.TestCase):
             OutputConfig(
                 path_template="{provider}/{start:%H}.parquet", compact_daily=True
             )
+        with self.assertRaises(ValueError):
+            # One folder per hour: a day is not in one folder
+            OutputConfig(
+                path_template="{provider}/{start:%Y-%m-%d}/{start:%H}/{start:%M}.parquet",
+                compact_daily=True,
+            )
 
 
 def _rows(entity_ids, hashes, times):
@@ -161,6 +167,18 @@ class TestDeduplicate(unittest.TestCase):
         self.assertEqual(merged.num_rows, 1)
         self.assertEqual(merged["firstSeen"].to_pylist(), [10])
         self.assertEqual(merged["lastSeen"].to_pylist(), [30])
+
+    def test_gap_ends_run(self):
+        # a is missing from the fetch at 20 (only b is there), then comes back
+        table = deduplicate(_rows(["a", "b", "a"], ["x", "z", "x"], [10, 20, 30]))
+        runs = sorted(
+            zip(
+                table["entityId"].to_pylist(),
+                table["firstSeen"].to_pylist(),
+                table["lastSeen"].to_pylist(),
+            )
+        )
+        self.assertEqual(runs, [("a", 10, 10), ("a", 30, 30), ("b", 20, 20)])
 
     def test_rows_without_hash_kept(self):
         table = deduplicate(_rows(["a", "a"], [None, None], [10, 20]))

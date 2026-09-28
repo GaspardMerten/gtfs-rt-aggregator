@@ -2,6 +2,7 @@ import argparse
 import logging
 
 from ..pipeline import run_pipeline_from_toml
+from ..utils.redact import install_redaction
 
 
 def main():
@@ -24,6 +25,7 @@ def main():
     # Call the run_pipeline_from_toml function
     try:
         logging.basicConfig(level=args.log_level)
+        install_redaction()
         run_pipeline_from_toml(args.toml_path)
     except Exception as e:
         print(f"Error: {e}")

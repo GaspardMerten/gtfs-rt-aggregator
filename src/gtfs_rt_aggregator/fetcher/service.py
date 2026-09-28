@@ -17,6 +17,7 @@ from ..fetcher.gtfs_rt import GtfsRtFetcher
 from ..static.service import manifest_tables, read_latest, static_base
 from ..storage.base import StorageInterface
 from ..utils.log_helper import setup_logger
+from ..utils.redact import redact
 from ..utils.file_time import format_file_time
 from ..utils.serializer import ParquetSerializer
 
@@ -171,7 +172,6 @@ class FetcherService:
             ).hexdigest()
             with feed["lock"]:
                 unchanged = feed["state"].get("snapshot") == snapshot
-                feed["state"]["snapshot"] = snapshot
 
             status.update(
                 last_success=fetch_time.isoformat(),
@@ -190,6 +190,10 @@ class FetcherService:
                 job_logger.info(
                     f"{url}: unchanged since the previous fetch, not stored"
                 )
+                # Nothing new arrives to write the window that just ended
+                self._flush_ended_windows(
+                    provider_name, url, fetch_time, storage, job_logger
+                )
                 return
 
             result = GtfsRtFetcher.to_tables(
@@ -199,8 +203,13 @@ class FetcherService:
                 {"feedTimestamp": header_timestamp, "staticVersion": static_version},
             )
             self._store(provider_name, url, result, fetch_time, storage, job_logger)
+            # Only once stored: after a failed save, the same content is tried again
+            with feed["lock"]:
+                feed["state"]["snapshot"] = snapshot
         except Exception as e:
-            status.update(last_error=str(e), last_error_at=fetch_time.isoformat())
+            status.update(
+                last_error=redact(str(e)), last_error_at=fetch_time.isoformat()
+            )
             job_logger.error(f"Error in fetch job for {url}: {str(e)}", exc_info=True)
         finally:
             self._write_status(provider_name, api, feed, status, storage, job_logger)
@@ -220,9 +229,16 @@ class FetcherService:
             return state.get("static_version"), state.get("static_tables")
 
         base = static_base(provider.name, static.name)
-        latest = read_latest(
-            self.storages.get(provider.name, self.storages["global"]), base, self.logger
-        )
+        try:
+            latest = read_latest(
+                self.storages.get(provider.name, self.storages["global"]),
+                base,
+                self.logger,
+            )
+        except Exception as e:
+            # A storage error must not fail the fetch: keep the last known version
+            self.logger.warning(f"Could not read the static version of {base}: {e}")
+            return state.get("static_version"), state.get("static_tables")
         version = latest.get("version") if latest else None
         tables = manifest_tables(latest, base) if latest else None
         state.update(
@@ -249,6 +265,22 @@ class FetcherService:
             )
         except Exception as e:
             logger.warning(f"Could not write the status of {api.url}: {e}")
+
+    def _flush_ended_windows(self, provider_name, url, fetch_time, storage, job_logger):
+        """Write accumulated windows of this feed that ended before fetch_time."""
+        for key, accumulator in self._accumulators.items():
+            if not key.startswith(self._feed_key(provider_name, url) + "|"):
+                continue
+            window = AggregatorService._get_rounded_time(
+                fetch_time, accumulator["minutes"]
+            )
+            with accumulator["lock"]:
+                buffer = accumulator["buffer"]
+                if not len(buffer) or buffer[0][0] >= window:
+                    continue
+                batch = buffer[:]
+                del buffer[:]
+            self._write_batch(storage, batch, accumulator["concatenate"], job_logger)
 
     def _store(self, provider_name, url, result, fetch_time, storage, job_logger):
         """Save each service table, or buffer it if the feed accumulates."""

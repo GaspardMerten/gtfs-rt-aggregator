@@ -59,3 +59,7 @@ def configure_root_logger(
         file_handler = logging.FileHandler(log_file)
         file_handler.setFormatter(formatter)
         root_logger.addHandler(file_handler)
+
+    from ..utils.redact import install_redaction
+
+    install_redaction(root_logger)

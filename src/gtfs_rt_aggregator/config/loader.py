@@ -99,6 +99,18 @@ def expand_env(value: Any, where: str = "") -> Any:
     return "${".join(_ENV_REFERENCE.sub(replace, part) for part in parts)
 
 
+PROVIDER_KEYS = {
+    "name",
+    "timezone",
+    "storage",
+    "realtime",
+    "apis",
+    "static",
+    "frequency_minutes",
+    "check_interval_seconds",
+}
+
+
 def _output_config(output_dict: Dict[str, Any]) -> OutputConfig:
     """Output options, converting filename_format / time_format (before 0.5.0)."""
     output_dict = dict(output_dict)
@@ -119,6 +131,10 @@ def _output_config(output_dict: Dict[str, Any]) -> OutputConfig:
         filename = legacy.get(
             "filename_format", "{group_time}_to_{next_period}.parquet"
         )
+        if not filename.endswith(".parquet"):
+            raise ValueError(
+                f"[output] filename_format must end with .parquet, got {filename!r}"
+            )
         output_dict["path_template"] = (
             "{provider}/{service}/{start:%Y-%m-%d}/"
             + filename.replace("{group_time}", "{start:" + time_format + "}").replace(
@@ -165,6 +181,11 @@ def _convert_toml_to_config(config_dict: Dict[str, Any]) -> GtfsRtConfig:
             raise ValueError("Missing required field: provider.name")
 
         logger.debug(f"Processing provider: {name}")
+        unknown = set(provider_dict) - PROVIDER_KEYS
+        if unknown:
+            raise ValueError(
+                f"Unknown options in provider {name}: {', '.join(sorted(unknown))}"
+            )
 
         # Extract provider-specific storage if defined
         provider_storage = None

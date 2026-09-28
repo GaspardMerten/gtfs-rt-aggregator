@@ -54,16 +54,22 @@ class FilterConfig(BaseModel):
     route_ids: List[str] = Field(default_factory=list, description="Route ids to keep")
     trip_ids: List[str] = Field(default_factory=list, description="Trip ids to keep")
 
-    @field_validator("route_types")
+    @field_validator("route_types", mode="before")
     @classmethod
     def validate_route_types(cls, v):
         for item in v:
+            if isinstance(item, bool) or not isinstance(item, (int, str)):
+                raise ValueError(
+                    f"route_types entries are numbers or ranges, got {item!r}"
+                )
             if isinstance(item, str):
                 low, _, high = item.partition("-")
                 if not (low.strip().isdigit() and high.strip().isdigit()):
                     raise ValueError(
                         f'route_types entries are numbers or ranges like "100-199", got {item!r}'
                     )
+                if int(low) > int(high):
+                    raise ValueError(f"Empty route_types range {item!r}")
         return v
 
     def route_type_set(self) -> set:
@@ -182,7 +188,8 @@ class StaticConfig(BaseModel):
     )
     name: str = Field(
         "static",
-        min_length=1,
+        # A single folder name, not clashing with _status
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]*$",
         description="Folder the versions are stored in, under the provider folder",
     )
     check_minutes: int = Field(
@@ -208,6 +215,8 @@ class StaticConfig(BaseModel):
             )
         if self.index_url and not self.url_pattern:
             raise ValueError("index_url needs a url_pattern")
+        if self.url and self.url_pattern:
+            raise ValueError("url_pattern is only used with index_url")
         if self.url_pattern:
             import re
 
@@ -338,10 +347,13 @@ class OutputConfig(BaseModel):
             )
         except (KeyError, IndexError, ValueError) as e:
             raise ValueError(f"Invalid path_template {v!r}: {e}")
-        if "{start" not in v:
-            raise ValueError(
-                "path_template must contain {start...}, or periods would share a file"
-            )
+        for field in ("{provider}", "{service}", "{start"):
+            if field not in v:
+                raise ValueError(
+                    f"path_template must contain {field}, or different data would share a file"
+                )
+        if ".." in path.split("/"):
+            raise ValueError("path_template cannot contain ..")
         if path.startswith("/") or not path.endswith(".parquet"):
             raise ValueError("path_template must be a relative path ending in .parquet")
         return v
@@ -352,18 +364,18 @@ class OutputConfig(BaseModel):
             from datetime import datetime
             import posixpath
 
-            folders = {
-                posixpath.dirname(
+            def folder(start):
+                return posixpath.dirname(
                     self.path_template.format(
-                        provider="p",
-                        service="s",
-                        start=datetime(2026, 1, d),
-                        end=datetime(2026, 1, d),
+                        provider="p", service="s", start=start, end=start
                     )
                 )
-                for d in (1, 2)
-            }
-            if len(folders) == 1:
+
+            # One folder per day, holding the whole day
+            first = folder(datetime(2026, 1, 1))
+            if first == folder(datetime(2026, 1, 2)) or first != folder(
+                datetime(2026, 1, 1, 23, 59)
+            ):
                 raise ValueError(
                     "compact_daily needs a path_template with one folder per day (e.g. date={start:%Y-%m-%d}/)"
                 )

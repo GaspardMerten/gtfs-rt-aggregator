@@ -12,6 +12,10 @@ import pyarrow.parquet as pq
 from ..config.models import FilterConfig
 from ..storage.base import StorageInterface
 
+# Changed when the resolution changes (2: route_type no longer truncated by
+# gtfs-parquet < 0.6.1), so earlier cached results are not reused
+CACHE_FORMAT = 2
+
 
 class EntityFilter:
     """
@@ -77,11 +81,13 @@ def build_filter(
 
     # Resolved once per static version and filter, then read from local disk:
     # each fetch runs in its own process
+    # CACHE_FORMAT changes when resolution changes, so old results are not reused
     digest = hashlib.sha1(
-        f"{cache_key}|{config.model_dump_json()}".encode()
+        f"{CACHE_FORMAT}|{cache_key}|{config.model_dump_json()}".encode()
     ).hexdigest()
+    # Per user: files other users can write must not decide what is filtered
     cache = os.path.join(
-        tempfile.gettempdir(), "gtfs_rt_aggregator", f"filter-{digest}.json"
+        tempfile.gettempdir(), f"gtfs_rt_aggregator-{_user()}", f"filter-{digest}.json"
     )
     try:
         with open(cache) as f:
@@ -91,12 +97,25 @@ def build_filter(
         pass
 
     routes, trips = _resolve(config, route_types, storage, tables)
-    os.makedirs(os.path.dirname(cache), exist_ok=True)
-    tmp = f"{cache}.tmp-{os.getpid()}"
-    with open(tmp, "w") as f:
-        json.dump({"routes": sorted(routes), "trips": sorted(trips)}, f)
-    os.replace(tmp, cache)
+    try:
+        os.makedirs(os.path.dirname(cache), mode=0o700, exist_ok=True)
+        tmp = f"{cache}.tmp-{os.getpid()}"
+        with open(tmp, "w") as f:
+            json.dump({"routes": sorted(routes), "trips": sorted(trips)}, f)
+        os.replace(tmp, cache)
+    except OSError:
+        # Only a cache (e.g. the folder belongs to another user)
+        pass
     return EntityFilter(route_types, routes, trips)
+
+
+def _user() -> str:
+    try:
+        return str(os.getuid())
+    except AttributeError:  # Windows
+        import getpass
+
+        return getpass.getuser()
 
 
 def _resolve(

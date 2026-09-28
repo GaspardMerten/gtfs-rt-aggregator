@@ -7,5 +7,4 @@ pydantic
 pytz
 google-cloud-storage
 minio
-# From the release tag while PyPI's index does not list 0.5.x yet (the files are on PyPI)
-gtfs-parquet @ git+https://github.com/GaspardMerten/gtfs-parquet@v0.5.1
+gtfs-parquet>=0.6.1

@@ -9,8 +9,10 @@ def deduplicate(table: pa.Table) -> pa.Table:
     Rows are compared on entityId and contentHash (a hash of the whole entity,
     set when fetching). Each run of identical consecutive rows of an entity
     becomes its first row, with firstSeen and lastSeen set to the first and
-    last fetchTime of the run. Tables that are already deduplicated (they have
-    firstSeen and lastSeen) can be merged again with new rows.
+    last fetchTime of the run. A run ends when the entity changes, or is missing
+    from a fetch time found in the table (it disappeared, then came back).
+    Tables that are already deduplicated (they have firstSeen and lastSeen) can
+    be merged again with new rows.
 
     Rows without contentHash (written before 0.5.0) are kept as they are.
     """
@@ -36,10 +38,33 @@ def deduplicate(table: pa.Table) -> pa.Table:
     # All-null hashes have the null type, which cannot be compared
     content = table["contentHash"].chunk(0).cast(pa.string())
 
-    # A row continues the previous run if it has the same entity and content
-    # (a missing hash never matches)
+    # Every fetch time present in the table, in order: an entity missing from
+    # a fetch between two of its rows ends its run there
+    times = pc.unique(
+        pa.chunked_array(
+            [
+                table["fetchTime"].combine_chunks(),
+                table["firstSeen"].combine_chunks(),
+                table["lastSeen"].combine_chunks(),
+            ]
+        )
+    )
+    times = pc.take(times, pc.sort_indices(times))
+    first_rank = pc.index_in(table["firstSeen"].chunk(0), value_set=times)
+    last_rank = pc.index_in(table["lastSeen"].chunk(0), value_set=times)
+    adjacent = pc.less_equal(
+        pc.subtract(first_rank[1:], last_rank[:-1]), pa.scalar(1, first_rank.type)
+    )
+
+    # A row continues the previous run if it has the same entity and content,
+    # at the next fetch (a missing hash never matches)
     continues = pc.fill_null(
-        pc.and_(pc.equal(entity[1:], entity[:-1]), pc.equal(content[1:], content[:-1])),
+        pc.and_(
+            pc.and_(
+                pc.equal(entity[1:], entity[:-1]), pc.equal(content[1:], content[:-1])
+            ),
+            adjacent,
+        ),
         False,
     )
     new_run = pa.concat_arrays([pa.array([True]), pc.invert(continues)])

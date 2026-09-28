@@ -144,6 +144,75 @@ class TestSkipUnchanged(_FetcherTest):
         self.assertNotIn("secret", json.dumps(status))
 
 
+class TestRobustness(_FetcherTest):
+    def test_failed_store_is_retried(self):
+        service = self._service(ApiConfig(url=URL, services=["VehiclePosition"]))
+        with patch.object(self.storage, "save_bytes", side_effect=IOError("disk full")):
+            with patch.object(GtfsRtFetcher, "fetch_feed", return_value=_feed_bytes()):
+                service.run_once("p", URL, ["VehiclePosition"], "UTC")
+        self._run(service)
+        self.assertEqual(len(self._individual()), 1)
+
+    def test_static_lookup_error_does_not_fail_fetch(self):
+        api = ApiConfig(url=URL, services=["VehiclePosition"])
+        service = self._service(api, [StaticConfig(url="https://example.org/gtfs.zip")])
+        with patch.object(
+            self.storage, "file_exists", side_effect=IOError("storage down")
+        ):
+            self._run(service)
+        self.assertEqual(len(self._individual()), 1)
+
+    def test_unchanged_fetch_writes_ended_window(self):
+        from datetime import datetime
+
+        import pytz
+
+        api = ApiConfig(url=URL, services=["VehiclePosition"], accumulate_minutes=15)
+        service = self._service(api)
+
+        class _Now(datetime):
+            current = datetime(2026, 1, 1, 16, 1, tzinfo=pytz.UTC)
+
+            @classmethod
+            def now(cls, tz=None):
+                return cls.current.astimezone(tz)
+
+        with patch("src.gtfs_rt_aggregator.fetcher.service.datetime", _Now):
+            self._run(service)
+            self.assertEqual(self._individual(), [])
+            # Next window, same content: not stored, but the ended window is written
+            _Now.current = datetime(2026, 1, 1, 16, 20, tzinfo=pytz.UTC)
+            self._run(service)
+        self.assertEqual(len(self._individual()), 1)
+
+
+class TestTripModifications(unittest.TestCase):
+    def test_fields_kept(self):
+        from datetime import datetime
+
+        from google.transit import gtfs_realtime_pb2
+
+        message = gtfs_realtime_pb2.FeedMessage()
+        message.header.gtfs_realtime_version = "2.0"
+        entity = message.entity.add(id="m1")
+        selected = entity.trip_modifications.selected_trips.add()
+        selected.trip_ids.append("T1")
+        selected.shape_id = "S1"
+        modification = entity.trip_modifications.modifications.add()
+        modification.last_modified_time = 1742550861
+        modification.start_stop_selector.stop_id = "A"
+
+        header, parsed = GtfsRtFetcher.parse_feed_with_header(
+            message.SerializeToString()
+        )
+        table = GtfsRtFetcher.to_tables(parsed, ["TripModifications"], datetime.now())[
+            "TripModifications"
+        ]
+        row = table.to_pylist()[0]
+        self.assertEqual(row["selectedTrips"], [{"tripIds": ["T1"], "shapeId": "S1"}])
+        self.assertEqual(row["modifications"][0]["lastModifiedTime"], 1742550861)
+
+
 class TestFilter(_FetcherTest):
     def _static(self, service_version="2026-01-01_00-00-00Z"):
         """Static version where route 125327 is rail (2) and the others buses (3)."""
@@ -162,7 +231,13 @@ class TestFilter(_FetcherTest):
                 pa.table(
                     {
                         "route_id": routes,
-                        "route_type": [2 if r == "125327" else 3 for r in routes],
+                        "route_type": pa.array(
+                            [
+                                2 if r == "125327" else 700 if r == "126323" else 3
+                                for r in routes
+                            ],
+                            pa.int16(),
+                        ),
                     }
                 )
             ),
@@ -184,7 +259,9 @@ class TestFilter(_FetcherTest):
             json.dumps({"version": service_version, "tables": tables}).encode(),
             f"{base}/latest.json",
         )
-        return sum(1 for _, r in trips if r == "125327")
+        return sum(1 for _, r in trips if r == "125327"), sum(
+            1 for _, r in trips if r == "126323"
+        )
 
     def _rows(self):
         return pq.read_table(io.BytesIO(self.storage.get_bytes(self._individual()[0])))
@@ -196,7 +273,7 @@ class TestFilter(_FetcherTest):
             filter=FilterConfig(route_types=[2, "100-199"]),
         )
         service = self._service(api, [StaticConfig(url="https://example.org/gtfs.zip")])
-        rail = self._static()
+        rail, _ = self._static()
         with patch("tempfile.gettempdir", return_value=self.id_tmp()):
             self._run(service)
         rows = self._rows()
@@ -206,6 +283,20 @@ class TestFilter(_FetcherTest):
             set(rows["staticVersion"].to_pylist()), {"2026-01-01_00-00-00Z"}
         )
         self.assertEqual(self._status()["kept_count"], rail)
+
+    def test_extended_route_type(self):
+        api = ApiConfig(
+            url=URL,
+            services=["VehiclePosition"],
+            filter=FilterConfig(route_types=["700-799"]),
+        )
+        service = self._service(api, [StaticConfig(url="https://example.org/gtfs.zip")])
+        _, buses = self._static()
+        with patch("tempfile.gettempdir", return_value=self.id_tmp()):
+            self._run(service)
+        rows = self._rows()
+        self.assertEqual(set(rows["trip_routeId"].to_pylist()), {"126323"})
+        self.assertEqual(rows.num_rows, buses)
 
     def test_trip_ids_without_static(self):
         api = ApiConfig(
