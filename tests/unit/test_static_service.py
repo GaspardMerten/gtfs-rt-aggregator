@@ -238,5 +238,33 @@ class TestStaticService(unittest.TestCase):
         self.assertEqual(args["headers"], {"x-api-key": "secret"})
 
 
+class TestGtfsParquetVersion(unittest.TestCase):
+    def test_version_tuple(self):
+        from src.gtfs_rt_aggregator.static.service import _version_tuple
+
+        self.assertEqual(_version_tuple("0.5.1"), (0, 5, 1))
+        self.assertEqual(_version_tuple("0.5.2.dev3+g1234"), (0, 5, 2))
+        self.assertEqual(_version_tuple("1.0rc1"), (1, 0))
+        self.assertLess(_version_tuple("0.4.1"), (0, 5, 1))
+
+    def test_old_gtfs_parquet_rejected(self):
+        config = GtfsRtConfig(
+            storage=StorageConfig(type="filesystem"),
+            providers=[
+                ProviderConfig(
+                    name="nl", static=[StaticConfig(url="https://example.org/a.zip")]
+                )
+            ],
+        )
+        with (
+            patch(
+                "src.gtfs_rt_aggregator.static.service.importlib.metadata.version",
+                return_value="0.4.1",
+            ),
+            self.assertRaises(ImportError),
+        ):
+            StaticService(config, {"global": MockStorageInterface()})
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1,5 +1,6 @@
 import glob
 import os
+import shutil
 from pathlib import Path
 from typing import List, Optional
 
@@ -36,12 +37,7 @@ class FileSystemStorage(StorageInterface):
             raise IOError(f"Failed to create directory: {directory}")
 
         try:
-            # Write to a temporary file first, so a process killed halfway
-            # never leaves a truncated file behind
-            tmp_path = f"{full_path}.tmp-{os.getpid()}"
-            with open(tmp_path, "wb") as f:
-                f.write(data)
-            os.replace(tmp_path, full_path)
+            self._write_atomic(full_path, lambda tmp: Path(tmp).write_bytes(data))
 
             self.logger.debug(f"Successfully saved data to {full_path}")
             return full_path
@@ -49,6 +45,28 @@ class FileSystemStorage(StorageInterface):
             self.logger.error(
                 f"Error saving data to {full_path}: {str(e)}", exc_info=True
             )
+            raise
+
+    def save_file(self, local_path: str, path: str) -> str:
+        """Copy a local file to the file system."""
+        full_path = self._get_full_path(path)
+        directory = os.path.dirname(full_path)
+        if not self._ensure_directory(directory):
+            raise IOError(f"Failed to create directory: {directory}")
+        self._write_atomic(full_path, lambda tmp: shutil.copyfile(local_path, tmp))
+        return full_path
+
+    @staticmethod
+    def _write_atomic(full_path: str, write):
+        """Write through a temporary file, so a process killed halfway never
+        leaves a truncated file behind."""
+        tmp_path = f"{full_path}.tmp-{os.getpid()}"
+        try:
+            write(tmp_path)
+            os.replace(tmp_path, full_path)
+        except BaseException:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
             raise
 
     def read_bytes(self, path: str) -> bytes:

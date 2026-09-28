@@ -71,6 +71,42 @@ class TestFileSystemWrites(unittest.TestCase):
             self.assertEqual(os.listdir(os.path.join(directory, "a")), ["b.json"])
             self.assertEqual(storage.read_bytes("a/b.json"), b"two")
 
+    def test_failed_write_leaves_no_temporary_file(self):
+        import os
+        import tempfile
+
+        from src.gtfs_rt_aggregator.storage.filesystem import FileSystemStorage
+
+        with tempfile.TemporaryDirectory() as directory:
+            storage = FileSystemStorage(directory)
+            with self.assertRaises(FileNotFoundError):
+                storage.save_file(os.path.join(directory, "missing"), "a/b.parquet")
+            self.assertEqual(os.listdir(os.path.join(directory, "a")), [])
+
+    def test_save_file(self):
+        import os
+        import tempfile
+
+        from src.gtfs_rt_aggregator.storage.filesystem import FileSystemStorage
+        from tests.mocks import MockStorageInterface
+
+        with tempfile.TemporaryDirectory() as directory:
+            local = os.path.join(directory, "local.parquet")
+            with open(local, "wb") as f:
+                f.write(b"data")
+
+            storage = FileSystemStorage(os.path.join(directory, "store"))
+            storage.save_file(local, "x/y.parquet")
+            self.assertEqual(storage.read_bytes("x/y.parquet"), b"data")
+            self.assertEqual(
+                os.listdir(os.path.join(directory, "store", "x")), ["y.parquet"]
+            )
+
+            # Default implementation, for backends without their own
+            mock = MockStorageInterface()
+            mock.save_file(local, "x/y.parquet")
+            self.assertEqual(mock.read_bytes("x/y.parquet"), b"data")
+
 
 if __name__ == "__main__":
     unittest.main()

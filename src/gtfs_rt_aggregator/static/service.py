@@ -1,3 +1,6 @@
+import importlib.metadata
+import itertools
+import importlib.util
 import json
 import os
 import tempfile
@@ -12,6 +15,17 @@ from ..config.models import GtfsRtConfig
 from ..storage.base import StorageInterface
 from ..utils.file_time import format_file_time
 from ..utils.log_helper import setup_logger
+
+
+def _version_tuple(version: str) -> Tuple[int, ...]:
+    """(0, 5, 1) for "0.5.1", "0.5.1.dev3+g1234" or "0.5.1rc1"."""
+    parts = []
+    for part in version.split(".")[:3]:
+        digits = "".join(itertools.takewhile(str.isdigit, part))
+        if not digits:
+            break
+        parts.append(int(digits))
+    return tuple(parts)
 
 
 class StaticService:
@@ -35,13 +49,19 @@ class StaticService:
         self.config = config
         self.storages = storages
 
+        # Checked without importing it: Polars reads POLARS_MAX_THREADS when it
+        # is first imported, which must happen in the job process (see _convert)
         if any(provider.static for provider in config.providers):
-            try:
-                import gtfs_parquet  # noqa: F401
-            except ImportError as e:
+            if importlib.util.find_spec("gtfs_parquet") is None:
                 raise ImportError(
                     "Static feeds need gtfs-parquet: pip install 'gtfs_rt_aggregator[static]'"
-                ) from e
+                )
+            version = importlib.metadata.version("gtfs-parquet")
+            if _version_tuple(version) < (0, 5, 1):
+                raise ImportError(
+                    f"Static feeds need gtfs-parquet 0.5.1 or later, found {version}: "
+                    "pip install -U 'gtfs_rt_aggregator[static]'"
+                )
 
     def get_scheduling(self) -> List[Tuple[Any, callable, str, Dict[str, Any]]]:
         """
@@ -133,13 +153,15 @@ class StaticService:
                         self._save_json(storage, f"{base}/latest.json", latest)
                     return
 
-                tables = self._to_parquet_tables(zip_path, tmp)
+                tables = self._convert(zip_path, os.path.join(tmp, "parquet"))
                 if not tables:
                     raise ValueError(f"No GTFS table could be parsed from {url}")
 
-            version = format_file_time(fetch_time)
-            for table_name, data in tables.items():
-                storage.save_bytes(data, f"{base}/{version}/{table_name}.parquet")
+                version = format_file_time(fetch_time)
+                for table_name, local_path in tables.items():
+                    storage.save_file(
+                        str(local_path), f"{base}/{version}/{table_name}.parquet"
+                    )
 
             manifest = {
                 "version": version,
@@ -193,19 +215,12 @@ class StaticService:
             }
 
     @staticmethod
-    def _to_parquet_tables(zip_path: str, tmp: str) -> Dict[str, bytes]:
-        """Parse the GTFS zip and return the Parquet bytes of each table."""
-        import gtfs_parquet
+    def _convert(zip_path: str, out_dir: str) -> Dict[str, str]:
+        """Convert the GTFS zip to one Parquet file per table, in out_dir."""
+        # Polars' memory grows with its thread count (one per core by default):
+        # 4 threads keep a national feed around 0.5 GB. Only effective if Polars
+        # was not imported yet in this process, which is the case in a job.
+        os.environ.setdefault("POLARS_MAX_THREADS", "4")
+        from gtfs_parquet import convert_gtfs_zip
 
-        feed = gtfs_parquet.parse_gtfs_zip(zip_path)
-        if hasattr(gtfs_parquet, "to_parquet_bytes"):
-            return gtfs_parquet.to_parquet_bytes(feed)
-
-        # gtfs-parquet < 0.5.0 can only write to disk
-        out = os.path.join(tmp, "parquet")
-        gtfs_parquet.write_parquet(feed, out)
-        tables = {}
-        for filename in os.listdir(out):
-            with open(os.path.join(out, filename), "rb") as f:
-                tables[filename.removesuffix(".parquet")] = f.read()
-        return tables
+        return convert_gtfs_zip(zip_path, out_dir)

@@ -7,4 +7,4 @@ pydantic
 pytz
 google-cloud-storage
 minio
-gtfs-parquet>=0.4.1
+gtfs-parquet>=0.5.1

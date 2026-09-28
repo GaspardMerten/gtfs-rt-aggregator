@@ -31,7 +31,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-static = ["gtfs-parquet>=0.4.1"]
+static = ["gtfs-parquet>=0.5.1"]
 
 [project.urls]
 "Homepage" = "https://github.com/GaspardMerten/gtfs-rt-aggregator"

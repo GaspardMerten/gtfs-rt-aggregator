@@ -77,6 +77,16 @@ class MinioStorage(StorageInterface):
             )
             raise
 
+    def save_file(self, local_path: str, path: str) -> str:
+        """Upload a local file to MinIO storage without reading it in memory."""
+        object_name = self._get_object_name(path)
+        self.client.fput_object(
+            bucket_name=self.bucket_name,
+            object_name=object_name,
+            file_path=local_path,
+        )
+        return path
+
     def read_bytes(self, path: str) -> bytes:
         """Read binary data from MinIO storage."""
         self.logger.debug(f"Reading data from {path}")

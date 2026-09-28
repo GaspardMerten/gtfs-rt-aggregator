@@ -25,6 +25,19 @@ class StorageInterface(ABC):
         """
         pass
 
+    def save_file(self, local_path: str, path: str) -> str:
+        """
+        Save a local file to storage.
+
+        Backends override this to upload without reading the file in memory.
+
+        @param local_path: Path of the local file
+        @param path: Path where to save the data
+        @return Path or identifier of the saved data
+        """
+        with open(local_path, "rb") as f:
+            return self.save_bytes(f.read(), path)
+
     @abstractmethod
     def read_bytes(self, path: str) -> bytes:
         """

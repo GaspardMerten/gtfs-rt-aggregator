@@ -41,6 +41,12 @@ class GoogleCloudStorage(StorageInterface):
             self.logger.error(f"Error saving data to GCS: {e}")
             raise
 
+    def save_file(self, local_path: str, path: str) -> str:
+        """Upload a local file to Google Cloud Storage without reading it in memory."""
+        blob_path = self._get_full_path(path)
+        self.bucket.blob(blob_path).upload_from_filename(local_path)
+        return f"gs://{self.bucket_name}/{blob_path}"
+
     def read_bytes(self, path: str) -> bytes:
         """Read binary data from Google Cloud Storage."""
         try:
