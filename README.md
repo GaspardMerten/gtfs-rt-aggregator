@@ -116,6 +116,8 @@ base_path = "gtfs-feeds"  # Optional: subfolder within the bucket
     - **refresh_seconds**: How often to fetch data from this API
     - **frequency_minutes**: The time interval (in minutes) for grouping files
     - **check_interval_seconds**: How often to check for new files to aggregate
+    - **accumulate_minutes**: Keep fetches in memory and write them in blocks of this many minutes (default `0`: write every fetch right away). Blocks follow the clock in the provider's timezone: `15` gives 16:00-16:15, 16:15-16:30, and so on, and `1440` gives one block per day. The value must divide 1440 and `frequency_minutes`. A block is written when the next one starts, or when the pipeline stops cleanly. If the process is killed, the current block is lost. A whole block sits in memory, so use short blocks for large feeds.
+    - **accumulate_concatenate**: Write each block as one Parquet file instead of one file per fetch (default `true`)
 
 ## Usage
 

@@ -1,6 +1,6 @@
 from typing import List, Optional, Dict, Any
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 class StorageConfig(BaseModel):
@@ -65,7 +65,30 @@ class ApiConfig(BaseModel):
     check_interval_seconds: int = Field(
         300, description="How often to check for new files to aggregate (in seconds)"
     )
-    accumulate_count: Optional[int] = 0
+    accumulate_minutes: int = Field(
+        0,
+        ge=0,
+        description="Keep fetches in memory and write them in clock-aligned blocks of this many minutes (0 writes every fetch right away)",
+    )
+    accumulate_concatenate: bool = Field(
+        True,
+        description="Write each block as one Parquet file instead of one file per fetch",
+    )
+
+    @model_validator(mode="after")
+    def validate_accumulate_minutes(self):
+        # Windows are aligned on minutes since midnight, and must never span two
+        # aggregation periods
+        if self.accumulate_minutes:
+            if 1440 % self.accumulate_minutes:
+                raise ValueError(
+                    f"accumulate_minutes ({self.accumulate_minutes}) must divide a day (1440 minutes)"
+                )
+            if self.frequency_minutes % self.accumulate_minutes:
+                raise ValueError(
+                    f"accumulate_minutes ({self.accumulate_minutes}) must divide frequency_minutes ({self.frequency_minutes})"
+                )
+        return self
 
     @classmethod
     @field_validator("services")

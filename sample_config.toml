@@ -37,7 +37,8 @@ timezone = "Europe/Amsterdam"
   url = "https://gtfs.ovapi.nl/nl/vehiclePositions.pb"
   services = ["VehiclePosition"]
   refresh_seconds = 20  # Fetch every 20 seconds
-  frequency_minutes = 5  # Group files in 60-minute intervals
+  frequency_minutes = 5  # Group files in 5-minute intervals
+  # accumulate_minutes = 5  # Write fetches in 5-minute blocks instead of one file per fetch
   check_interval_seconds = 10  # Check for new files every 5 minutes
 
   [[providers.apis]]

@@ -1,9 +1,13 @@
 from datetime import datetime
+from io import BytesIO
 from multiprocessing import Manager
 from typing import Dict, List, Any, Tuple
 
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pytz
 
+from ..aggregator.service import AggregatorService
 from ..config.models import GtfsRtConfig
 from ..fetcher.gtfs_rt import GtfsRtFetcher
 from ..storage.base import StorageInterface
@@ -25,10 +29,41 @@ class FetcherService:
         self.logger.debug("Initializing fetcher service")
         self.config = config
         self.storages = storages
+
+        # Fetch jobs run in separate processes, so accumulated fetches live in a
+        # Manager process. One buffer and lock per (provider, API, service type),
+        # created up front so the jobs never need the Manager itself.
+        self._manager = None
+        self._accumulators = {}
+        for provider in config.providers:
+            for api in provider.apis:
+                if not api.accumulate_minutes:
+                    continue
+                if self._manager is None:
+                    self._manager = Manager()
+                for service_type in api.services:
+                    key = self._accumulator_key(provider.name, api.url, service_type)
+                    self._accumulators[key] = {
+                        "buffer": self._manager.list(),
+                        "lock": self._manager.Lock(),
+                        "minutes": api.accumulate_minutes,
+                        "concatenate": api.accumulate_concatenate,
+                        "provider_name": provider.name,
+                        "service_type": service_type,
+                    }
+
         self.logger.debug("Fetcher service initialized")
 
-        self.manager = Manager()
-        self.accumulate_storage = self.manager.dict()
+    def __getstate__(self):
+        # The Manager cannot be pickled (spawn/forkserver start methods pickle
+        # the job target); its proxies can, and are all the jobs need.
+        state = self.__dict__.copy()
+        state["_manager"] = None
+        return state
+
+    @staticmethod
+    def _accumulator_key(provider_name: str, url: str, service_type: str) -> str:
+        return f"{provider_name}|{url}|{service_type}"
 
     def get_scheduling(self) -> List[Tuple[Any, callable, str, Dict[str, Any]]]:
         """
@@ -49,7 +84,6 @@ class FetcherService:
                     "url": api.url,
                     "service_types": api.services,
                     "timezone": provider.timezone,
-                    "accumulate_count": api.accumulate_count,
                 }
 
                 self.logger.debug(
@@ -77,7 +111,6 @@ class FetcherService:
         url: str,
         service_types: List[str],
         timezone: str,
-        accumulate_count: int = 0,
     ):
         """
         Run a fetch job once.
@@ -128,35 +161,126 @@ class FetcherService:
                 )
                 path = f"{provider_name}/{service_type}/{filename}"
 
-                # Save to storage
-                job_logger.debug(f"Saving data to {path}")
+                accumulator = self._accumulators.get(
+                    self._accumulator_key(provider_name, url, service_type)
+                )
 
-                if not accumulate_count:
+                if accumulator is None:
+                    job_logger.debug(f"Saving data to {path}")
                     saved_path = storage.save_bytes(parquet_bytes, path)
                     job_logger.info(
                         f"Saved {service_type} data with {len(df)} records to {saved_path}"
                     )
+                    continue
 
+                # Clock-aligned window (e.g. 16:00-16:15), in the provider timezone
+                window = AggregatorService._get_rounded_time(
+                    fetch_time, accumulator["minutes"]
+                )
+                item = (window, path, parquet_bytes)
+
+                # Buffer and drain under the lock so concurrent jobs can neither
+                # lose a fetch nor write the same batch twice. Nothing runs when
+                # a window ends, so the first fetch of the next window writes it.
+                batch = None
+                with accumulator["lock"]:
+                    buffer = accumulator["buffer"]
+                    buffered_window = buffer[0][0] if len(buffer) else None
+                    if buffered_window is not None and window < buffered_window:
+                        # A slow job from an already written window: write it
+                        # alone rather than mixing windows
+                        batch = [item]
+                    else:
+                        if buffered_window is not None and window > buffered_window:
+                            batch = buffer[:]
+                            del buffer[:]
+                        buffer.append(item)
+
+                if batch is None:
+                    job_logger.debug(
+                        f"Buffered {service_type} data for {path} (window {window})"
+                    )
                 else:
-                    key = provider_name + service_type
-                    if key not in self.accumulate_storage:
-                        self.accumulate_storage[key] = self.manager.dict()
-                    self.accumulate_storage[key][path] = parquet_bytes
-
-                    # If we have enough accumulated data, save it
-                    if len(self.accumulate_storage[key]) >= accumulate_count:
-                        for (
-                            accumulated_path,
-                            accumulated_bytes,
-                        ) in self.accumulate_storage[key].items():
-                            storage.save_bytes(accumulated_bytes, accumulated_path)
-                        job_logger.info(
-                            f"Saved multiple {service_type} records to storage under {provider_name}"
-                        )
-                        self.accumulate_storage[key].clear()
+                    self._write_batch(
+                        storage, batch, accumulator["concatenate"], job_logger
+                    )
 
         except Exception as e:
             job_logger.error(f"Error in fetch job: {str(e)}", exc_info=True)
+
+    def flush_all(self):
+        """
+        Write every fetch still buffered in memory to storage.
+
+        Meant to be called once the fetch jobs have stopped (e.g. on shutdown).
+        """
+        for key, accumulator in self._accumulators.items():
+            try:
+                # Jobs are stopped, but one may have been killed while holding
+                # the lock: don't wait on it forever
+                acquired = accumulator["lock"].acquire(timeout=5)
+                try:
+                    buffer = accumulator["buffer"]
+                    batch = buffer[:]
+                    del buffer[:]
+                finally:
+                    if acquired:
+                        accumulator["lock"].release()
+
+                if batch:
+                    self.logger.info(
+                        f"Flushing {len(batch)} buffered fetches for {key}"
+                    )
+                    storage = self._get_storage_for_provider(
+                        accumulator["provider_name"]
+                    )
+                    self._write_batch(
+                        storage, batch, accumulator["concatenate"], self.logger
+                    )
+            except Exception as e:
+                self.logger.error(
+                    f"Error flushing buffered fetches for {key}: {str(e)}",
+                    exc_info=True,
+                )
+
+        if self._manager is not None:
+            self._manager.shutdown()
+            self._manager = None
+            self._accumulators = {}
+
+    @staticmethod
+    def _write_batch(
+        storage: StorageInterface,
+        batch: List[Tuple[datetime, str, bytes]],
+        concatenate: bool,
+        logger,
+    ):
+        """
+        Write a batch of buffered fetches, all from the same window, to storage.
+
+        @param storage: Storage interface to write to
+        @param batch: (window, path, parquet bytes) tuples, oldest first
+        @param concatenate: Write a single file instead of one per fetch
+        @param logger: Logger to use
+        """
+        if not concatenate:
+            for _, path, parquet_bytes in batch:
+                storage.save_bytes(parquet_bytes, path)
+            logger.info(f"Saved {len(batch)} buffered files, last one {batch[-1][1]}")
+            return
+
+        table = pa.concat_tables(
+            [pq.read_table(BytesIO(parquet_bytes)) for _, _, parquet_bytes in batch],
+            promote_options="default",
+        )
+        # Named after the first fetch: the aggregator groups files by that timestamp
+        saved_path = storage.save_bytes(
+            ParquetSerializer.pyarrow_table_to_bytes(table, compression="snappy"),
+            batch[0][1],
+        )
+        logger.info(
+            f"Saved {len(batch)} buffered fetches with {table.num_rows} records to {saved_path}"
+        )
 
     def _get_storage_for_provider(self, provider_name: str) -> StorageInterface:
         """

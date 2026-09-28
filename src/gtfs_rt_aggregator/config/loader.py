@@ -163,10 +163,11 @@ def _convert_toml_to_config(config_dict: Dict[str, Any]) -> GtfsRtConfig:
             refresh_seconds = api_dict.get("refresh_seconds", 60)
             frequency_minutes = api_dict.get("frequency_minutes", 60)
             check_interval_seconds = api_dict.get("check_interval_seconds", 300)
-            accumulate_count = api_dict.get("accumulate_count", 0)
+            accumulate_minutes = api_dict.get("accumulate_minutes", 0)
+            accumulate_concatenate = api_dict.get("accumulate_concatenate", True)
 
             logger.debug(
-                f"API for {name}: url={url}, services={services}, refresh={refresh_seconds}s, frequency={frequency_minutes}m, check_interval={check_interval_seconds}s"
+                f"API for {name}: url={url}, services={services}, refresh={refresh_seconds}s, frequency={frequency_minutes}m, check_interval={check_interval_seconds}s, accumulate_minutes={accumulate_minutes}, accumulate_concatenate={accumulate_concatenate}"
             )
 
             api = ApiConfig(
@@ -175,7 +176,8 @@ def _convert_toml_to_config(config_dict: Dict[str, Any]) -> GtfsRtConfig:
                 refresh_seconds=refresh_seconds,
                 frequency_minutes=frequency_minutes,
                 check_interval_seconds=check_interval_seconds,
-                accumulate_count=accumulate_count,
+                accumulate_minutes=accumulate_minutes,
+                accumulate_concatenate=accumulate_concatenate,
             )
 
             apis.append(api)

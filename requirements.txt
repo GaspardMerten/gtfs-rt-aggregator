@@ -4,5 +4,6 @@ pandas
 pyarrow
 schedule
 pydantic
+pytz
 google-cloud-storage
 minio

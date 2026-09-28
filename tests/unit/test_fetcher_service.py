@@ -1,8 +1,14 @@
+import multiprocessing
 import os
+import pickle
+import tempfile
 import unittest
+from datetime import datetime
 from io import BytesIO
+from unittest.mock import patch
 
 import pandas as pd
+import pytz
 
 from src.gtfs_rt_aggregator.config.models import (
     GtfsRtConfig,
@@ -11,6 +17,7 @@ from src.gtfs_rt_aggregator.config.models import (
     StorageConfig,
 )
 from src.gtfs_rt_aggregator.fetcher.service import FetcherService
+from src.gtfs_rt_aggregator.storage.filesystem import FileSystemStorage
 from tests.mocks import MockStorageInterface, MockServerManager
 
 # Start with a base port, but the actual port may change
@@ -209,6 +216,201 @@ class TestFetcherService(unittest.TestCase):
 
         # Should have the expected columns for vehicle positions
         self.assertIn("fetchTime", df.columns)
+
+
+class _FakeDatetime(datetime):
+    """Stand-in for datetime in the fetcher service, with a settable now()."""
+
+    current = datetime(2025, 1, 1, 16, 0, 0, tzinfo=pytz.UTC)
+
+    @classmethod
+    def now(cls, tz=None):
+        return cls.current.astimezone(tz)
+
+
+class TestFetcherServiceAccumulate(unittest.TestCase):
+    """Tests for buffering fetches in memory per clock-aligned window."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.server_manager = MockServerManager()
+        if not cls.server_manager.start():
+            raise RuntimeError("Could not start mock server")
+        cls.url = f"http://localhost:{cls.server_manager.port}/vehicle_positions"
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server_manager.stop()
+
+    def setUp(self):
+        patcher = patch(
+            "src.gtfs_rt_aggregator.fetcher.service.datetime", _FakeDatetime
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _make_service(self, storage, accumulate_minutes, concatenate=True):
+        config = GtfsRtConfig(
+            storage=StorageConfig(type="filesystem", params={}),
+            providers=[
+                ProviderConfig(
+                    name="test_provider",
+                    timezone="UTC",
+                    apis=[
+                        ApiConfig(
+                            url=self.url,
+                            services=["VehiclePosition"],
+                            accumulate_minutes=accumulate_minutes,
+                            accumulate_concatenate=concatenate,
+                        )
+                    ],
+                )
+            ],
+        )
+        service = FetcherService(config, {"global": storage})
+        self.addCleanup(service.flush_all)
+        return service
+
+    def _run(self, service, hour=None, minute=None, second=0):
+        if hour is not None:
+            _FakeDatetime.current = datetime(
+                2025, 1, 1, hour, minute, second, tzinfo=pytz.UTC
+            )
+        service.run_once(
+            provider_name="test_provider",
+            url=self.url,
+            service_types=["VehiclePosition"],
+            timezone="UTC",
+        )
+
+    def _rows(self, storage, path):
+        return len(pd.read_parquet(BytesIO(storage.get_bytes(path))))
+
+    def _single_fetch_rows(self):
+        storage = MockStorageInterface()
+        self._run(self._make_service(storage, 0))
+        (path,) = storage.list_paths()
+        return self._rows(storage, path)
+
+    def test_window_written_by_first_fetch_of_next_window(self):
+        storage = MockStorageInterface()
+        service = self._make_service(storage, 15)
+
+        self._run(service, 16, 1)
+        self._run(service, 16, 14, 59)
+        self.assertEqual(storage.list_paths(), [])
+
+        self._run(service, 16, 15)
+        prefix = "test_provider/VehiclePosition/individual/"
+        self.assertEqual(storage.list_paths(), [prefix + "2025-01-01_16-01-00.parquet"])
+        self.assertEqual(
+            self._rows(storage, storage.list_paths()[0]), 2 * self._single_fetch_rows()
+        )
+
+    def test_window_written_separately(self):
+        storage = MockStorageInterface()
+        service = self._make_service(storage, 15, concatenate=False)
+
+        self._run(service, 16, 1)
+        self._run(service, 16, 2)
+        self.assertEqual(storage.list_paths(), [])
+        self._run(service, 16, 15)
+        self.assertEqual(len(storage.list_paths()), 2)
+
+    def test_late_fetch_from_previous_window_written_alone(self):
+        storage = MockStorageInterface()
+        service = self._make_service(storage, 15)
+
+        self._run(service, 16, 15)
+        self._run(service, 16, 14, 58)
+        prefix = "test_provider/VehiclePosition/individual/"
+        self.assertEqual(storage.list_paths(), [prefix + "2025-01-01_16-14-58.parquet"])
+
+        # The 16:15 window is still buffered
+        service.flush_all()
+        self.assertIn(prefix + "2025-01-01_16-15-00.parquet", storage.list_paths())
+
+    def test_day_window_aligned_on_midnight(self):
+        storage = MockStorageInterface()
+        config = GtfsRtConfig(
+            storage=StorageConfig(type="filesystem", params={}),
+            providers=[
+                ProviderConfig(
+                    name="test_provider",
+                    timezone="UTC",
+                    apis=[
+                        ApiConfig(
+                            url=self.url,
+                            services=["VehiclePosition"],
+                            frequency_minutes=1440,
+                            accumulate_minutes=1440,
+                        )
+                    ],
+                )
+            ],
+        )
+        service = FetcherService(config, {"global": storage})
+        self.addCleanup(service.flush_all)
+
+        self._run(service, 0, 0)
+        self._run(service, 23, 59, 59)
+        self.assertEqual(storage.list_paths(), [])
+        _FakeDatetime.current = datetime(2025, 1, 2, 0, 0, 0, tzinfo=pytz.UTC)
+        self._run(service)
+        self.assertEqual(len(storage.list_paths()), 1)
+
+    def test_flush_all_writes_remaining(self):
+        storage = MockStorageInterface()
+        service = self._make_service(storage, 15)
+
+        self._run(service, 16, 1)
+        self.assertEqual(storage.list_paths(), [])
+        service.flush_all()
+        self.assertEqual(len(storage.list_paths()), 1)
+
+    def test_invalid_windows_rejected(self):
+        for minutes, frequency in ((7, 60), (45, 60), (120, 60)):
+            with self.assertRaises(ValueError):
+                ApiConfig(
+                    url=self.url,
+                    services=["VehiclePosition"],
+                    frequency_minutes=frequency,
+                    accumulate_minutes=minutes,
+                )
+        ApiConfig(
+            url=self.url,
+            services=["VehiclePosition"],
+            frequency_minutes=60,
+            accumulate_minutes=15,
+        )
+
+    def test_service_is_picklable(self):
+        # spawn/forkserver start methods pickle the job target (self.run_once)
+        service = self._make_service(MockStorageInterface(), 15)
+        pickle.dumps(service.run_once)
+
+    def test_concurrent_jobs_lose_nothing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            storage = FileSystemStorage(directory)
+            service = self._make_service(storage, 15)
+
+            _FakeDatetime.current = datetime(2025, 1, 1, 16, 1, tzinfo=pytz.UTC)
+            ctx = multiprocessing.get_context("fork")
+            processes = [
+                ctx.Process(target=self._run, args=(service,)) for _ in range(6)
+            ]
+            for process in processes:
+                process.start()
+            for process in processes:
+                process.join(timeout=60)
+            service.flush_all()
+
+            files = storage.list_files(
+                "test_provider/VehiclePosition/individual/", "*.parquet"
+            )
+            self.assertEqual(len(files), 1)
+            df = pd.read_parquet(BytesIO(storage.read_bytes(files[0])))
+            self.assertEqual(len(df), 6 * self._single_fetch_rows())
 
 
 if __name__ == "__main__":

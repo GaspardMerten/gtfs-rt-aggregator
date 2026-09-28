@@ -92,6 +92,10 @@ class GtfsRtPipeline:
         except Exception as e:
             self.logger.error(f"Error starting pipeline: {str(e)}", exc_info=True)
             self.stop()
+        finally:
+            # The scheduler returns once stopped (it handles Ctrl+C itself):
+            # write whatever the fetch jobs still had buffered
+            self.fetcher_service.flush_all()
 
     def stop(self):
         """Stop the pipeline."""
