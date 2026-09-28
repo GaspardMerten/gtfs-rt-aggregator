@@ -144,6 +144,10 @@ class TestAggregatorService(unittest.TestCase):
         extract = self.aggregator._extract_datetime_from_filename
         expected = amsterdam.localize(datetime(2026, 9, 28, 16, 0, 20))
 
+        utc = extract("p/VP/individual/2026-09-28_14-00-20Z.parquet", amsterdam)
+        self.assertEqual(utc, expected)
+        self.assertEqual(utc.hour, 16)
+        # Names from 0.3.0: local time with offset
         self.assertEqual(
             extract("p/VP/individual/2026-09-28_16-00-20+0200.parquet", amsterdam),
             expected,
@@ -165,9 +169,9 @@ class TestAggregatorService(unittest.TestCase):
         # 2026-10-25 in Amsterdam: 02:00-03:00 happens first at +0200, then at +0100
         amsterdam = pytz.timezone("Europe/Amsterdam")
         first, second, after = (
-            "p/VP/individual/2026-10-25_02-30-00+0200.parquet",
-            "p/VP/individual/2026-10-25_02-30-00+0100.parquet",
-            "p/VP/individual/2026-10-25_03-00-00+0100.parquet",
+            "p/VP/individual/2026-10-25_00-30-00Z.parquet",
+            "p/VP/individual/2026-10-25_01-30-00Z.parquet",
+            "p/VP/individual/2026-10-25_02-00-00Z.parquet",
         )
         groups = self.aggregator._group_files_by_time(
             [first, second, after], 60, amsterdam
@@ -191,9 +195,8 @@ class TestAggregatorService(unittest.TestCase):
         import pyarrow as pa
         import pyarrow.parquet as pq
 
-        from src.gtfs_rt_aggregator.aggregator.service import INDIVIDUAL_TIME_FORMAT
+        from src.gtfs_rt_aggregator.utils.file_time import format_file_time
 
-        tz = pytz.timezone(timezone)
         storage = MockStorageInterface()
         aggregator = AggregatorService(self.config, {"global": storage})
         t = start_utc
@@ -201,7 +204,7 @@ class TestAggregatorService(unittest.TestCase):
         while t < start_utc + timedelta(hours=hours):
             buffer = io.BytesIO()
             pq.write_table(pa.table({"utc": [t.isoformat()]}), buffer)
-            name = t.astimezone(tz).strftime(INDIVIDUAL_TIME_FORMAT)
+            name = format_file_time(t)
             storage.save_bytes(buffer.getvalue(), f"p/VP/individual/{name}.parquet")
             fetches += 1
             aggregator.run_once("p", ["VP"], frequency, timezone)

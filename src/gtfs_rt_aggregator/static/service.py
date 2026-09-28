@@ -8,20 +8,20 @@ from typing import Dict, List, Any, Optional, Tuple
 import pytz
 import requests
 
-from ..aggregator.service import INDIVIDUAL_TIME_FORMAT
 from ..config.models import GtfsRtConfig
 from ..storage.base import StorageInterface
+from ..utils.file_time import format_file_time
 from ..utils.log_helper import setup_logger
 
 
 class StaticService:
     """Service storing a new version of each GTFS static feed when it changes.
 
-    Layout, for a feed named "static" of provider "nl":
+    Layout, for a feed named "static" of provider "nl" (versions named in UTC):
 
-        nl/static/2026-09-28_03-00-00+0200/stops.parquet  (one file per table)
-        nl/static/2026-09-28_03-00-00+0200/manifest.json
-        nl/static/latest.json                             (copy of the last manifest)
+        nl/static/2026-09-28_01-00-00Z/stops.parquet  (one file per table)
+        nl/static/2026-09-28_01-00-00Z/manifest.json
+        nl/static/latest.json                         (copy of the last manifest)
     """
 
     def __init__(self, config: GtfsRtConfig, storages: Dict[str, StorageInterface]):
@@ -137,7 +137,7 @@ class StaticService:
                 if not tables:
                     raise ValueError(f"No GTFS table could be parsed from {url}")
 
-            version = fetch_time.strftime(INDIVIDUAL_TIME_FORMAT)
+            version = format_file_time(fetch_time)
             for table_name, data in tables.items():
                 storage.save_bytes(data, f"{base}/{version}/{table_name}.parquet")
 

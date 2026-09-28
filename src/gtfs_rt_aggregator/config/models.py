@@ -18,41 +18,28 @@ class StorageConfig(BaseModel):
         default_factory=dict, description="Storage-specific parameters"
     )
 
-    @classmethod
     @field_validator("type")
-    def validate_storage_type(cls, v):
-        """
-        Validate storage type.
-
-        @param v: Storage type value to validate
-        @return Validated storage type
-        @raises ValueError: If storage type is invalid
-        """
-        valid_types = {"filesystem", "gcs", "google", "google_cloud_storage"}
-        if v.lower() not in valid_types:
-            raise ValueError(
-                f"Invalid storage type: {v}. Must be one of: {', '.join(valid_types)}"
-            )
+    @classmethod
+    def validate_storage_type(cls, v: str) -> str:
+        # Unknown types are rejected by StorageFactory, which also accepts
+        # types registered at runtime
         return v.lower()
 
-    @classmethod
-    @field_validator("params")
-    def validate_params(cls, values):
-        """
-        Validate storage parameters based on type.
-
-        @param values: Dictionary of values to validate
-        @return Validated values
-        @raises ValueError: If required parameters are missing
-        """
-        storage_type = values.get("type")
-        params = values.get("params", {})
-
-        if storage_type in ("gcs", "google", "google_cloud_storage"):
-            if "bucket_name" not in params:
-                raise ValueError("bucket_name is required for Google Cloud Storage")
-
-        return values
+    @model_validator(mode="after")
+    def validate_params(self):
+        required = {
+            "gcs": ["bucket_name"],
+            "google": ["bucket_name"],
+            "google_cloud_storage": ["bucket_name"],
+            "minio": ["endpoint", "access_key", "secret_key", "bucket_name"],
+            "s3": ["endpoint", "access_key", "secret_key", "bucket_name"],
+        }.get(self.type, [])
+        missing = [name for name in required if name not in self.params]
+        if missing:
+            raise ValueError(
+                f"Storage type {self.type} needs params: {', '.join(missing)}"
+            )
+        return self
 
 
 class ApiConfig(BaseModel):
@@ -64,13 +51,15 @@ class ApiConfig(BaseModel):
         description="List of service types to fetch (VehiclePosition, TripUpdate, Alert, TripModifications)",
     )
     refresh_seconds: int = Field(
-        60, description="How often to fetch data from this API (in seconds)"
+        60, gt=0, description="How often to fetch data from this API (in seconds)"
     )
     frequency_minutes: int = Field(
-        60, description="How often to group data (in minutes)"
+        60, gt=0, description="How often to group data (in minutes)"
     )
     check_interval_seconds: int = Field(
-        300, description="How often to check for new files to aggregate (in seconds)"
+        300,
+        gt=0,
+        description="How often to check for new files to aggregate (in seconds)",
     )
     accumulate_minutes: int = Field(
         0,
@@ -101,38 +90,17 @@ class ApiConfig(BaseModel):
                 )
         return self
 
-    @classmethod
     @field_validator("services")
-    def validate_services(cls, v):
-        """
-        Validate service types.
-
-        @param v: List of service types to validate
-        @return Validated service types
-        @raises ValueError: If service type is invalid
-        """
-        valid_services = {"VehiclePosition", "TripUpdate", "Alert", "TripModifications"}
-        for service in v:
-            if service not in valid_services:
-                raise ValueError(
-                    f"Invalid service type: {service}. Must be one of: {', '.join(valid_services)}"
-                )
-        return v
-
     @classmethod
-    @field_validator("refresh_seconds", "frequency_minutes", "check_interval_seconds")
-    def validate_time_values(cls, v, values, field):
-        """
-        Validate time values are positive.
-
-        @param v: Time value to validate
-        @param values: Dictionary of values
-        @param field: Field being validated
-        @return Validated time value
-        @raises ValueError: If time value is not positive
-        """
-        if v <= 0:
-            raise ValueError(f"{field.name} must be positive")
+    def validate_services(cls, v: List[str]) -> List[str]:
+        valid_services = {"VehiclePosition", "TripUpdate", "Alert", "TripModifications"}
+        if not v:
+            raise ValueError("services cannot be empty")
+        invalid = [service for service in v if service not in valid_services]
+        if invalid:
+            raise ValueError(
+                f"Invalid service type: {', '.join(invalid)}. Must be one of: {', '.join(sorted(valid_services))}"
+            )
         return v
 
 
@@ -174,30 +142,14 @@ class ProviderConfig(BaseModel):
         default_factory=list, description="GTFS static feeds for this provider"
     )
     frequency_minutes: Optional[int] = Field(
-        None, description="Default grouping frequency for all APIs (in minutes)"
+        None, gt=0, description="Default grouping frequency for all APIs (in minutes)"
     )
     check_interval_seconds: Optional[int] = Field(
-        None, description="Default check interval for all APIs (in seconds)"
+        None, gt=0, description="Default check interval for all APIs (in seconds)"
     )
     storage: Optional[StorageConfig] = Field(
         None, description="Provider-specific storage configuration (overrides global)"
     )
-
-    @classmethod
-    @field_validator("frequency_minutes", "check_interval_seconds")
-    def validate_time_values(cls, v, values, field):
-        """
-        Validate time values are positive.
-
-        @param v: Time value to validate
-        @param values: Dictionary of values
-        @param field: Field being validated
-        @return Validated time value
-        @raises ValueError: If time value is not positive
-        """
-        if v is not None and v <= 0:
-            raise ValueError(f"{field.name} must be positive")
-        return v
 
     @model_validator(mode="after")
     def validate_feeds(self):
@@ -222,22 +174,16 @@ class ProviderConfig(BaseModel):
         """Realtime feeds, under the name used before 0.3.0."""
         return self.realtime
 
-    @classmethod
     @field_validator("timezone")
-    def validate_timezone(cls, v):
-        """
-        Validate timezone.
+    @classmethod
+    def validate_timezone(cls, v: str) -> str:
+        import pytz
 
-        @param v: Timezone to validate
-        @return Validated timezone
-        @raises ValueError: If timezone is invalid
-        """
         try:
-            import pytz
-
             pytz.timezone(v)
-        except Exception as e:
-            raise ValueError(f"Invalid timezone: {v}. {str(e)}")
+        except pytz.UnknownTimeZoneError:
+            raise ValueError(f"Invalid timezone: {v}")
+        return v
 
 
 class OutputConfig(BaseModel):
@@ -265,19 +211,15 @@ class GtfsRtConfig(BaseModel):
         description="Output configuration",
     )
 
-    @classmethod
     @field_validator("providers")
-    def validate_provider_names(cls, providers):
-        """
-        Validate provider names are unique.
-
-        @param providers: List of providers to validate
-        @return Validated providers
-        @raises ValueError: If provider names are not unique
-        """
+    @classmethod
+    def validate_provider_names(
+        cls, providers: List[ProviderConfig]
+    ) -> List[ProviderConfig]:
         names = [p.name for p in providers]
-        if len(names) != len(set(names)):
-            raise ValueError("Provider names must be unique")
+        duplicates = sorted({name for name in names if names.count(name) > 1})
+        if duplicates:
+            raise ValueError(f"Provider names must be unique: {', '.join(duplicates)}")
         return providers
 
     def get_provider_storage(self, provider_name: str) -> StorageConfig:

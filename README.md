@@ -153,21 +153,25 @@ A provider can have realtime feeds, static feeds, or both. Every job runs once a
 ### Storage Layout
 
 ```
-ovapi/VehiclePosition/individual/2026-09-28_16-00-20+0200.parquet   # one fetch (or one accumulated block)
-ovapi/VehiclePosition/2026-09-28/16-00-00_to_17-00-00.parquet       # aggregated
-ovapi/static/2026-09-28_03-00-00+0200/stops.parquet                 # one static version, one file per table
-ovapi/static/2026-09-28_03-00-00+0200/manifest.json
-ovapi/static/latest.json                                            # manifest of the latest version
+ovapi/VehiclePosition/individual/2026-09-28_14-00-20Z.parquet   # one fetch (or one accumulated block), UTC
+ovapi/VehiclePosition/2026-09-28/16-00-00_to_17-00-00.parquet   # aggregated, local time
+ovapi/static/2026-09-28_01-00-00Z/stops.parquet                 # one static version (UTC), one file per table
+ovapi/static/2026-09-28_01-00-00Z/manifest.json
+ovapi/static/latest.json                                        # manifest of the latest version
 ```
 
-Times are in the provider's timezone. Individual files and static versions also carry the UTC offset, so the hour that repeats when clocks go back never produces the same name twice. Aggregated files use local time only; on that night, the repeated hour ends up in a single file covering both passes. Every row keeps its own `fetchTime` (Unix time).
+Individual files and static versions are named after their fetch time in UTC (the `Z` suffix), so the hour that repeats when clocks go back never produces the same name twice. Aggregation periods, daily folders and aggregated files use the provider's timezone; on the night clocks go back, the repeated hour ends up in a single aggregated file covering both passes. Every row keeps its own `fetchTime` (Unix time).
 
 A new static version is stored only when a file inside the zip changed. The pipeline first asks the server whether the feed changed since the last check (ETag / Last-Modified), then compares the checksum and size of each file in the zip. A zip rebuilt with the same files is not stored again. Each version is a full copy of the feed. The whole feed is parsed in memory: the Dutch national feed (a 230 MB zip) needs about 6 GB of RAM and 2 minutes. If a check is still running when the next one is due, the next one is skipped.
+
+### Upgrading to 0.4.0
+
+- Individual files and static versions are now named in UTC (`2026-09-28_14-00-20Z.parquet`) instead of local time with an offset, which had a `+` that some tools read as a space. Files named the old ways are still aggregated.
+- The configuration is now validated: invalid service types, timezones, non-positive intervals, duplicate provider names and missing GCS/MinIO parameters are rejected when the file is loaded.
 
 ### Upgrading to 0.3.0
 
 - Rename `[[providers.apis]]` to `[[providers.realtime]]`. The old name still works but logs a warning.
-- Individual file names now end with the UTC offset (`2026-09-28_16-00-20+0200.parquet`). Files named the old way are still aggregated.
 - When files arrive for a period that was already aggregated, they are added to the existing aggregated file instead of replacing it.
 - `ProviderConfig.model_dump()` returns the feeds under `realtime` instead of `apis`.
 - Every job now runs once at startup instead of waiting for its first interval.

@@ -9,12 +9,8 @@ import pytz
 from ..config.models import GtfsRtConfig
 from ..storage.base import StorageInterface
 from ..utils.log_helper import setup_logger
+from ..utils.file_time import parse_file_time
 from ..utils.serializer import ParquetSerializer
-
-# Name of individual files, in the provider timezone, e.g. 2026-10-25_02-30-00+0100.
-# Files written before 0.3.0 have no UTC offset.
-INDIVIDUAL_TIME_FORMAT = "%Y-%m-%d_%H-%M-%S%z"
-LEGACY_INDIVIDUAL_TIME_FORMAT = "%Y-%m-%d_%H-%M-%S"
 
 
 class AggregatorService:
@@ -374,29 +370,24 @@ class AggregatorService:
 
         Args:
             filename: Filename to extract datetime from
-            timezone: Provider timezone, to convert names that carry a UTC offset
+            timezone: Provider timezone
 
         Returns:
-            Datetime in the provider timezone (naive for names without offset),
+            Datetime in the provider timezone (naive for names from before 0.3.0),
             or None if the name does not match
         """
         basename = (
             filename.split("/")[-1].replace("individual_", "").replace(".parquet", "")
         )
-        try:
-            dt = datetime.strptime(basename, INDIVIDUAL_TIME_FORMAT)
-            # Keep the offset: it tells the two passes of the hour that repeats
-            # when clocks go back apart
-            return dt.astimezone(timezone) if timezone is not None else dt
-        except ValueError:
-            pass
-        try:
-            return datetime.strptime(basename, LEGACY_INDIVIDUAL_TIME_FORMAT)
-        except ValueError as e:
-            self.logger.error(
-                f"Error extracting datetime from filename: {str(e)}", stack_info=True
-            )
+        dt = parse_file_time(basename)
+        if dt is None:
+            self.logger.error(f"Could not extract a datetime from filename: {filename}")
             return None
+        # Keep the real instant: it tells the two passes of the hour that
+        # repeats when clocks go back apart
+        if dt.tzinfo is not None and timezone is not None:
+            return dt.astimezone(timezone)
+        return dt
 
     @staticmethod
     def _get_rounded_time(dt: datetime, freq_minutes: int) -> datetime:

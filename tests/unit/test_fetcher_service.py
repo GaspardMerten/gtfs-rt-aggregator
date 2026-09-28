@@ -303,7 +303,7 @@ class TestFetcherServiceAccumulate(unittest.TestCase):
         self._run(service, 16, 15)
         prefix = "test_provider/VehiclePosition/individual/"
         self.assertEqual(
-            storage.list_paths(), [prefix + "2025-01-01_16-01-00+0000.parquet"]
+            storage.list_paths(), [prefix + "2025-01-01_16-01-00Z.parquet"]
         )
         self.assertEqual(
             self._rows(storage, storage.list_paths()[0]), 2 * self._single_fetch_rows()
@@ -327,12 +327,12 @@ class TestFetcherServiceAccumulate(unittest.TestCase):
         self._run(service, 16, 14, 58)
         prefix = "test_provider/VehiclePosition/individual/"
         self.assertEqual(
-            storage.list_paths(), [prefix + "2025-01-01_16-14-58+0000.parquet"]
+            storage.list_paths(), [prefix + "2025-01-01_16-14-58Z.parquet"]
         )
 
         # The 16:15 window is still buffered
         service.flush_all()
-        self.assertIn(prefix + "2025-01-01_16-15-00+0000.parquet", storage.list_paths())
+        self.assertIn(prefix + "2025-01-01_16-15-00Z.parquet", storage.list_paths())
 
     def test_day_window_aligned_on_midnight(self):
         storage = MockStorageInterface()

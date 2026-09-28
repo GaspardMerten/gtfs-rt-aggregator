@@ -2,7 +2,14 @@ import unittest
 from io import BytesIO
 
 from src.gtfs_rt_aggregator.config.loader import load_config_from_toml_file
-from src.gtfs_rt_aggregator.config.models import ApiConfig, ProviderConfig
+from pydantic import ValidationError
+
+from src.gtfs_rt_aggregator.config.models import (
+    ApiConfig,
+    GtfsRtConfig,
+    ProviderConfig,
+    StorageConfig,
+)
 
 
 def _load(toml: str):
@@ -120,6 +127,58 @@ name = "nl"
   [[providers.static]]
   url = "https://example.org/b.zip"
 """)
+
+
+class TestValidators(unittest.TestCase):
+    URL = "https://example.org/vp.pb"
+
+    def test_invalid_values_rejected(self):
+        cases = {
+            "service": lambda: ApiConfig(url=self.URL, services=["Bus"]),
+            "no service": lambda: ApiConfig(url=self.URL, services=[]),
+            "refresh": lambda: ApiConfig(
+                url=self.URL, services=["Alert"], refresh_seconds=0
+            ),
+            "frequency": lambda: ApiConfig(
+                url=self.URL, services=["Alert"], frequency_minutes=-5
+            ),
+            "timezone": lambda: ProviderConfig(
+                name="nl",
+                timezone="Europe/Amsterdm",
+                realtime=[ApiConfig(url=self.URL, services=["Alert"])],
+            ),
+            "provider frequency": lambda: ProviderConfig(
+                name="nl",
+                frequency_minutes=0,
+                realtime=[ApiConfig(url=self.URL, services=["Alert"])],
+            ),
+            "gcs bucket": lambda: StorageConfig(type="gcs", params={}),
+            "minio params": lambda: StorageConfig(
+                type="minio", params={"endpoint": "e"}
+            ),
+            "duplicate providers": lambda: GtfsRtConfig(
+                storage=StorageConfig(type="filesystem"),
+                providers=[
+                    ProviderConfig(
+                        name="nl",
+                        realtime=[ApiConfig(url=self.URL, services=["Alert"])],
+                    )
+                ]
+                * 2,
+            ),
+        }
+        for name, build in cases.items():
+            with self.subTest(name), self.assertRaises(ValidationError):
+                build()
+
+    def test_valid_values_kept(self):
+        provider = ProviderConfig(
+            name="nl",
+            timezone="Europe/Amsterdam",
+            realtime=[ApiConfig(url=self.URL, services=["TripModifications"])],
+        )
+        self.assertEqual(provider.timezone, "Europe/Amsterdam")
+        self.assertEqual(StorageConfig(type="FileSystem").type, "filesystem")
 
 
 if __name__ == "__main__":

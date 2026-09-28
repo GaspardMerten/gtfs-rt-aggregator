@@ -139,8 +139,8 @@ class TestStaticService(unittest.TestCase):
     def test_first_run_stores_full_version(self):
         self._run()
 
-        self.assertEqual(self._versions(), ["2026-09-28_03-00-00+0200"])
-        version = "nl/static/2026-09-28_03-00-00+0200"
+        self.assertEqual(self._versions(), ["2026-09-28_01-00-00Z"])
+        version = "nl/static/2026-09-28_01-00-00Z"
         for table in ("agency", "stops", "routes", "trips", "stop_times", "calendar"):
             self.assertIn(f"{version}/{table}.parquet", self.storage.list_paths())
 
@@ -179,7 +179,7 @@ class TestStaticService(unittest.TestCase):
 
         latest = json.loads(self.storage.get_bytes("nl/static/latest.json"))
         self.assertEqual(latest["etag"], '"v2"')
-        self.assertEqual(latest["version"], "2026-09-28_03-00-00+0200")
+        self.assertEqual(latest["version"], "2026-09-28_01-00-00Z")
         self.assertEqual(len(self._versions()), 1)
 
     def test_changed_file_stores_new_version(self):
@@ -190,10 +190,10 @@ class TestStaticService(unittest.TestCase):
         self._run(2)
 
         self.assertEqual(
-            self._versions(), ["2026-09-28_03-00-00+0200", "2026-09-28_04-00-00+0200"]
+            self._versions(), ["2026-09-28_01-00-00Z", "2026-09-28_02-00-00Z"]
         )
         latest = json.loads(self.storage.get_bytes("nl/static/latest.json"))
-        self.assertEqual(latest["version"], "2026-09-28_04-00-00+0200")
+        self.assertEqual(latest["version"], "2026-09-28_02-00-00Z")
         stops = pd.read_parquet(
             io.BytesIO(
                 self.storage.get_bytes(f"nl/static/{latest['version']}/stops.parquet")
@@ -226,7 +226,7 @@ class TestStaticService(unittest.TestCase):
         self._run(2)
 
         latest = json.loads(self.storage.get_bytes("nl/static/latest.json"))
-        self.assertEqual(latest["version"], "2026-09-28_04-00-00+0200")
+        self.assertEqual(latest["version"], "2026-09-28_02-00-00Z")
 
     def test_get_scheduling(self):
         (schedule,) = self.service.get_scheduling()

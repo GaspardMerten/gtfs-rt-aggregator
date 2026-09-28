@@ -7,11 +7,12 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytz
 
-from ..aggregator.service import AggregatorService, INDIVIDUAL_TIME_FORMAT
+from ..aggregator.service import AggregatorService
 from ..config.models import GtfsRtConfig
 from ..fetcher.gtfs_rt import GtfsRtFetcher
 from ..storage.base import StorageInterface
 from ..utils.log_helper import setup_logger
+from ..utils.file_time import format_file_time
 from ..utils.serializer import ParquetSerializer
 
 
@@ -160,11 +161,7 @@ class FetcherService:
                     df, compression="snappy"
                 )
 
-                # Local time plus UTC offset: without the offset, the hour that
-                # repeats when clocks go back would produce the same names twice
-                filename = (
-                    f"individual/{fetch_time.strftime(INDIVIDUAL_TIME_FORMAT)}.parquet"
-                )
+                filename = f"individual/{format_file_time(fetch_time)}.parquet"
                 path = f"{provider_name}/{service_type}/{filename}"
 
                 accumulator = self._accumulators.get(
