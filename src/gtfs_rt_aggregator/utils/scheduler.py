@@ -72,7 +72,15 @@ class SchedulerClass:
             self.exclusive_processes[job_name] = process
 
         # Headers often carry an API key: keep them out of the logs
-        logged = {k: ("***" if k == "headers" and v else v) for k, v in kwargs.items()}
+        logged = {
+            k: (
+                "***"
+                if k == "headers" and v
+                # A query string may hold an API key too
+                else v.split("?")[0] + "?***" if k == "url" and v and "?" in v else v
+            )
+            for k, v in kwargs.items()
+        }
         logging.info(f"Launched process for {func.__name__} with args {logged}")
 
     def _cleanup_processes(self):

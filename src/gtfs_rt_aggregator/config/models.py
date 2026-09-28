@@ -1,4 +1,4 @@
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Union
 
 from pydantic import (
     AliasChoices,
@@ -42,8 +42,51 @@ class StorageConfig(BaseModel):
         return self
 
 
+class FilterConfig(BaseModel):
+    """Rows of a realtime feed to keep. A row is kept if it matches any rule."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    route_types: List[Union[int, str]] = Field(
+        default_factory=list,
+        description='GTFS route types to keep, e.g. [2, "100-199"] for rail. Needs a static feed.',
+    )
+    route_ids: List[str] = Field(default_factory=list, description="Route ids to keep")
+    trip_ids: List[str] = Field(default_factory=list, description="Trip ids to keep")
+
+    @field_validator("route_types")
+    @classmethod
+    def validate_route_types(cls, v):
+        for item in v:
+            if isinstance(item, str):
+                low, _, high = item.partition("-")
+                if not (low.strip().isdigit() and high.strip().isdigit()):
+                    raise ValueError(
+                        f'route_types entries are numbers or ranges like "100-199", got {item!r}'
+                    )
+        return v
+
+    def route_type_set(self) -> set:
+        types = set()
+        for item in self.route_types:
+            if isinstance(item, int):
+                types.add(item)
+            else:
+                low, _, high = item.partition("-")
+                types.update(range(int(low), int(high) + 1))
+        return types
+
+    @property
+    def needs_static(self) -> bool:
+        # Route ids and types are matched through the static trips and routes
+        return bool(self.route_types or self.route_ids)
+
+
 class ApiConfig(BaseModel):
     """GTFS-RT (realtime) feed configuration for a provider."""
+
+    # Catch typos such as refresh_second instead of silently using the default
+    model_config = ConfigDict(extra="forbid")
 
     url: str = Field(..., description="URL of the GTFS-RT feed")
     services: List[str] = Field(
@@ -73,6 +116,24 @@ class ApiConfig(BaseModel):
     headers: Dict[str, str] = Field(
         default_factory=dict,
         description="HTTP headers sent with each request (e.g. an API key)",
+    )
+    retries: int = Field(
+        3, ge=0, description="Retries on connection errors, timeouts and 429/5xx"
+    )
+    skip_unchanged: bool = Field(
+        True,
+        description="Do not store a fetch whose entities are the same as the previous one",
+    )
+    deduplicate: bool = Field(
+        False,
+        description="When aggregating, merge consecutive identical rows of an entity into one row with firstSeen and lastSeen",
+    )
+    static: Optional[str] = Field(
+        None,
+        description="Name of the provider's static feed used for staticVersion and the filter (needed only if it has several)",
+    )
+    filter: Optional[FilterConfig] = Field(
+        None, description="Rows to keep; all rows are kept if not set"
     )
 
     @model_validator(mode="after")
@@ -110,7 +171,15 @@ class StaticConfig(BaseModel):
     # Catch typos such as check_minute instead of silently using the default
     model_config = ConfigDict(extra="forbid")
 
-    url: str = Field(..., description="URL of the GTFS zip")
+    url: Optional[str] = Field(None, description="URL of the GTFS zip")
+    index_url: Optional[str] = Field(
+        None,
+        description="Page listing the GTFS zip, for feeds whose URL changes (with url_pattern)",
+    )
+    url_pattern: Optional[str] = Field(
+        None,
+        description="Regular expression matching the zip links on index_url; the greatest match is used",
+    )
     name: str = Field(
         "static",
         min_length=1,
@@ -123,6 +192,30 @@ class StaticConfig(BaseModel):
         default_factory=dict,
         description="HTTP headers sent with each request (e.g. an API key)",
     )
+    retries: int = Field(
+        3, ge=0, description="Retries on connection errors, timeouts and 429/5xx"
+    )
+    reuse_unchanged_tables: bool = Field(
+        False,
+        description="Point to the previous version's file for tables whose source file did not change, instead of storing them again",
+    )
+
+    @model_validator(mode="after")
+    def validate_source(self):
+        if bool(self.url) == bool(self.index_url):
+            raise ValueError(
+                "A static feed needs either url, or index_url and url_pattern"
+            )
+        if self.index_url and not self.url_pattern:
+            raise ValueError("index_url needs a url_pattern")
+        if self.url_pattern:
+            import re
+
+            try:
+                re.compile(self.url_pattern)
+            except re.error as e:
+                raise ValueError(f"Invalid url_pattern: {e}")
+        return self
 
 
 class ProviderConfig(BaseModel):
@@ -167,7 +260,27 @@ class ProviderConfig(BaseModel):
             raise ValueError(
                 f"Static feed names of provider {self.name} cannot be a realtime service type: {sorted(services & set(names))}"
             )
+        for api in self.realtime:
+            if api.static is not None and api.static not in names:
+                raise ValueError(
+                    f"Realtime feed {api.url} of provider {self.name} refers to static feed {api.static!r}, which is not defined"
+                )
+            if api.filter and api.filter.needs_static and self.static_for(api) is None:
+                raise ValueError(
+                    f"The route filter of {api.url} needs a static feed in provider {self.name}"
+                    + (
+                        ' (several are defined: set static = "<name>")'
+                        if self.static
+                        else ""
+                    )
+                )
         return self
+
+    def static_for(self, api: "ApiConfig") -> Optional["StaticConfig"]:
+        """Static feed matching a realtime feed: the one it names, or the only one."""
+        if api.static is not None:
+            return next(feed for feed in self.static if feed.name == api.static)
+        return self.static[0] if len(self.static) == 1 else None
 
     @property
     def apis(self) -> List[ApiConfig]:
@@ -186,16 +299,75 @@ class ProviderConfig(BaseModel):
         return v
 
 
+DEFAULT_PATH_TEMPLATE = (
+    "provider={provider}/service={service}/date={start:%Y-%m-%d}/"
+    "{start:%H-%M-%S}_to_{end:%H-%M-%S}.parquet"
+)
+
+
 class OutputConfig(BaseModel):
-    filename_format: str = Field(
-        "{group_time}_to_{next_period}.parquet",
-        description="Filename format for output files",
+    model_config = ConfigDict(extra="forbid")
+
+    path_template: str = Field(
+        DEFAULT_PATH_TEMPLATE,
+        description="Path of aggregated files. Fields: provider, service, start, end (datetimes in the provider timezone)",
+    )
+    compact_daily: bool = Field(
+        False,
+        description="Once a day is over, merge its aggregated files into one file sorted by sort_by",
+    )
+    compacted_name: str = Field(
+        "day.parquet", description="File name of a compacted day, in the day's folder"
+    )
+    sort_by: List[str] = Field(
+        default_factory=lambda: ["entityId", "fetchTime"],
+        description="Columns a compacted day is sorted by",
     )
 
-    time_format: str = Field(
-        "%H-%M-%S",
-        description="Time format for filename timestamps",
-    )
+    @field_validator("path_template")
+    @classmethod
+    def validate_path_template(cls, v: str) -> str:
+        from datetime import datetime
+
+        try:
+            path = v.format(
+                provider="p",
+                service="s",
+                start=datetime(2026, 1, 1),
+                end=datetime(2026, 1, 1, 1),
+            )
+        except (KeyError, IndexError, ValueError) as e:
+            raise ValueError(f"Invalid path_template {v!r}: {e}")
+        if "{start" not in v:
+            raise ValueError(
+                "path_template must contain {start...}, or periods would share a file"
+            )
+        if path.startswith("/") or not path.endswith(".parquet"):
+            raise ValueError("path_template must be a relative path ending in .parquet")
+        return v
+
+    @model_validator(mode="after")
+    def validate_compaction(self):
+        if self.compact_daily:
+            from datetime import datetime
+            import posixpath
+
+            folders = {
+                posixpath.dirname(
+                    self.path_template.format(
+                        provider="p",
+                        service="s",
+                        start=datetime(2026, 1, d),
+                        end=datetime(2026, 1, d),
+                    )
+                )
+                for d in (1, 2)
+            }
+            if len(folders) == 1:
+                raise ValueError(
+                    "compact_daily needs a path_template with one folder per day (e.g. date={start:%Y-%m-%d}/)"
+                )
+        return self
 
 
 class GtfsRtConfig(BaseModel):
@@ -204,11 +376,7 @@ class GtfsRtConfig(BaseModel):
     storage: StorageConfig = Field(..., description="Global storage configuration")
     providers: List[ProviderConfig] = Field(..., description="List of providers")
     output: OutputConfig = Field(
-        OutputConfig(
-            filename_format="{group_time}_to_{next_period}.parquet",
-            time_format="%H-%M-%S",
-        ),
-        description="Output configuration",
+        default_factory=OutputConfig, description="Output configuration"
     )
 
     @field_validator("providers")

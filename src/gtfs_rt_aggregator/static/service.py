@@ -2,10 +2,12 @@ import importlib.metadata
 import itertools
 import importlib.util
 import json
+import re
 import os
 import tempfile
 import zipfile
 from datetime import datetime
+from urllib.parse import urljoin
 from typing import Dict, List, Any, Optional, Tuple
 
 import pytz
@@ -14,6 +16,7 @@ import requests
 from ..config.models import GtfsRtConfig
 from ..storage.base import StorageInterface
 from ..utils.file_time import format_file_time
+from ..utils.http import get_bytes, raise_for_status, with_retries
 from ..utils.log_helper import setup_logger
 
 
@@ -26,6 +29,33 @@ def _version_tuple(version: str) -> Tuple[int, ...]:
             break
         parts.append(int(digits))
     return tuple(parts)
+
+
+def static_base(provider_name: str, feed_name: str) -> str:
+    """Folder of a static feed's versions and latest.json."""
+    return f"{provider_name}/{feed_name}"
+
+
+def read_latest(storage: StorageInterface, base: str, logger=None) -> Optional[dict]:
+    """Manifest of the latest stored version, or None if there is none (or it
+    cannot be read: the next check then stores a full version)."""
+    path = f"{base}/latest.json"
+    if not storage.file_exists(path):
+        return None
+    try:
+        return json.loads(storage.read_bytes(path))
+    except ValueError:
+        if logger:
+            logger.warning(f"Could not read {path}, ignoring it")
+        return None
+
+
+def manifest_tables(manifest: dict, base: str) -> Dict[str, str]:
+    """Storage path of each table of a version (0.3/0.4 manifests list names)."""
+    tables = manifest.get("tables", {})
+    if isinstance(tables, list):
+        return {name: f"{base}/{manifest['version']}/{name}.parquet" for name in tables}
+    return tables
 
 
 class StaticService:
@@ -79,8 +109,12 @@ class StaticService:
                     "url": feed.url,
                     "timezone": provider.timezone,
                     "headers": feed.headers,
+                    "index_url": feed.index_url,
+                    "url_pattern": feed.url_pattern,
+                    "retries": feed.retries,
+                    "reuse_unchanged_tables": feed.reuse_unchanged_tables,
                 }
-                name = f"Static - {provider.name} - {feed.name} - {feed.url}"
+                name = f"Static - {provider.name} - {feed.name} - {feed.url or feed.index_url}"
                 # Exclusive: two checks of the same feed must not run at once
                 schedules.append(
                     (feed.check_minutes * 60, self.run_once, name, args, True)
@@ -93,26 +127,38 @@ class StaticService:
         self,
         provider_name: str,
         feed_name: str,
-        url: str,
+        url: Optional[str],
         timezone: str,
         headers: Optional[Dict[str, str]] = None,
+        index_url: Optional[str] = None,
+        url_pattern: Optional[str] = None,
+        retries: int = 3,
+        reuse_unchanged_tables: bool = False,
     ):
         """
         Check a static feed once, and store it if it changed.
 
         @param provider_name: Name of the provider
         @param feed_name: Folder of the feed under the provider folder
-        @param url: URL of the GTFS zip
+        @param url: URL of the GTFS zip (None when index_url is used)
         @param timezone: Timezone of the provider
         @param headers: HTTP headers to send (e.g. an API key)
+        @param index_url: Page listing the zip, for URLs that change
+        @param url_pattern: Regular expression matching the zip links on index_url
+        @param retries: Retries on connection errors, timeouts and 429/5xx
+        @param reuse_unchanged_tables: Point to the previous file of unchanged tables
         """
         logger = setup_logger(f"{__name__}.StaticService.job.{provider_name}")
-        base = f"{provider_name}/{feed_name}"
+        base = static_base(provider_name, feed_name)
 
         try:
             storage = self.storages.get(provider_name, self.storages["global"])
-            latest = self._read_latest(storage, base)
+            latest = read_latest(storage, base, logger)
             fetch_time = datetime.now(pytz.timezone(timezone))
+            if index_url:
+                url = self._resolve_url(
+                    index_url, url_pattern, headers, retries, logger
+                )
 
             # Only reuse the cache validators if they belong to the same URL
             request_headers = dict(headers or {})
@@ -124,18 +170,16 @@ class StaticService:
 
             with tempfile.TemporaryDirectory() as tmp:
                 zip_path = os.path.join(tmp, "feed.zip")
-                with requests.get(
-                    url, headers=request_headers, stream=True, timeout=300
-                ) as response:
-                    if response.status_code == 304:
-                        logger.info(f"{base}: not modified since the last check")
-                        return
-                    response.raise_for_status()
-                    with open(zip_path, "wb") as f:
-                        for chunk in response.iter_content(chunk_size=1 << 20):
-                            f.write(chunk)
-                    etag = response.headers.get("ETag")
-                    last_modified = response.headers.get("Last-Modified")
+                validators = with_retries(
+                    lambda: self._download(url, request_headers, zip_path),
+                    retries,
+                    logger,
+                    f"Downloading {url}",
+                )
+                if validators is None:
+                    logger.info(f"{base}: not modified since the last check")
+                    return
+                etag, last_modified = validators
 
                 files = self._zip_fingerprint(zip_path)
                 if not files:
@@ -153,15 +197,25 @@ class StaticService:
                         self._save_json(storage, f"{base}/latest.json", latest)
                     return
 
-                tables = self._convert(zip_path, os.path.join(tmp, "parquet"))
-                if not tables:
+                converted = self._convert(zip_path, os.path.join(tmp, "parquet"))
+                if not converted:
                     raise ValueError(f"No GTFS table could be parsed from {url}")
 
                 version = format_file_time(fetch_time)
-                for table_name, local_path in tables.items():
-                    storage.save_file(
-                        str(local_path), f"{base}/{version}/{table_name}.parquet"
-                    )
+                tables = {}
+                for table_name, local_path in converted.items():
+                    source = f"{table_name}.txt"
+                    if (
+                        reuse_unchanged_tables
+                        and latest
+                        and latest.get("files", {}).get(source) == files.get(source)
+                        and table_name in manifest_tables(latest, base)
+                    ):
+                        tables[table_name] = manifest_tables(latest, base)[table_name]
+                        continue
+                    path = f"{base}/{version}/{table_name}.parquet"
+                    storage.save_file(str(local_path), path)
+                    tables[table_name] = path
 
             manifest = {
                 "version": version,
@@ -170,29 +224,61 @@ class StaticService:
                 "etag": etag,
                 "last_modified": last_modified,
                 "files": files,
-                "tables": sorted(tables),
+                # Storage path of each table; with reuse_unchanged_tables, some
+                # point to an earlier version's folder
+                "tables": tables,
             }
             self._save_json(storage, f"{base}/{version}/manifest.json", manifest)
             # Written last, so a run that fails halfway is retried at the next
             # check (the incomplete version folder stays behind)
             self._save_json(storage, f"{base}/latest.json", manifest)
 
-            logger.info(f"{base}: stored new version {version} ({len(tables)} tables)")
+            reused = sum(
+                not p.startswith(f"{base}/{version}/") for p in tables.values()
+            )
+            logger.info(
+                f"{base}: stored new version {version} ({len(tables)} tables, {reused} reused)"
+            )
         except Exception as e:
             logger.error(
                 f"Error in static feed job for {base}: {str(e)}", exc_info=True
             )
 
-    def _read_latest(self, storage: StorageInterface, base: str) -> Optional[dict]:
-        path = f"{base}/latest.json"
-        if not storage.file_exists(path):
-            return None
-        try:
-            return json.loads(storage.read_bytes(path))
-        except ValueError:
-            # Treated as a first run: the next version is stored in full
-            self.logger.warning(f"Could not read {path}, ignoring it")
-            return None
+    @staticmethod
+    def _download(
+        url: str, headers: Dict[str, str], zip_path: str
+    ) -> Optional[Tuple[Optional[str], Optional[str]]]:
+        """Download url to zip_path; return (ETag, Last-Modified), or None on 304."""
+        with requests.get(url, headers=headers, stream=True, timeout=300) as response:
+            if response.status_code == 304:
+                return None
+            raise_for_status(response)
+            with open(zip_path, "wb") as f:
+                for chunk in response.iter_content(chunk_size=1 << 20):
+                    f.write(chunk)
+            return response.headers.get("ETag"), response.headers.get("Last-Modified")
+
+    @staticmethod
+    def _resolve_url(
+        index_url: str,
+        url_pattern: str,
+        headers: Optional[Dict[str, str]],
+        retries: int,
+        logger,
+    ) -> str:
+        """
+        Find the current zip URL on index_url: the greatest link matching
+        url_pattern, so that dated URLs (e.g. gtfs-20260928.zip) give the newest.
+        """
+        page = get_bytes(index_url, headers, retries, logger).decode("utf-8", "replace")
+        matches = {
+            urljoin(index_url, m.group(0)) for m in re.finditer(url_pattern, page)
+        }
+        if not matches:
+            raise ValueError(f"No link matching {url_pattern!r} on {index_url}")
+        url = max(matches)
+        logger.info(f"Resolved {index_url} to {url}")
+        return url
 
     @staticmethod
     def _save_json(storage: StorageInterface, path: str, data: dict):

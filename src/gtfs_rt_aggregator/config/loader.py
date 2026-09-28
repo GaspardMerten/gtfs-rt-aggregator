@@ -1,3 +1,5 @@
+import os
+import re
 import tomllib
 from pathlib import Path
 from typing import Dict, Any, Union, BinaryIO
@@ -57,12 +59,73 @@ def load_config_from_toml_file(toml_file: BinaryIO) -> GtfsRtConfig:
         logger.debug("Successfully parsed TOML file")
 
         # Convert to Pydantic model
-        return _convert_toml_to_config(config_dict)
+        return _convert_toml_to_config(expand_env(config_dict))
     except Exception as e:
         logger.error(
             f"Error loading configuration from file object: {str(e)}", exc_info=True
         )
         raise ValueError(f"Error loading configuration: {e}")
+
+
+_ENV_REFERENCE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
+
+
+def expand_env(value: Any, where: str = "") -> Any:
+    """
+    Replace ${NAME} with the NAME environment variable in every string value,
+    so secrets such as API keys can stay out of the file. "$${" writes a
+    literal "${".
+
+    @raises ValueError: If a referenced variable is not set
+    """
+    if isinstance(value, dict):
+        return {
+            k: expand_env(v, f"{where}.{k}" if where else k) for k, v in value.items()
+        }
+    if isinstance(value, list):
+        return [expand_env(v, f"{where}[{i}]") for i, v in enumerate(value)]
+    if not isinstance(value, str):
+        return value
+
+    def replace(match: re.Match) -> str:
+        name = match.group(1)
+        if name not in os.environ:
+            raise ValueError(
+                f"Environment variable {name} (used in {where}) is not set"
+            )
+        return os.environ[name]
+
+    parts = value.split("$${")
+    return "${".join(_ENV_REFERENCE.sub(replace, part) for part in parts)
+
+
+def _output_config(output_dict: Dict[str, Any]) -> OutputConfig:
+    """Output options, converting filename_format / time_format (before 0.5.0)."""
+    output_dict = dict(output_dict)
+    legacy = {
+        k: output_dict.pop(k)
+        for k in ("filename_format", "time_format")
+        if k in output_dict
+    }
+    if legacy:
+        if "path_template" in output_dict:
+            raise ValueError(
+                "Use path_template or filename_format/time_format, not both"
+            )
+        logger.warning(
+            "[output] filename_format and time_format are deprecated, use path_template"
+        )
+        time_format = legacy.get("time_format", "%H-%M-%S")
+        filename = legacy.get(
+            "filename_format", "{group_time}_to_{next_period}.parquet"
+        )
+        output_dict["path_template"] = (
+            "{provider}/{service}/{start:%Y-%m-%d}/"
+            + filename.replace("{group_time}", "{start:" + time_format + "}").replace(
+                "{next_period}", "{end:" + time_format + "}"
+            )
+        )
+    return OutputConfig(**output_dict)
 
 
 def _convert_toml_to_config(config_dict: Dict[str, Any]) -> GtfsRtConfig:
@@ -87,20 +150,8 @@ def _convert_toml_to_config(config_dict: Dict[str, Any]) -> GtfsRtConfig:
     logger.debug(f"Global storage configuration: type={storage_type}")
     storage_config = StorageConfig(type=storage_type, params=storage_params)
 
-    # Extract output format configuration
-    output_dict = config_dict.get("output", {})
-    output_filename_format = output_dict.get(
-        "filename_format", "{group_time}_to_{next_period}.parquet"
-    )
-    output_time_format = output_dict.get("time_format", "%H-%M-%S")
-
-    logger.debug(
-        f"Output configuration: filename_format={output_filename_format}, time_format={output_time_format}"
-    )
-
-    output_config = OutputConfig(
-        filename_format=output_filename_format, time_format=output_time_format
-    )
+    output_config = _output_config(config_dict.get("output", {}))
+    logger.debug(f"Output configuration: {output_config}")
 
     # Extract provider configurations
     providers_list = config_dict.get("providers", [])
@@ -169,37 +220,17 @@ def _convert_toml_to_config(config_dict: Dict[str, Any]) -> GtfsRtConfig:
                     f"Missing required field: provider.realtime.services for provider {name} and URL {url}"
                 )
 
-            refresh_seconds = api_dict.get("refresh_seconds", 60)
-            frequency_minutes = api_dict.get("frequency_minutes", 60)
-            check_interval_seconds = api_dict.get("check_interval_seconds", 300)
-            accumulate_minutes = api_dict.get("accumulate_minutes", 0)
-            accumulate_concatenate = api_dict.get("accumulate_concatenate", True)
-
-            logger.debug(
-                f"API for {name}: url={url}, services={services}, refresh={refresh_seconds}s, frequency={frequency_minutes}m, check_interval={check_interval_seconds}s, accumulate_minutes={accumulate_minutes}, accumulate_concatenate={accumulate_concatenate}"
-            )
-
-            api = ApiConfig(
-                url=url,
-                services=services,
-                refresh_seconds=refresh_seconds,
-                frequency_minutes=frequency_minutes,
-                check_interval_seconds=check_interval_seconds,
-                accumulate_minutes=accumulate_minutes,
-                accumulate_concatenate=accumulate_concatenate,
-                headers=api_dict.get("headers", {}),
-            )
+            api = ApiConfig(**api_dict)
+            logger.debug(f"Realtime feed for {name}: {api.url} {api.services}")
 
             apis.append(api)
 
         # Extract static feed configurations
         static_feeds = []
         for static_dict in provider_dict.get("static", []):
-            if not static_dict.get("url"):
-                raise ValueError(
-                    f"Missing required field: provider.static.url for provider {name}"
-                )
-            logger.debug(f"Static feed for {name}: {static_dict.get('url')}")
+            logger.debug(
+                f"Static feed for {name}: {static_dict.get('url') or static_dict.get('index_url')}"
+            )
             static_feeds.append(StaticConfig(**static_dict))
 
         timezone = provider_dict.get("timezone", "UTC")

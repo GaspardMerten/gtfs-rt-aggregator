@@ -1,11 +1,14 @@
+import posixpath
 from datetime import datetime, timedelta
 from io import BytesIO
 from typing import Dict, List, Any, Optional, Tuple
 
 import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.parquet as pq
 import pytz
 
+from ..aggregator.dedup import deduplicate as deduplicate_rows
 from ..config.models import GtfsRtConfig
 from ..storage.base import StorageInterface
 from ..utils.log_helper import setup_logger
@@ -52,6 +55,7 @@ class AggregatorService:
                     "service_types": api.services,
                     "frequency_minutes": api.frequency_minutes,
                     "timezone": provider.timezone,
+                    "deduplicate": api.deduplicate,
                 }
 
                 self.logger.debug(
@@ -60,6 +64,23 @@ class AggregatorService:
                 name = f"Aggregator - {provider.name} - {api.services} - {api.frequency_minutes}m"
                 # Add to schedules
                 schedules.append((check_interval, self.run_once, name, args))
+
+                if self.config.output.compact_daily:
+                    compact_args = {
+                        "provider_name": provider.name,
+                        "service_types": api.services,
+                        "timezone": provider.timezone,
+                        "deduplicate": api.deduplicate,
+                    }
+                    schedules.append(
+                        (
+                            24 * 3600,
+                            self.compact_once,
+                            f"Compaction - {provider.name} - {api.services}",
+                            compact_args,
+                            True,
+                        )
+                    )
 
         self.logger.info(f"Created {len(schedules)} aggregation schedules")
         return schedules
@@ -70,6 +91,7 @@ class AggregatorService:
         service_types: List[str],
         frequency_minutes: int,
         timezone: str,
+        deduplicate: bool = False,
     ):
         """
         Run an aggregation job once.
@@ -79,6 +101,7 @@ class AggregatorService:
             service_types: List of service types to aggregate
             frequency_minutes: Frequency in minutes for grouping
             timezone: Timezone of the provider
+            deduplicate: Merge consecutive identical rows (firstSeen / lastSeen)
         """
         job_logger = setup_logger(f"{__name__}.AggregatorService.job.{provider_name}")
         job_logger.info(
@@ -98,6 +121,7 @@ class AggregatorService:
                     frequency_minutes=frequency_minutes,
                     timezone=tz,
                     logger=job_logger,
+                    deduplicate=deduplicate,
                 )
 
             job_logger.info(f"Completed aggregation job for {provider_name}")
@@ -128,6 +152,7 @@ class AggregatorService:
         frequency_minutes: int,
         timezone: pytz.timezone,
         logger=None,
+        deduplicate: bool = False,
     ):
         """
         Aggregate a service type.
@@ -209,6 +234,7 @@ class AggregatorService:
                 next_period=next_period,
                 storage=storage,
                 logger=logger,
+                deduplicate=deduplicate,
             )
 
     def _group_files_by_time(
@@ -265,6 +291,7 @@ class AggregatorService:
         next_period: datetime,
         storage: StorageInterface,
         logger=None,
+        deduplicate: bool = False,
     ):
         """
         Aggregate files into a single file.
@@ -316,14 +343,9 @@ class AggregatorService:
                 f"Combined DataFrame has {round(table.num_rows / len(files))} records on average, for {len(files)} files"
             )
 
-            # Create path for the grouped file
-            group_time_str = group_time.strftime(self.config.output.time_format)
-            next_period_str = next_period.strftime(self.config.output.time_format)
-            day_str = group_time.strftime("%Y-%m-%d")
-            filename = self.config.output.filename_format.format(
-                group_time=group_time_str, next_period=next_period_str
+            path = self.output_path(
+                provider_name, service_type, group_time, next_period
             )
-            path = f"{provider_name}/{service_type}/{day_str}/{filename}"
 
             # Add to an existing file instead of replacing it: files can arrive
             # after their period was aggregated (a slow fetch), and when clocks
@@ -334,6 +356,11 @@ class AggregatorService:
                     [pq.read_table(BytesIO(storage.read_bytes(path))), table],
                     promote_options="default",
                 )
+
+            if deduplicate:
+                before = table.num_rows
+                table = deduplicate_rows(table)
+                logger.info(f"Deduplicated {before} rows into {table.num_rows}")
 
             # Convert to Parquet bytes
             logger.debug("Converting combined DataFrame to Parquet")
@@ -361,6 +388,82 @@ class AggregatorService:
 
         except Exception as e:
             logger.error(f"Error aggregating files: {str(e)}", exc_info=True)
+
+    def output_path(
+        self, provider_name: str, service_type: str, start: datetime, end: datetime
+    ) -> str:
+        """Path of the aggregated file of a period, from output.path_template."""
+        return self.config.output.path_template.format(
+            provider=provider_name, service=service_type, start=start, end=end
+        )
+
+    def compact_once(
+        self,
+        provider_name: str,
+        service_types: List[str],
+        timezone: str,
+        deduplicate: bool = False,
+        days_back: int = 7,
+    ):
+        """
+        Merge the aggregated files of each finished day into one file, sorted by
+        output.sort_by. Looks at the last days_back days before today; a day
+        compacted earlier is compacted again if files were added to it since.
+
+        Args:
+            provider_name: Name of the provider
+            service_types: Service types to compact
+            timezone: Timezone of the provider
+            deduplicate: Merge consecutive identical rows (firstSeen / lastSeen)
+            days_back: How many finished days to look at
+        """
+        logger = setup_logger(f"{__name__}.AggregatorService.compact.{provider_name}")
+        tz = pytz.timezone(timezone)
+        storage = self._get_storage_for_provider(provider_name)
+        today = datetime.now(tz).date()
+        name = self.config.output.compacted_name
+
+        for service_type in service_types:
+            for back in range(1, days_back + 1):
+                day = today - timedelta(days=back)
+                start = tz.localize(datetime(day.year, day.month, day.day))
+                folder = posixpath.dirname(
+                    self.output_path(provider_name, service_type, start, start)
+                )
+                try:
+                    files = sorted(
+                        f
+                        for f in storage.list_files(folder, "*.parquet")
+                        # Some backends also list files in subfolders
+                        if posixpath.dirname(f) == folder
+                    )
+                    compacted = posixpath.join(folder, name)
+                    parts = [f for f in files if posixpath.basename(f) != name]
+                    if not parts:
+                        continue
+                    tables = [
+                        pq.read_table(BytesIO(storage.read_bytes(f))) for f in files
+                    ]
+                    table = pa.concat_tables(tables, promote_options="default")
+                    if deduplicate:
+                        table = deduplicate_rows(table)
+                    sort_keys = [
+                        (c, "ascending")
+                        for c in self.config.output.sort_by
+                        if c in table.column_names
+                    ]
+                    if sort_keys:
+                        table = table.take(pc.sort_indices(table, sort_keys=sort_keys))
+                    storage.save_bytes(
+                        ParquetSerializer.pyarrow_table_to_bytes(table), compacted
+                    )
+                    for f in parts:
+                        storage.delete_file(f)
+                    logger.info(
+                        f"Compacted {len(parts)} files into {compacted} ({table.num_rows} rows)"
+                    )
+                except Exception as e:
+                    logger.error(f"Error compacting {folder}: {e}", exc_info=True)
 
     def _extract_datetime_from_filename(
         self, filename: str, timezone: Optional[pytz.BaseTzInfo] = None

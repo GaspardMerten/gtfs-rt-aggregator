@@ -1,6 +1,7 @@
+import hashlib
 from collections import defaultdict
 from datetime import datetime
-from typing import Dict, List, Any, Optional
+from typing import Dict, Iterable, List, Any, Optional, Tuple
 
 import pyarrow as pa
 import pytz
@@ -14,6 +15,7 @@ from ..schema.stop import stop_schema
 from ..schema.trip_update import trip_update_schema
 from ..schema.vehicle_position import vehicle_position_schema
 from ..utils import setup_logger
+from ..utils.http import get_bytes
 
 VEHICLE_POSITIONS = "VehiclePosition", "vehicle", vehicle_position_schema
 TRIP_UPDATE = "TripUpdate", "tripUpdate", trip_update_schema
@@ -69,24 +71,24 @@ class GtfsRtFetcher:
         return entity
 
     @staticmethod
-    def fetch_feed(url: str, headers: Optional[Dict[str, str]] = None) -> bytes:
+    def fetch_feed(
+        url: str, headers: Optional[Dict[str, str]] = None, retries: int = 3
+    ) -> bytes:
         """
         Fetch GTFS-RT feed from a URL.
 
         @param url: URL of the GTFS-RT feed
         @param headers: HTTP headers to send (e.g. an API key)
+        @param retries: Retries on connection errors, timeouts and 429/5xx
         @return Binary data of the feed
-        @raises requests.RequestException: If the request fails
+        @raises requests.RequestException: If the request still fails after retries
         """
         logger = GtfsRtFetcher.logger
         logger.debug(f"Fetching GTFS-RT feed from {url}")
-
         try:
-            response = requests.get(url, headers=headers, timeout=60)
-            response.raise_for_status()
-            content_length = len(response.content)
-            logger.debug(f"Successfully fetched {content_length} bytes from {url}")
-            return response.content
+            data = get_bytes(url, headers, retries, logger)
+            logger.debug(f"Successfully fetched {len(data)} bytes from {url}")
+            return data
         except requests.RequestException as e:
             logger.error(f"Failed to fetch feed from {url}: {str(e)}", exc_info=True)
             raise
@@ -99,70 +101,116 @@ class GtfsRtFetcher:
         @param data: Binary data of the feed
         @return Dictionary with entity types as keys and lists of entities as values
         """
-        logger = GtfsRtFetcher.logger
-        logger.debug(f"Parsing {len(data)} bytes of GTFS-RT feed data")
+        return GtfsRtFetcher.parse_feed_with_header(data)[1]
 
-        try:
-            # noinspection PyUnresolvedReferences
-            feed = gtfs_realtime_pb2.FeedMessage()
-            feed.ParseFromString(data)
+    @staticmethod
+    def parse_feed_with_header(
+        data: bytes,
+    ) -> Tuple[Optional[int], Dict[str, List[Dict[str, Any]]]]:
+        """
+        Parse GTFS-RT feed data.
 
-            # Convert to dictionary
-            feed_dict = MessageToDict(feed)
+        @param data: Binary data of the feed
+        @return The header timestamp (Unix time, None if absent) and the entities
+            by entity type
+        """
+        feed = GtfsRtFetcher.parse_message(data)
+        return feed.header.timestamp or None, GtfsRtFetcher.entities_by_service(
+            feed.entity
+        )
 
-            # Extract entities
-            entities = feed_dict.get("entity", [])
-            logger.debug(f"Found {len(entities)} entities in feed")
+    @staticmethod
+    def parse_message(data: bytes):
+        """Parse GTFS-RT bytes into a FeedMessage."""
+        # noinspection PyUnresolvedReferences
+        feed = gtfs_realtime_pb2.FeedMessage()
+        feed.ParseFromString(data)
+        GtfsRtFetcher.logger.debug(
+            f"Parsed {len(data)} bytes, {len(feed.entity)} entities"
+        )
+        return feed
 
-            # Group by entity type
-            result = defaultdict(list)
+    @staticmethod
+    def entity_hash(entity) -> str:
+        """Hash of an entity's content, to tell unchanged entities apart."""
+        return hashlib.blake2b(
+            entity.SerializeToString(deterministic=True), digest_size=8
+        ).hexdigest()
 
-            for entity in entities:
-                entity_id = entity.get("id")
+    @staticmethod
+    def entities_by_service(entities: Iterable) -> Dict[str, List[Dict[str, Any]]]:
+        """
+        Convert FeedEntity messages to dicts, grouped by service type.
 
-                for service_name, service_key, schema in SERVICE_TYPES:
-                    if service_key in entity:
-                        result[service_name].append(
-                            {
-                                "entityId": entity_id,
-                                **GtfsRtFetcher.convert_timestamp_to_int(
-                                    entity[service_key], service_name
-                                ),
-                            }
-                        )
-
-            # Log counts by service type
-            for service_name, entities_list in result.items():
-                logger.debug(
-                    f"Found {len(entities_list)} entities of type {service_name}"
-                )
-
-            return result
-        except Exception as e:
-            logger.error(f"Error parsing GTFS-RT feed: {str(e)}", exc_info=True)
-            raise
+        Each dict gets the entity id (entityId) and a hash of the entity
+        (contentHash), used to skip unchanged fetches and deduplicate rows.
+        """
+        result = defaultdict(list)
+        for entity in entities:
+            entity_dict = MessageToDict(entity)
+            content_hash = GtfsRtFetcher.entity_hash(entity)
+            for service_name, service_key, schema in SERVICE_TYPES:
+                if service_key in entity_dict:
+                    result[service_name].append(
+                        {
+                            "entityId": entity_dict.get("id"),
+                            "contentHash": content_hash,
+                            **GtfsRtFetcher.convert_timestamp_to_int(
+                                entity_dict[service_key], service_name
+                            ),
+                        }
+                    )
+        return result
 
     @staticmethod
     def insert_fetch_time(
-        entities: List[Dict[str, Any]], fetch_time: datetime
+        entities: List[Dict[str, Any]],
+        fetch_time: datetime,
+        extra: Optional[Dict[str, Any]] = None,
     ) -> List[Dict[str, Any]]:
         """
-        Add fetch time to entities.
+        Add fetch time, and any extra columns, to entities.
 
         @param entities: List of entities
         @param fetch_time: Fetch time
+        @param extra: Other values to add to every entity (e.g. feedTimestamp)
         @return List of entities with fetch time added
         """
-        logger = GtfsRtFetcher.logger
-        logger.debug(
-            f"Adding fetch time {fetch_time.isoformat()} to {len(entities)} entities"
-        )
+        added = {"fetchTime": int(fetch_time.timestamp()), **(extra or {})}
+        return [{**entity, **added} for entity in entities]
 
-        result = []
-        for entity in entities:
-            entity_copy = entity.copy()
-            entity_copy["fetchTime"] = int(fetch_time.timestamp())
-            result.append(entity_copy)
+    @classmethod
+    def to_tables(
+        cls,
+        parsed_data: Dict[str, List[Dict[str, Any]]],
+        service_types: List[str],
+        fetch_time: datetime,
+        extra: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, pa.Table]:
+        """
+        Build one flattened table per requested service type.
+
+        @param parsed_data: Entities by service type, from parse_feed
+        @param service_types: Service types to keep
+        @param fetch_time: Fetch time, stored in every row
+        @param extra: Other values stored in every row (e.g. feedTimestamp)
+        @return Tables by service type (missing service types are left out)
+        """
+        result = {}
+        for service_type in service_types:
+            if service_type not in parsed_data:
+                cls.logger.warning(f"Service type {service_type} not found in feed")
+                continue
+            table = pa.Table.from_pylist(
+                cls.insert_fetch_time(parsed_data[service_type], fetch_time, extra),
+                schema=SERVICE_TYPE_TO_SCHEMA[service_type],
+            ).flatten()
+            result[service_type] = table.rename_columns(
+                [col.replace(".", "_") for col in table.column_names]
+            )
+            cls.logger.info(
+                f"Processed {table.num_rows} records for service type {service_type}"
+            )
         return result
 
     @classmethod
@@ -172,6 +220,7 @@ class GtfsRtFetcher:
         service_types: List[str],
         timezone: str,
         headers: Optional[Dict[str, str]] = None,
+        retries: int = 3,
     ) -> Dict[str, pa.Table]:
         """
         Fetch and parse GTFS-RT data.
@@ -180,64 +229,21 @@ class GtfsRtFetcher:
         @param service_types: List of service types to fetch
         @param timezone: Timezone of the provider
         @param headers: HTTP headers to send (e.g. an API key)
-        @return Dictionary with service types as keys and DataFrames as values
+        @param retries: Retries on connection errors, timeouts and 429/5xx
+        @return Dictionary with service types as keys and tables as values
         """
-        logger = cls.logger
-        logger.info(
-            f"Fetching and parsing GTFS-RT data from {url} for service types {service_types}"
-        )
-
-        # Get timezone
-        tz = pytz.timezone(timezone)
-
-        # Fetch time
-        fetch_time = datetime.now(tz)
-        logger.debug(f"Fetch time: {fetch_time.isoformat()}")
-
+        fetch_time = datetime.now(pytz.timezone(timezone))
         try:
-            # Fetch feed
-            logger.debug(f"Fetching feed from {url}")
-            feed_data = cls.fetch_feed(url, headers)
-
-            # Parse feed
-            logger.debug("Parsing feed data")
-            parsed_data = cls.parse_feed(feed_data)
-
-            # Filter and convert to DataFrames
-            result = {}
-            for service_type in service_types:
-                if service_type in parsed_data:
-                    logger.debug(f"Processing service type: {service_type}")
-
-                    # Add fetch time
-                    entities_with_time = cls.insert_fetch_time(
-                        parsed_data[service_type], fetch_time
-                    )
-                    table = pa.Table.from_pylist(
-                        entities_with_time,
-                        schema=SERVICE_TYPE_TO_SCHEMA[service_type],
-                    ).flatten()
-
-                    table = table.rename_columns(
-                        [col.replace(".", "_") for col in table.column_names]
-                    )
-
-                    if table.num_rows > 0:
-                        logger.info(
-                            f"Successfully processed {table.num_rows} records for service type {service_type}"
-                        )
-                    else:
-                        logger.info(f"No data found for service type {service_type}")
-
-                    result[service_type] = table
-                else:
-                    logger.warning(f"Service type {service_type} not found in feed")
-
-            return result
-
+            data = cls.fetch_feed(url, headers, retries)
+            header_timestamp, parsed_data = cls.parse_feed_with_header(data)
+            return cls.to_tables(
+                parsed_data,
+                service_types,
+                fetch_time,
+                {"feedTimestamp": header_timestamp},
+            )
         except Exception as e:
-            logger.error(
+            cls.logger.error(
                 f"Error fetching or parsing feed from {url}: {str(e)}", exc_info=True
             )
-            # Return empty DataFrames for requested service types
             return {}

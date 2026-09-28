@@ -120,7 +120,7 @@ class TestFetcherService(unittest.TestCase):
         )
 
         # Check that data was saved to storage
-        saved_paths = self.storage.list_paths()
+        saved_paths = [p for p in self.storage.list_paths() if "/_status/" not in p]
 
         # Should have one saved file
         self.assertEqual(len(saved_paths), 1)
@@ -157,7 +157,7 @@ class TestFetcherService(unittest.TestCase):
         )
 
         # Check that data was saved to storage
-        saved_paths = self.storage.list_paths()
+        saved_paths = [p for p in self.storage.list_paths() if "/_status/" not in p]
 
         # Should have one saved file
         self.assertEqual(len(saved_paths), 1)
@@ -194,7 +194,7 @@ class TestFetcherService(unittest.TestCase):
         )
 
         # Check that data was saved to storage
-        saved_paths = self.storage.list_paths()
+        saved_paths = [p for p in self.storage.list_paths() if "/_status/" not in p]
 
         # Should have one saved file
         self.assertEqual(len(saved_paths), 1)
@@ -262,6 +262,8 @@ class TestFetcherServiceAccumulate(unittest.TestCase):
                             services=["VehiclePosition"],
                             accumulate_minutes=accumulate_minutes,
                             accumulate_concatenate=concatenate,
+                            # These tests fetch the same test feed repeatedly
+                            skip_unchanged=False,
                         )
                     ],
                 )
@@ -289,7 +291,7 @@ class TestFetcherServiceAccumulate(unittest.TestCase):
     def _single_fetch_rows(self):
         storage = MockStorageInterface()
         self._run(self._make_service(storage, 0))
-        (path,) = storage.list_paths()
+        (path,) = storage.list_paths("test_provider/VehiclePosition/")
         return self._rows(storage, path)
 
     def test_window_written_by_first_fetch_of_next_window(self):
@@ -298,15 +300,19 @@ class TestFetcherServiceAccumulate(unittest.TestCase):
 
         self._run(service, 16, 1)
         self._run(service, 16, 14, 59)
-        self.assertEqual(storage.list_paths(), [])
+        self.assertEqual(storage.list_paths("test_provider/VehiclePosition/"), [])
 
         self._run(service, 16, 15)
         prefix = "test_provider/VehiclePosition/individual/"
         self.assertEqual(
-            storage.list_paths(), [prefix + "2025-01-01_16-01-00Z.parquet"]
+            storage.list_paths("test_provider/VehiclePosition/"),
+            [prefix + "2025-01-01_16-01-00Z.parquet"],
         )
         self.assertEqual(
-            self._rows(storage, storage.list_paths()[0]), 2 * self._single_fetch_rows()
+            self._rows(
+                storage, storage.list_paths("test_provider/VehiclePosition/")[0]
+            ),
+            2 * self._single_fetch_rows(),
         )
 
     def test_window_written_separately(self):
@@ -315,9 +321,9 @@ class TestFetcherServiceAccumulate(unittest.TestCase):
 
         self._run(service, 16, 1)
         self._run(service, 16, 2)
-        self.assertEqual(storage.list_paths(), [])
+        self.assertEqual(storage.list_paths("test_provider/VehiclePosition/"), [])
         self._run(service, 16, 15)
-        self.assertEqual(len(storage.list_paths()), 2)
+        self.assertEqual(len(storage.list_paths("test_provider/VehiclePosition/")), 2)
 
     def test_late_fetch_from_previous_window_written_alone(self):
         storage = MockStorageInterface()
@@ -327,12 +333,16 @@ class TestFetcherServiceAccumulate(unittest.TestCase):
         self._run(service, 16, 14, 58)
         prefix = "test_provider/VehiclePosition/individual/"
         self.assertEqual(
-            storage.list_paths(), [prefix + "2025-01-01_16-14-58Z.parquet"]
+            storage.list_paths("test_provider/VehiclePosition/"),
+            [prefix + "2025-01-01_16-14-58Z.parquet"],
         )
 
         # The 16:15 window is still buffered
         service.flush_all()
-        self.assertIn(prefix + "2025-01-01_16-15-00Z.parquet", storage.list_paths())
+        self.assertIn(
+            prefix + "2025-01-01_16-15-00Z.parquet",
+            storage.list_paths("test_provider/VehiclePosition/"),
+        )
 
     def test_day_window_aligned_on_midnight(self):
         storage = MockStorageInterface()
@@ -348,6 +358,7 @@ class TestFetcherServiceAccumulate(unittest.TestCase):
                             services=["VehiclePosition"],
                             frequency_minutes=1440,
                             accumulate_minutes=1440,
+                            skip_unchanged=False,
                         )
                     ],
                 )
@@ -358,19 +369,19 @@ class TestFetcherServiceAccumulate(unittest.TestCase):
 
         self._run(service, 0, 0)
         self._run(service, 23, 59, 59)
-        self.assertEqual(storage.list_paths(), [])
+        self.assertEqual(storage.list_paths("test_provider/VehiclePosition/"), [])
         _FakeDatetime.current = datetime(2025, 1, 2, 0, 0, 0, tzinfo=pytz.UTC)
         self._run(service)
-        self.assertEqual(len(storage.list_paths()), 1)
+        self.assertEqual(len(storage.list_paths("test_provider/VehiclePosition/")), 1)
 
     def test_flush_all_writes_remaining(self):
         storage = MockStorageInterface()
         service = self._make_service(storage, 15)
 
         self._run(service, 16, 1)
-        self.assertEqual(storage.list_paths(), [])
+        self.assertEqual(storage.list_paths("test_provider/VehiclePosition/"), [])
         service.flush_all()
-        self.assertEqual(len(storage.list_paths()), 1)
+        self.assertEqual(len(storage.list_paths("test_provider/VehiclePosition/")), 1)
 
     def test_invalid_windows_rejected(self):
         for minutes, frequency in ((7, 60), (45, 60), (120, 60)):

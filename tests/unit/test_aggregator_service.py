@@ -212,7 +212,7 @@ class TestAggregatorService(unittest.TestCase):
 
         rows = []
         left = 0
-        for path in storage.list_paths("p/VP/"):
+        for path in storage.list_paths(""):
             table = pq.read_table(io.BytesIO(storage.get_bytes(path)))
             if "/individual/" in path:
                 left += table.num_rows

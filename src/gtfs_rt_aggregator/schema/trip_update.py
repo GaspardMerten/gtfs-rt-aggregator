@@ -77,6 +77,11 @@ trip_update_schema = pa.schema(
         # trip is required => nullable=False
         pa.field("entityId", pa.string(), nullable=False),
         pa.field("fetchTime", pa.uint64(), nullable=False),
+        # Timestamp from the feed header, and static version current at fetch time
+        pa.field("feedTimestamp", pa.uint64(), nullable=True),
+        pa.field("staticVersion", pa.string(), nullable=True),
+        # Hash of the entity, to skip unchanged fetches and deduplicate rows
+        pa.field("contentHash", pa.string(), nullable=True),
         pa.field("trip", trip_descriptor_type, nullable=False),
         pa.field("vehicle", vehicle_descriptor_type, nullable=True),
         pa.field("stopTimeUpdate", pa.list_(stop_time_update_type), nullable=True),

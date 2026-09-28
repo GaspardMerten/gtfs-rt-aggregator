@@ -125,6 +125,7 @@ class TestStaticService(unittest.TestCase):
             url=self.url,
             timezone="Europe/Amsterdam",
             headers={"x-api-key": "secret"},
+            retries=0,
         )
 
     def _versions(self):

@@ -160,7 +160,7 @@ class TestFullPipeline(unittest.TestCase):
         for service_type in ["VehiclePosition", "TripUpdate", "Alert"]:
             # Check for hourly aggregated files
             aggregated_files = self.storage.list_files(
-                f"{self.provider_name}/{service_type}/{now_date}/"
+                f"provider={self.provider_name}/service={service_type}/date={now_date}/"
             )
             self.assertTrue(
                 len(aggregated_files) > 0,

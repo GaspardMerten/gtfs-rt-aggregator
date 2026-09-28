@@ -1,4 +1,7 @@
-from datetime import datetime
+import hashlib
+import json
+import time
+from datetime import datetime, timezone as dt_timezone
 from io import BytesIO
 from multiprocessing import Manager
 from typing import Dict, List, Any, Optional, Tuple
@@ -8,12 +11,23 @@ import pyarrow.parquet as pq
 import pytz
 
 from ..aggregator.service import AggregatorService
-from ..config.models import GtfsRtConfig
+from ..config.models import ApiConfig, GtfsRtConfig, ProviderConfig
+from ..fetcher.filter import build_filter
 from ..fetcher.gtfs_rt import GtfsRtFetcher
+from ..static.service import manifest_tables, read_latest, static_base
 from ..storage.base import StorageInterface
 from ..utils.log_helper import setup_logger
 from ..utils.file_time import format_file_time
 from ..utils.serializer import ParquetSerializer
+
+# How long a job reuses the static version found by a previous job
+STATIC_VERSION_TTL_SECONDS = 60
+
+
+def feed_slug(api: ApiConfig) -> str:
+    """Short stable name of a realtime feed, for its status file."""
+    url_hash = hashlib.sha1(api.url.encode()).hexdigest()[:8]
+    return f"{'-'.join(api.services)}-{url_hash}"
 
 
 class FetcherService:
@@ -31,17 +45,22 @@ class FetcherService:
         self.config = config
         self.storages = storages
 
-        # Fetch jobs run in separate processes, so accumulated fetches live in a
-        # Manager process. One buffer and lock per (provider, API, service type),
-        # created up front so the jobs never need the Manager itself.
+        # Fetch jobs run in separate processes, so what they share (the previous
+        # fetch of each feed, accumulated fetches) lives in a Manager process.
+        # Proxies are created up front so the jobs never need the Manager itself.
         self._manager = None
+        self._feeds = {}
         self._accumulators = {}
         for provider in config.providers:
             for api in provider.realtime:
-                if not api.accumulate_minutes:
-                    continue
                 if self._manager is None:
                     self._manager = Manager()
+                self._feeds[self._feed_key(provider.name, api.url)] = {
+                    "lock": self._manager.Lock(),
+                    "state": self._manager.dict(),
+                }
+                if not api.accumulate_minutes:
+                    continue
                 for service_type in api.services:
                     key = self._accumulator_key(provider.name, api.url, service_type)
                     self._accumulators[key] = {
@@ -63,8 +82,17 @@ class FetcherService:
         return state
 
     @staticmethod
+    def _feed_key(provider_name: str, url: str) -> str:
+        return f"{provider_name}|{url}"
+
+    @staticmethod
     def _accumulator_key(provider_name: str, url: str, service_type: str) -> str:
         return f"{provider_name}|{url}|{service_type}"
+
+    def _find(self, provider_name: str, url: str) -> Tuple[ProviderConfig, ApiConfig]:
+        provider = next(p for p in self.config.providers if p.name == provider_name)
+        api = next(a for a in provider.realtime if a.url == url)
+        return provider, api
 
     def get_scheduling(self) -> List[Tuple[Any, callable, str, Dict[str, Any]]]:
         """
@@ -73,13 +101,9 @@ class FetcherService:
         Returns:
             List of tuples containing (schedule job, function, arguments)
         """
-        self.logger.debug("Creating fetch schedules")
         schedules = []
-
-        # Create schedules for each provider and API
         for provider in self.config.providers:
             for api in provider.realtime:
-                # Create the function arguments
                 args = {
                     "provider_name": provider.name,
                     "url": api.url,
@@ -87,21 +111,7 @@ class FetcherService:
                     "timezone": provider.timezone,
                     "headers": api.headers,
                 }
-
-                self.logger.debug(
-                    f"Created schedule for provider {provider.name}, API {api.url}, refresh {api.refresh_seconds}s"
-                )
-
-                name = (
-                    "Fetcher - "
-                    + provider.name
-                    + " - "
-                    + api.url
-                    + " - "
-                    + str(api.services)
-                )
-
-                # Add to schedules
+                name = f"Fetcher - {provider.name} - {feed_slug(api)}"
                 schedules.append((api.refresh_seconds, self.run_once, name, args))
 
         self.logger.info(f"Created {len(schedules)} fetch schedules")
@@ -125,91 +135,172 @@ class FetcherService:
         @param headers: HTTP headers to send (e.g. an API key)
         """
         job_logger = setup_logger(f"{__name__}.FetcherService.job.{provider_name}")
-        job_logger.info(f"Starting fetch job for {provider_name} from {url}")
+        provider, api = self._find(provider_name, url)
+        feed = self._feeds[self._feed_key(provider_name, url)]
+        storage = self._get_storage_for_provider(provider_name)
+        fetch_time = datetime.now(pytz.timezone(timezone))
+        status = {"last_attempt": fetch_time.isoformat()}
 
         try:
-            # Get the storage for this provider
-            storage = self._get_storage_for_provider(provider_name)
+            data = GtfsRtFetcher.fetch_feed(url, headers, api.retries)
+            message = GtfsRtFetcher.parse_message(data)
+            header_timestamp = message.header.timestamp or None
+            static_version, tables = self._static_version(provider, api, storage, feed)
 
-            # Get timezone
-            tz = pytz.timezone(timezone)
-
-            # Fetch time
-            fetch_time = datetime.now(tz)
-            job_logger.debug(f"Fetch time: {fetch_time}")
-
-            # Fetch and parse data
-            job_logger.debug(f"Fetching data for service types: {service_types}")
-            result = GtfsRtFetcher.fetch_and_parse(
-                url, service_types, timezone, headers
-            )
-
-            # Save each service type
-            for service_type, df in result.items():
-                if service_type not in service_types:
+            entities = list(message.entity)
+            if api.filter:
+                entity_filter = build_filter(
+                    api.filter,
+                    storage,
+                    tables,
+                    f"{provider_name}|{api.static}|{static_version}",
+                )
+                if entity_filter is None:
                     job_logger.warning(
-                        f"Service type {service_type} not in service types {service_types}"
-                    )
-                    continue
-
-                job_logger.debug(
-                    f"Processing {len(df)} records for service type {service_type}"
-                )
-
-                # Convert to Parquet bytes
-                parquet_bytes = ParquetSerializer.pyarrow_table_to_bytes(
-                    df, compression="snappy"
-                )
-
-                filename = f"individual/{format_file_time(fetch_time)}.parquet"
-                path = f"{provider_name}/{service_type}/{filename}"
-
-                accumulator = self._accumulators.get(
-                    self._accumulator_key(provider_name, url, service_type)
-                )
-
-                if accumulator is None:
-                    job_logger.debug(f"Saving data to {path}")
-                    saved_path = storage.save_bytes(parquet_bytes, path)
-                    job_logger.info(
-                        f"Saved {service_type} data with {len(df)} records to {saved_path}"
-                    )
-                    continue
-
-                # Clock-aligned window (e.g. 16:00-16:15), in the provider timezone
-                window = AggregatorService._get_rounded_time(
-                    fetch_time, accumulator["minutes"]
-                )
-                item = (window, path, parquet_bytes)
-
-                # Buffer and drain under the lock so concurrent jobs can neither
-                # lose a fetch nor write the same batch twice. Nothing runs when
-                # a window ends, so the first fetch of the next window writes it.
-                batch = None
-                with accumulator["lock"]:
-                    buffer = accumulator["buffer"]
-                    buffered_window = buffer[0][0] if len(buffer) else None
-                    if buffered_window is not None and window < buffered_window:
-                        # A slow job from an already written window: write it
-                        # alone rather than mixing windows
-                        batch = [item]
-                    else:
-                        if buffered_window is not None and window > buffered_window:
-                            batch = buffer[:]
-                            del buffer[:]
-                        buffer.append(item)
-
-                if batch is None:
-                    job_logger.debug(
-                        f"Buffered {service_type} data for {path} (window {window})"
+                        f"{url}: no static version stored yet, filter not applied"
                     )
                 else:
-                    self._write_batch(
-                        storage, batch, accumulator["concatenate"], job_logger
-                    )
+                    entities = [e for e in entities if entity_filter.keep(e)]
 
+            # Same entities as the previous fetch (in any order): nothing new
+            snapshot = hashlib.blake2b(
+                "".join(
+                    sorted(GtfsRtFetcher.entity_hash(e) for e in entities)
+                ).encode(),
+                digest_size=16,
+            ).hexdigest()
+            with feed["lock"]:
+                unchanged = feed["state"].get("snapshot") == snapshot
+                feed["state"]["snapshot"] = snapshot
+
+            status.update(
+                last_success=fetch_time.isoformat(),
+                feed_timestamp=header_timestamp,
+                feed_age_seconds=(
+                    round(fetch_time.timestamp() - header_timestamp)
+                    if header_timestamp
+                    else None
+                ),
+                entity_count=len(message.entity),
+                kept_count=len(entities),
+                unchanged=unchanged,
+                static_version=static_version,
+            )
+            if unchanged and api.skip_unchanged:
+                job_logger.info(
+                    f"{url}: unchanged since the previous fetch, not stored"
+                )
+                return
+
+            result = GtfsRtFetcher.to_tables(
+                GtfsRtFetcher.entities_by_service(entities),
+                service_types,
+                fetch_time,
+                {"feedTimestamp": header_timestamp, "staticVersion": static_version},
+            )
+            self._store(provider_name, url, result, fetch_time, storage, job_logger)
         except Exception as e:
-            job_logger.error(f"Error in fetch job: {str(e)}", exc_info=True)
+            status.update(last_error=str(e), last_error_at=fetch_time.isoformat())
+            job_logger.error(f"Error in fetch job for {url}: {str(e)}", exc_info=True)
+        finally:
+            self._write_status(provider_name, api, feed, status, storage, job_logger)
+
+    def _static_version(
+        self, provider: ProviderConfig, api: ApiConfig, storage, feed
+    ) -> Tuple[Optional[str], Optional[Dict[str, str]]]:
+        """
+        Current version of the provider's static feed and the path of its
+        tables, or (None, None). Looked up at most once a minute across jobs.
+        """
+        static = provider.static_for(api)
+        if static is None:
+            return None, None
+        state = feed["state"]
+        if time.time() - state.get("static_checked_at", 0) < STATIC_VERSION_TTL_SECONDS:
+            return state.get("static_version"), state.get("static_tables")
+
+        base = static_base(provider.name, static.name)
+        latest = read_latest(
+            self.storages.get(provider.name, self.storages["global"]), base, self.logger
+        )
+        version = latest.get("version") if latest else None
+        tables = manifest_tables(latest, base) if latest else None
+        state.update(
+            static_checked_at=time.time(), static_version=version, static_tables=tables
+        )
+        return version, tables
+
+    def _write_status(self, provider_name, api, feed, status, storage, logger):
+        """
+        Write the feed's status.json: last attempt, success and error, feed age,
+        entity counts. Keeps the fields of earlier fetches (e.g. the last success
+        after a failure).
+        """
+        try:
+            with feed["lock"]:
+                merged = dict(feed["state"].get("status", {}))
+                merged.update(status)
+                feed["state"]["status"] = merged
+            # The query string may hold an API key
+            merged = {"url": api.url.split("?")[0], "services": api.services, **merged}
+            storage.save_bytes(
+                json.dumps(merged, indent=2).encode("utf-8"),
+                f"{provider_name}/_status/{feed_slug(api)}.json",
+            )
+        except Exception as e:
+            logger.warning(f"Could not write the status of {api.url}: {e}")
+
+    def _store(self, provider_name, url, result, fetch_time, storage, job_logger):
+        """Save each service table, or buffer it if the feed accumulates."""
+        for service_type, df in result.items():
+            parquet_bytes = ParquetSerializer.pyarrow_table_to_bytes(
+                df, compression="snappy"
+            )
+            filename = f"individual/{format_file_time(fetch_time)}.parquet"
+            path = f"{provider_name}/{service_type}/{filename}"
+
+            accumulator = self._accumulators.get(
+                self._accumulator_key(provider_name, url, service_type)
+            )
+
+            if accumulator is None:
+                saved_path = storage.save_bytes(parquet_bytes, path)
+                job_logger.info(
+                    f"Saved {service_type} data with {len(df)} records to {saved_path}"
+                )
+                continue
+
+            # Clock-aligned window (e.g. 16:00-16:15), in the provider timezone
+            window = AggregatorService._get_rounded_time(
+                fetch_time, accumulator["minutes"]
+            )
+            item = (window, path, parquet_bytes)
+
+            # Buffer and drain under the lock so concurrent jobs can neither
+            # lose a fetch nor write the same batch twice. Nothing runs when
+            # a window ends, so the first fetch of the next window writes it.
+            batch = None
+            with accumulator["lock"]:
+                buffer = accumulator["buffer"]
+                buffered_window = buffer[0][0] if len(buffer) else None
+                if buffered_window is not None and window < buffered_window:
+                    # A slow job from an already written window: write it
+                    # alone rather than mixing windows
+                    batch = [item]
+                else:
+                    if buffered_window is not None and window > buffered_window:
+                        batch = buffer[:]
+                        del buffer[:]
+                    buffer.append(item)
+
+            if batch is None:
+                job_logger.debug(
+                    f"Buffered {service_type} data for {path} (window {window})"
+                )
+            else:
+                self._write_batch(
+                    storage, batch, accumulator["concatenate"], job_logger
+                )
 
     def flush_all(self):
         """
