@@ -1,6 +1,6 @@
 from collections import defaultdict
 from datetime import datetime
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Optional
 
 import pyarrow as pa
 import pytz
@@ -69,11 +69,12 @@ class GtfsRtFetcher:
         return entity
 
     @staticmethod
-    def fetch_feed(url: str) -> bytes:
+    def fetch_feed(url: str, headers: Optional[Dict[str, str]] = None) -> bytes:
         """
         Fetch GTFS-RT feed from a URL.
 
         @param url: URL of the GTFS-RT feed
+        @param headers: HTTP headers to send (e.g. an API key)
         @return Binary data of the feed
         @raises requests.RequestException: If the request fails
         """
@@ -81,7 +82,7 @@ class GtfsRtFetcher:
         logger.debug(f"Fetching GTFS-RT feed from {url}")
 
         try:
-            response = requests.get(url)
+            response = requests.get(url, headers=headers, timeout=60)
             response.raise_for_status()
             content_length = len(response.content)
             logger.debug(f"Successfully fetched {content_length} bytes from {url}")
@@ -166,7 +167,11 @@ class GtfsRtFetcher:
 
     @classmethod
     def fetch_and_parse(
-        cls, url: str, service_types: List[str], timezone: str
+        cls,
+        url: str,
+        service_types: List[str],
+        timezone: str,
+        headers: Optional[Dict[str, str]] = None,
     ) -> Dict[str, pa.Table]:
         """
         Fetch and parse GTFS-RT data.
@@ -174,6 +179,7 @@ class GtfsRtFetcher:
         @param url: URL of the GTFS-RT feed
         @param service_types: List of service types to fetch
         @param timezone: Timezone of the provider
+        @param headers: HTTP headers to send (e.g. an API key)
         @return Dictionary with service types as keys and DataFrames as values
         """
         logger = cls.logger
@@ -191,7 +197,7 @@ class GtfsRtFetcher:
         try:
             # Fetch feed
             logger.debug(f"Fetching feed from {url}")
-            feed_data = cls.fetch_feed(url)
+            feed_data = cls.fetch_feed(url, headers)
 
             # Parse feed
             logger.debug("Parsing feed data")

@@ -1,6 +1,13 @@
 from typing import List, Optional, Dict, Any
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import (
+    AliasChoices,
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_validator,
+)
 
 
 class StorageConfig(BaseModel):
@@ -49,7 +56,7 @@ class StorageConfig(BaseModel):
 
 
 class ApiConfig(BaseModel):
-    """API configuration for a provider."""
+    """GTFS-RT (realtime) feed configuration for a provider."""
 
     url: str = Field(..., description="URL of the GTFS-RT feed")
     services: List[str] = Field(
@@ -73,6 +80,10 @@ class ApiConfig(BaseModel):
     accumulate_concatenate: bool = Field(
         True,
         description="Write each block as one Parquet file instead of one file per fetch",
+    )
+    headers: Dict[str, str] = Field(
+        default_factory=dict,
+        description="HTTP headers sent with each request (e.g. an API key)",
     )
 
     @model_validator(mode="after")
@@ -125,12 +136,43 @@ class ApiConfig(BaseModel):
         return v
 
 
+class StaticConfig(BaseModel):
+    """GTFS static feed configuration for a provider."""
+
+    # Catch typos such as check_minute instead of silently using the default
+    model_config = ConfigDict(extra="forbid")
+
+    url: str = Field(..., description="URL of the GTFS zip")
+    name: str = Field(
+        "static",
+        min_length=1,
+        description="Folder the versions are stored in, under the provider folder",
+    )
+    check_minutes: int = Field(
+        60, gt=0, description="How often to check for a new version (in minutes)"
+    )
+    headers: Dict[str, str] = Field(
+        default_factory=dict,
+        description="HTTP headers sent with each request (e.g. an API key)",
+    )
+
+
 class ProviderConfig(BaseModel):
     """Provider configuration."""
 
+    model_config = ConfigDict(populate_by_name=True)
+
     name: str = Field(..., description="Name of the provider")
     timezone: str = Field("UTC", description="Timezone of the provider")
-    apis: List[ApiConfig] = Field(..., description="List of APIs for this provider")
+    realtime: List[ApiConfig] = Field(
+        default_factory=list,
+        # "apis" is the name used before 0.3.0
+        validation_alias=AliasChoices("realtime", "apis"),
+        description="GTFS-RT feeds for this provider",
+    )
+    static: List[StaticConfig] = Field(
+        default_factory=list, description="GTFS static feeds for this provider"
+    )
     frequency_minutes: Optional[int] = Field(
         None, description="Default grouping frequency for all APIs (in minutes)"
     )
@@ -156,6 +198,29 @@ class ProviderConfig(BaseModel):
         if v is not None and v <= 0:
             raise ValueError(f"{field.name} must be positive")
         return v
+
+    @model_validator(mode="after")
+    def validate_feeds(self):
+        if not self.realtime and not self.static:
+            raise ValueError(
+                f"Provider {self.name} has no realtime or static feed defined"
+            )
+        names = [feed.name for feed in self.static]
+        if len(names) != len(set(names)):
+            raise ValueError(
+                f"Static feeds of provider {self.name} need distinct names, got {names}"
+            )
+        services = {service for api in self.realtime for service in api.services}
+        if services & set(names):
+            raise ValueError(
+                f"Static feed names of provider {self.name} cannot be a realtime service type: {sorted(services & set(names))}"
+            )
+        return self
+
+    @property
+    def apis(self) -> List[ApiConfig]:
+        """Realtime feeds, under the name used before 0.3.0."""
+        return self.realtime
 
     @classmethod
     @field_validator("timezone")
@@ -257,7 +322,7 @@ class GtfsRtConfig(BaseModel):
 
         # Find the API
         api = None
-        for a in provider.apis:
+        for a in provider.realtime:
             if a.url == api_url:
                 api = a
                 break

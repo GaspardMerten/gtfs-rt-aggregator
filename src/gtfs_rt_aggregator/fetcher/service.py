@@ -1,13 +1,13 @@
 from datetime import datetime
 from io import BytesIO
 from multiprocessing import Manager
-from typing import Dict, List, Any, Tuple
+from typing import Dict, List, Any, Optional, Tuple
 
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytz
 
-from ..aggregator.service import AggregatorService
+from ..aggregator.service import AggregatorService, INDIVIDUAL_TIME_FORMAT
 from ..config.models import GtfsRtConfig
 from ..fetcher.gtfs_rt import GtfsRtFetcher
 from ..storage.base import StorageInterface
@@ -36,7 +36,7 @@ class FetcherService:
         self._manager = None
         self._accumulators = {}
         for provider in config.providers:
-            for api in provider.apis:
+            for api in provider.realtime:
                 if not api.accumulate_minutes:
                     continue
                 if self._manager is None:
@@ -77,13 +77,14 @@ class FetcherService:
 
         # Create schedules for each provider and API
         for provider in self.config.providers:
-            for api in provider.apis:
+            for api in provider.realtime:
                 # Create the function arguments
                 args = {
                     "provider_name": provider.name,
                     "url": api.url,
                     "service_types": api.services,
                     "timezone": provider.timezone,
+                    "headers": api.headers,
                 }
 
                 self.logger.debug(
@@ -111,6 +112,7 @@ class FetcherService:
         url: str,
         service_types: List[str],
         timezone: str,
+        headers: Optional[Dict[str, str]] = None,
     ):
         """
         Run a fetch job once.
@@ -119,6 +121,7 @@ class FetcherService:
         @param url: URL of the GTFS-RT feed
         @param service_types: List of service types to fetch
         @param timezone: Timezone of the provider
+        @param headers: HTTP headers to send (e.g. an API key)
         """
         job_logger = setup_logger(f"{__name__}.FetcherService.job.{provider_name}")
         job_logger.info(f"Starting fetch job for {provider_name} from {url}")
@@ -136,7 +139,9 @@ class FetcherService:
 
             # Fetch and parse data
             job_logger.debug(f"Fetching data for service types: {service_types}")
-            result = GtfsRtFetcher.fetch_and_parse(url, service_types, timezone)
+            result = GtfsRtFetcher.fetch_and_parse(
+                url, service_types, timezone, headers
+            )
 
             # Save each service type
             for service_type, df in result.items():
@@ -155,9 +160,10 @@ class FetcherService:
                     df, compression="snappy"
                 )
 
-                # Create path
+                # Local time plus UTC offset: without the offset, the hour that
+                # repeats when clocks go back would produce the same names twice
                 filename = (
-                    f"individual/{fetch_time.strftime('%Y-%m-%d_%H-%M-%S')}.parquet"
+                    f"individual/{fetch_time.strftime(INDIVIDUAL_TIME_FORMAT)}.parquet"
                 )
                 path = f"{provider_name}/{service_type}/{filename}"
 

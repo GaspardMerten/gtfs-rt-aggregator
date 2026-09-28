@@ -5,6 +5,7 @@ from .aggregator.service import AggregatorService
 from .config.loader import load_config_from_toml
 from .config.models import GtfsRtConfig
 from .fetcher.service import FetcherService
+from .static.service import StaticService
 from .storage import create_storage
 from .storage.base import StorageInterface
 from .utils.log_helper import setup_logger
@@ -33,6 +34,7 @@ class GtfsRtPipeline:
         # Create services
         self.fetcher_service = FetcherService(config, self.storages)
         self.aggregator_service = AggregatorService(config, self.storages)
+        self.static_service = StaticService(config, self.storages)
 
         # Create scheduler
         self.scheduler = scheduler or SchedulerClass()
@@ -79,10 +81,14 @@ class GtfsRtPipeline:
             self.logger.debug("Getting aggregator schedules")
             aggregator_schedules = self.aggregator_service.get_scheduling()
 
+            self.logger.debug("Getting static feed schedules")
+            static_schedules = self.static_service.get_scheduling()
+
             # Add schedules to the scheduler
             self.logger.debug("Adding schedules to scheduler")
             self.scheduler.add_schedules(fetcher_schedules)
             self.scheduler.add_schedules(aggregator_schedules)
+            self.scheduler.add_schedules(static_schedules)
 
             self.logger.info("Pipeline started. Press Ctrl+C to stop.")
             self.scheduler.start()

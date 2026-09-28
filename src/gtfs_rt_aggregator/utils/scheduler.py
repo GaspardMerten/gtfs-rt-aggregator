@@ -1,7 +1,7 @@
 import logging
 import multiprocessing
 import time
-from typing import List, Tuple, Callable, Dict, Any
+from typing import List, Tuple, Callable, Dict, Any, Optional
 
 import schedule
 
@@ -17,6 +17,7 @@ class SchedulerClass:
         """Initialize the scheduler."""
         self.scheduler = schedule.Scheduler()
         self.processes = []
+        self.exclusive_processes = {}
         self.running = False
         self.logger = setup_logger(
             f"{self.__class__.__module__}.{self.__class__.__name__}"
@@ -28,24 +29,38 @@ class SchedulerClass:
         Add schedules to the scheduler.
 
         Args:
-            schedules: List of tuples containing (schedule job, function, arguments)
+            schedules: List of (interval in seconds, function, name, arguments) tuples,
+                optionally followed by True for a job that must not overlap itself
         """
-        for seconds, func, name, args in schedules:
+        for seconds, func, name, args, *options in schedules:
+            exclusive = bool(options and options[0])
             self.scheduler.every(seconds).seconds.do(
-                self._run_job_in_process, func=func, **args
+                self._run_job_in_process,
+                func=func,
+                job_name=name if exclusive else None,
+                **args,
             )
             self.logger.info(f"Added schedule for {name} every {seconds} seconds")
 
-    def _run_job_in_process(self, func: Callable, **kwargs):
+    def _run_job_in_process(
+        self, func: Callable, job_name: Optional[str] = None, **kwargs
+    ):
         """
         Run a job in a separate process.
 
         Args:
             func: Function to run
+            job_name: Set for exclusive jobs: skipped while their previous run is alive
             **kwargs: Arguments to pass to the function
         """
         # Clean up completed processes before starting a new one
         self._cleanup_processes()
+
+        if job_name is not None:
+            previous = self.exclusive_processes.get(job_name)
+            if previous is not None and previous.is_alive():
+                self.logger.warning(f"Skipping {job_name}: previous run still running")
+                return
 
         # Create a new process for the job
         process = multiprocessing.Process(target=func, kwargs=kwargs)
@@ -53,8 +68,12 @@ class SchedulerClass:
 
         # Add to the list of processes
         self.processes.append(process)
+        if job_name is not None:
+            self.exclusive_processes[job_name] = process
 
-        logging.info(f"Launched process for {func.__name__} with args {kwargs}")
+        # Headers often carry an API key: keep them out of the logs
+        logged = {k: ("***" if k == "headers" and v else v) for k, v in kwargs.items()}
+        logging.info(f"Launched process for {func.__name__} with args {logged}")
 
     def _cleanup_processes(self):
         """Clean up completed processes."""
@@ -71,6 +90,9 @@ class SchedulerClass:
     def start(self):
         """Start the scheduler."""
         self.running = True
+        # Run every job once right away instead of waiting a full interval
+        # (a static feed checked daily would otherwise first run after a day)
+        self.scheduler.run_all()
         try:
             while self.running:
                 self.tick()
@@ -101,3 +123,4 @@ class SchedulerClass:
 
         # Clean up the process list
         self.processes = []
+        self.exclusive_processes = {}

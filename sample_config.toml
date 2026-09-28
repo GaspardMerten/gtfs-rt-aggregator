@@ -33,27 +33,32 @@ timezone = "Europe/Amsterdam"
   [providers.storage.params]
   base_directory = "data/ovapi-specific"  # Different directory for this provider
 
-  [[providers.apis]]
+  [[providers.realtime]]
   url = "https://gtfs.ovapi.nl/nl/vehiclePositions.pb"
   services = ["VehiclePosition"]
   refresh_seconds = 20  # Fetch every 20 seconds
   frequency_minutes = 5  # Group files in 5-minute intervals
   # accumulate_minutes = 5  # Write fetches in 5-minute blocks instead of one file per fetch
-  check_interval_seconds = 10  # Check for new files every 5 minutes
+  check_interval_seconds = 10  # Check for new files every 10 seconds
 
-  [[providers.apis]]
+  [[providers.realtime]]
   url = "https://gtfs.ovapi.nl/nl/tripUpdates.pb"
   services = ["TripUpdate"]
   refresh_seconds = 30  # Fetch every 30 seconds
   frequency_minutes = 60  # Group files in 60-minute intervals
   check_interval_seconds = 300  # Check for new files every 5 minutes
 
-  [[providers.apis]]
+  [[providers.realtime]]
   url = "https://gtfs.ovapi.nl/nl/alerts.pb"
   services = ["Alert"]
   refresh_seconds = 3600  # Fetch every hour
   frequency_minutes = 1440  # Group files in 24-hour intervals
   check_interval_seconds = 3600  # Check for new files every hour
+
+  # GTFS static feed, stored each time it changes (needs gtfs-rt-aggregator[static])
+  [[providers.static]]
+  url = "https://gtfs.ovapi.nl/nl/gtfs-nl.zip"
+  check_minutes = 60  # Check for a new version every hour
 
 [[providers]]
 name = "york"
@@ -78,7 +83,7 @@ timezone = "Europe/London"
     # secure = true
     # base_path = "realtime"
 
-    [[providers.apis]]
+    [[providers.realtime]]
     url = "https://data.bus-data.dft.gov.uk/api/v1/gtfsrtdatafeed/?boundingBox=-1.1946631,53.8989899,-1.0119385,54.0195692&api_key=YOUR_API_KEY"
     services = ["VehiclePosition", "TripUpdate", "Alert"]
     refresh_seconds = 20  # Fetch every 20 seconds

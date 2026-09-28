@@ -36,9 +36,12 @@ class FileSystemStorage(StorageInterface):
             raise IOError(f"Failed to create directory: {directory}")
 
         try:
-            # Write the data
-            with open(full_path, "wb") as f:
+            # Write to a temporary file first, so a process killed halfway
+            # never leaves a truncated file behind
+            tmp_path = f"{full_path}.tmp-{os.getpid()}"
+            with open(tmp_path, "wb") as f:
                 f.write(data)
+            os.replace(tmp_path, full_path)
 
             self.logger.debug(f"Successfully saved data to {full_path}")
             return full_path

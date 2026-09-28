@@ -8,6 +8,7 @@ from ..config.models import (
     ProviderConfig,
     ApiConfig,
     OutputConfig,
+    StaticConfig,
 )
 from ..utils.log_helper import setup_logger
 
@@ -136,28 +137,36 @@ def _convert_toml_to_config(config_dict: Dict[str, Any]) -> GtfsRtConfig:
                 type=provider_storage_type, params=provider_storage_params
             )
 
-        # Extract API configurations
-        apis_list = provider_dict.get("apis", [])
-        logger.debug(f"Found {len(apis_list)} APIs for provider {name}")
+        # Extract realtime feed configurations ("apis" before 0.3.0)
+        if "realtime" in provider_dict and "apis" in provider_dict:
+            raise ValueError(
+                f"Provider {name} defines both realtime and apis: use realtime only"
+            )
+        if "apis" in provider_dict:
+            logger.warning(
+                f"Provider {name}: [[providers.apis]] is deprecated, rename it to [[providers.realtime]]"
+            )
+        apis_list = provider_dict.get("realtime", provider_dict.get("apis", []))
+        logger.debug(f"Found {len(apis_list)} realtime feeds for provider {name}")
         apis = []
 
         for api_dict in apis_list:
             url = api_dict.get("url")
             if not url:
                 logger.error(
-                    f"Missing required field: provider.apis.url for provider {name}"
+                    f"Missing required field: provider.realtime.url for provider {name}"
                 )
                 raise ValueError(
-                    f"Missing required field: provider.apis.url for provider {name}"
+                    f"Missing required field: provider.realtime.url for provider {name}"
                 )
 
             services = api_dict.get("services", [])
             if not services:
                 logger.error(
-                    f"Missing required field: provider.apis.services for provider {name} and URL {url}"
+                    f"Missing required field: provider.realtime.services for provider {name} and URL {url}"
                 )
                 raise ValueError(
-                    f"Missing required field: provider.apis.services for provider {name} and URL {url}"
+                    f"Missing required field: provider.realtime.services for provider {name} and URL {url}"
                 )
 
             refresh_seconds = api_dict.get("refresh_seconds", 60)
@@ -178,13 +187,20 @@ def _convert_toml_to_config(config_dict: Dict[str, Any]) -> GtfsRtConfig:
                 check_interval_seconds=check_interval_seconds,
                 accumulate_minutes=accumulate_minutes,
                 accumulate_concatenate=accumulate_concatenate,
+                headers=api_dict.get("headers", {}),
             )
 
             apis.append(api)
 
-        if not apis:
-            logger.error(f"No APIs defined for provider {name}")
-            raise ValueError(f"No APIs defined for provider {name}")
+        # Extract static feed configurations
+        static_feeds = []
+        for static_dict in provider_dict.get("static", []):
+            if not static_dict.get("url"):
+                raise ValueError(
+                    f"Missing required field: provider.static.url for provider {name}"
+                )
+            logger.debug(f"Static feed for {name}: {static_dict.get('url')}")
+            static_feeds.append(StaticConfig(**static_dict))
 
         timezone = provider_dict.get("timezone", "UTC")
         logger.debug(f"Provider {name} timezone: {timezone}")
@@ -192,7 +208,8 @@ def _convert_toml_to_config(config_dict: Dict[str, Any]) -> GtfsRtConfig:
         provider = ProviderConfig(
             name=name,
             timezone=timezone,
-            apis=apis,
+            realtime=apis,
+            static=static_feeds,
             frequency_minutes=provider_dict.get("frequency_minutes"),
             check_interval_seconds=provider_dict.get("check_interval_seconds"),
             storage=provider_storage,

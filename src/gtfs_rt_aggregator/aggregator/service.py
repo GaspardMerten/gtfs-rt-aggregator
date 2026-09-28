@@ -11,6 +11,11 @@ from ..storage.base import StorageInterface
 from ..utils.log_helper import setup_logger
 from ..utils.serializer import ParquetSerializer
 
+# Name of individual files, in the provider timezone, e.g. 2026-10-25_02-30-00+0100.
+# Files written before 0.3.0 have no UTC offset.
+INDIVIDUAL_TIME_FORMAT = "%Y-%m-%d_%H-%M-%S%z"
+LEGACY_INDIVIDUAL_TIME_FORMAT = "%Y-%m-%d_%H-%M-%S"
+
 
 class AggregatorService:
     """Service for aggregating GTFS-RT data."""
@@ -41,7 +46,7 @@ class AggregatorService:
 
         # Create schedules for each provider and API
         for provider in self.config.providers:
-            for api in provider.apis:
+            for api in provider.realtime:
                 # Get the check interval
                 check_interval = api.check_interval_seconds
 
@@ -171,13 +176,16 @@ class AggregatorService:
                 f"Processing group at {group_time} with {len(group_files)} files"
             )
 
-            # Get the next time period
-            next_period = group_time + timedelta(minutes=frequency_minutes)
+            # Get the next time period, in local time
+            next_period = self._localize(
+                group_time.replace(tzinfo=None) + timedelta(minutes=frequency_minutes),
+                group_time,
+            )
 
             # Check if there's at least one file from the next time period
             has_next_period_file = False
             for file_path in files:
-                file_dt = self._extract_datetime_from_filename(file_path)
+                file_dt = self._extract_datetime_from_filename(file_path, timezone)
                 if file_dt:
                     file_dt = (
                         timezone.localize(file_dt)
@@ -228,7 +236,7 @@ class AggregatorService:
 
         for file_path in files:
             # Extract datetime from filename
-            file_dt = self._extract_datetime_from_filename(file_path)
+            file_dt = self._extract_datetime_from_filename(file_path, timezone)
             if not file_dt:
                 self.logger.warning(
                     f"Could not extract datetime from filename: {file_path}"
@@ -258,7 +266,7 @@ class AggregatorService:
         service_type: str,
         files: List[str],
         group_time: datetime,
-            next_period: datetime,
+        next_period: datetime,
         storage: StorageInterface,
         logger=None,
     ):
@@ -312,10 +320,6 @@ class AggregatorService:
                 f"Combined DataFrame has {round(table.num_rows / len(files))} records on average, for {len(files)} files"
             )
 
-            # Convert to Parquet bytes
-            logger.debug("Converting combined DataFrame to Parquet")
-            parquet_bytes = ParquetSerializer.pyarrow_table_to_bytes(table)
-
             # Create path for the grouped file
             group_time_str = group_time.strftime(self.config.output.time_format)
             next_period_str = next_period.strftime(self.config.output.time_format)
@@ -324,6 +328,20 @@ class AggregatorService:
                 group_time=group_time_str, next_period=next_period_str
             )
             path = f"{provider_name}/{service_type}/{day_str}/{filename}"
+
+            # Add to an existing file instead of replacing it: files can arrive
+            # after their period was aggregated (a slow fetch), and when clocks
+            # go back both passes of the repeated hour share the same file name
+            if storage.file_exists(path):
+                logger.info(f"Adding {len(files)} files to existing {path}")
+                table = pa.concat_tables(
+                    [pq.read_table(BytesIO(storage.read_bytes(path))), table],
+                    promote_options="default",
+                )
+
+            # Convert to Parquet bytes
+            logger.debug("Converting combined DataFrame to Parquet")
+            parquet_bytes = ParquetSerializer.pyarrow_table_to_bytes(table)
 
             # Save to storage
             logger.debug(f"Saving grouped file to {path}")
@@ -348,26 +366,33 @@ class AggregatorService:
         except Exception as e:
             logger.error(f"Error aggregating files: {str(e)}", exc_info=True)
 
-    def _extract_datetime_from_filename(self, filename: str) -> Optional[datetime]:
+    def _extract_datetime_from_filename(
+        self, filename: str, timezone: Optional[pytz.BaseTzInfo] = None
+    ) -> Optional[datetime]:
         """
-        Extract datetime from filename.
+        Extract the local fetch time from an individual file name.
 
         Args:
             filename: Filename to extract datetime from
+            timezone: Provider timezone, to convert names that carry a UTC offset
 
         Returns:
-            Extracted datetime or None if not found
+            Datetime in the provider timezone (naive for names without offset),
+            or None if the name does not match
         """
-        # Expected format: individual_YYYY-MM-DD_HH-MM-SS.parquet
+        basename = (
+            filename.split("/")[-1].replace("individual_", "").replace(".parquet", "")
+        )
         try:
-            # Extract the datetime part
-            basename = filename.split("/")[-1]
-
-            # Extract the datetime string
-            dt_str = basename.replace("individual_", "").replace(".parquet", "")
-            # Parse the datetime
-            return datetime.strptime(dt_str, "%Y-%m-%d_%H-%M-%S")
-        except Exception as e:
+            dt = datetime.strptime(basename, INDIVIDUAL_TIME_FORMAT)
+            # Keep the offset: it tells the two passes of the hour that repeats
+            # when clocks go back apart
+            return dt.astimezone(timezone) if timezone is not None else dt
+        except ValueError:
+            pass
+        try:
+            return datetime.strptime(basename, LEGACY_INDIVIDUAL_TIME_FORMAT)
+        except ValueError as e:
             self.logger.error(
                 f"Error extracting datetime from filename: {str(e)}", stack_info=True
             )
@@ -385,8 +410,27 @@ class AggregatorService:
         Returns:
             Rounded datetime
         """
-        # Round down to the nearest frequency
+        # Round down to the nearest frequency, in local time
         minutes = (dt.hour * 60 + dt.minute) // freq_minutes * freq_minutes
-        return dt.replace(
+        rounded = dt.replace(
             hour=minutes // 60, minute=minutes % 60, second=0, microsecond=0
         )
+        return AggregatorService._localize(rounded.replace(tzinfo=None), dt)
+
+    @staticmethod
+    def _localize(naive: datetime, reference: datetime) -> datetime:
+        """
+        Attach the timezone of an aware reference datetime to a naive local time.
+
+        dt.replace(hour=...) on a pytz datetime keeps the UTC offset of the
+        original time, which is wrong when the clocks changed in between (e.g.
+        midnight on the day clocks go back). An ambiguous time takes the same
+        side of the change as the reference.
+        """
+        if reference.tzinfo is None:
+            return naive
+        localize = getattr(reference.tzinfo, "localize", None)
+        if localize is None:
+            # Not a pytz timezone (e.g. zoneinfo): replace() is already correct
+            return naive.replace(tzinfo=reference.tzinfo)
+        return localize(naive, is_dst=bool(reference.dst()))

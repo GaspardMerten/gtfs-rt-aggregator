@@ -36,8 +36,10 @@ class GoogleCloudStorage(StorageInterface):
 
             return f"gs://{self.bucket_name}/{blob_path}"
         except Exception as e:
+            # Raise like the other backends: callers must not go on (e.g. delete
+            # the individual files) after a failed save
             self.logger.error(f"Error saving data to GCS: {e}")
-            return ""
+            raise
 
     def read_bytes(self, path: str) -> bytes:
         """Read binary data from Google Cloud Storage."""

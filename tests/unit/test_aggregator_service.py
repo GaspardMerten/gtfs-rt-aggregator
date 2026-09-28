@@ -139,6 +139,123 @@ class TestAggregatorService(unittest.TestCase):
             self.assertEqual(kwargs.get("service_type"), self.service_type)
             self.assertEqual(kwargs.get("frequency_minutes"), self.frequency_minutes)
 
+    def test_extract_datetime_with_and_without_offset(self):
+        amsterdam = pytz.timezone("Europe/Amsterdam")
+        extract = self.aggregator._extract_datetime_from_filename
+        expected = amsterdam.localize(datetime(2026, 9, 28, 16, 0, 20))
+
+        self.assertEqual(
+            extract("p/VP/individual/2026-09-28_16-00-20+0200.parquet", amsterdam),
+            expected,
+        )
+        # Written in another offset: same instant
+        converted = extract(
+            "p/VP/individual/2026-09-28_14-00-20+0000.parquet", amsterdam
+        )
+        self.assertEqual(converted, expected)
+        self.assertEqual(converted.hour, 16)
+        # Before 0.3.0: naive local time
+        self.assertEqual(
+            extract("p/VP/individual/2026-09-28_16-00-20.parquet", amsterdam),
+            datetime(2026, 9, 28, 16, 0, 20),
+        )
+        self.assertIsNone(extract("p/VP/individual/not-a-date.parquet", amsterdam))
+
+    def test_repeated_hour_when_clocks_go_back(self):
+        # 2026-10-25 in Amsterdam: 02:00-03:00 happens first at +0200, then at +0100
+        amsterdam = pytz.timezone("Europe/Amsterdam")
+        first, second, after = (
+            "p/VP/individual/2026-10-25_02-30-00+0200.parquet",
+            "p/VP/individual/2026-10-25_02-30-00+0100.parquet",
+            "p/VP/individual/2026-10-25_03-00-00+0100.parquet",
+        )
+        groups = self.aggregator._group_files_by_time(
+            [first, second, after], 60, amsterdam
+        )
+
+        # Three distinct hours; the two passes of 02:00 are written to the same
+        # output file, which the aggregator extends instead of replacing
+        self.assertEqual(
+            [groups[group] for group in sorted(groups)], [[first], [second], [after]]
+        )
+        self.assertEqual(
+            [group.strftime("%H:%M%z") for group in sorted(groups)],
+            ["02:00+0200", "02:00+0100", "03:00+0100"],
+        )
+
+    def _simulate(self, timezone, start_utc, hours, frequency, step_minutes=5):
+        """Fetch every step_minutes and aggregate after each fetch; return
+        (fetches, rows in aggregated files, individual files left)."""
+        import io
+
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        from src.gtfs_rt_aggregator.aggregator.service import INDIVIDUAL_TIME_FORMAT
+
+        tz = pytz.timezone(timezone)
+        storage = MockStorageInterface()
+        aggregator = AggregatorService(self.config, {"global": storage})
+        t = start_utc
+        fetches = 0
+        while t < start_utc + timedelta(hours=hours):
+            buffer = io.BytesIO()
+            pq.write_table(pa.table({"utc": [t.isoformat()]}), buffer)
+            name = t.astimezone(tz).strftime(INDIVIDUAL_TIME_FORMAT)
+            storage.save_bytes(buffer.getvalue(), f"p/VP/individual/{name}.parquet")
+            fetches += 1
+            aggregator.run_once("p", ["VP"], frequency, timezone)
+            t += timedelta(minutes=step_minutes)
+
+        rows = []
+        left = 0
+        for path in storage.list_paths("p/VP/"):
+            table = pq.read_table(io.BytesIO(storage.get_bytes(path)))
+            if "/individual/" in path:
+                left += table.num_rows
+            else:
+                rows += table.column("utc").to_pylist()
+        self.assertEqual(len(rows), len(set(rows)), "duplicated rows")
+        return fetches, len(rows), left
+
+    def test_no_loss_around_clock_changes(self):
+        cases = [
+            # clocks go back
+            ("Europe/Amsterdam", datetime(2026, 10, 24, 23, tzinfo=pytz.UTC), 4),
+            ("Europe/London", datetime(2026, 10, 24, 23, tzinfo=pytz.UTC), 4),
+            # clocks go forward
+            ("Europe/Amsterdam", datetime(2026, 3, 28, 23, tzinfo=pytz.UTC), 4),
+        ]
+        for timezone, start, hours in cases:
+            for frequency in (15, 60):
+                with self.subTest(timezone=timezone, start=start, frequency=frequency):
+                    fetches, aggregated, left = self._simulate(
+                        timezone, start, hours, frequency
+                    )
+                    self.assertEqual(aggregated + left, fetches)
+                    # Only the last, unfinished period may still be waiting
+                    self.assertLessEqual(left, frequency // 5)
+
+    def test_daily_groups_on_clock_change_days(self):
+        for start in (
+            datetime(2026, 10, 24, 12, tzinfo=pytz.UTC),
+            datetime(2026, 3, 28, 12, tzinfo=pytz.UTC),
+        ):
+            with self.subTest(start=start):
+                fetches, aggregated, left = self._simulate(
+                    "Europe/Amsterdam", start, 60, 1440, step_minutes=60
+                )
+                self.assertEqual(aggregated + left, fetches)
+                self.assertLessEqual(left, 24)
+
+    def test_rounding_keeps_the_right_offset(self):
+        amsterdam = pytz.timezone("Europe/Amsterdam")
+        # 16:00 on the day clocks go back is +0100, but that day's midnight is +0200
+        dt = amsterdam.localize(datetime(2026, 10, 25, 16, 0))
+        midnight = AggregatorService._get_rounded_time(dt, 1440)
+        self.assertEqual(midnight, amsterdam.localize(datetime(2026, 10, 25, 0, 0)))
+        self.assertEqual(midnight.utcoffset(), timedelta(hours=2))
+
     def test_get_scheduling(self):
         """Test get_scheduling method."""
         # Get the scheduling
