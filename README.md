@@ -1,7 +1,8 @@
 # GTFS-RT Aggregator
 
 This project provides a pipeline for fetching, storing, and aggregating GTFS-RT (General Transit Feed Specification -
-Realtime) data from multiple providers into Parquet format.
+Realtime) data from multiple providers into Parquet format. It can also keep a Parquet copy of each version of the
+providers' GTFS static feeds.
 
 ## Features
 
@@ -15,16 +16,9 @@ Realtime) data from multiple providers into Parquet format.
 ## Requirements
 
 - Python 3.11+
-- Required Python packages (see requirements.txt):
-  - requests
-  - gtfs-realtime-bindings
-  - pandas
-  - pyarrow
-  - schedule
-  - pydantic
-  - google-cloud-storage (optional, for GCS storage)
-  - minio (optional, for MinIO storage)
-  - gtfs-parquet (optional, for GTFS static feeds)
+- Installed with the package: requests, gtfs-realtime-bindings, protobuf, pandas, pyarrow, pytz, schedule, pydantic,
+  google-cloud-storage and minio
+- Only with the `static` extra: gtfs-parquet (which brings in Polars), for GTFS static feeds
 
 ## Installation
 
@@ -127,19 +121,24 @@ base_path = "gtfs-feeds"  # Optional: subfolder within the bucket
 
 - **storage**: Global storage configuration
   - **type**: Storage backend type ("filesystem", "gcs", or "minio")
-  - **params**: Backend-specific parameters
+  - **params**: Backend-specific parameters (`bucket_name` is required for GCS; `endpoint`, `access_key`, `secret_key`
+    and `bucket_name` for MinIO)
 
-- **providers**: List of GTFS-RT data providers
-  - **name**: Name of the provider (used for directory structure)
-  - **timezone**: Timezone for the provider's data
+- **output**: Optional naming of aggregated files
+  - **filename_format**: Default `"{group_time}_to_{next_period}.parquet"`
+  - **time_format**: `strftime` format of `group_time` and `next_period` (default `"%H-%M-%S"`)
+
+- **providers**: List of data providers
+  - **name**: Name of the provider (used for directory structure, must be unique)
+  - **timezone**: Timezone for the provider's data (default `"UTC"`)
   - **storage**: Optional storage for this provider only (same fields as the global one)
   - **realtime**: List of GTFS-RT feeds for this provider (called `apis` before 0.3.0, which still works)
     - **url**: URL of the GTFS-RT feed
     - **headers**: Optional HTTP headers sent with each request, e.g. an API key
     - **services**: List of service types to extract from the feed (VehiclePosition, TripUpdate, Alert, TripModifications)
-    - **refresh_seconds**: How often to fetch data from this API
-    - **frequency_minutes**: The time interval (in minutes) for grouping files
-    - **check_interval_seconds**: How often to check for new files to aggregate
+    - **refresh_seconds**: How often to fetch data from this API (default `60`)
+    - **frequency_minutes**: The time interval (in minutes) for grouping files (default `60`)
+    - **check_interval_seconds**: How often to check for new files to aggregate (default `300`)
     - **accumulate_minutes**: Keep fetches in memory and write them in blocks of this many minutes (default `0`: write every fetch right away). Blocks follow the clock in the provider's timezone: `15` gives 16:00-16:15, 16:15-16:30, and so on, and `1440` gives one block per day. The value must divide 1440 and `frequency_minutes`. A block is written when the next one starts, or when the pipeline stops cleanly. If the process is killed, the current block is lost. A whole block sits in memory, so use short blocks for large feeds.
     - **accumulate_concatenate**: Write each block as one Parquet file instead of one file per fetch (default `true`)
   - **static**: List of GTFS static feeds for this provider (needs the `static` extra)
