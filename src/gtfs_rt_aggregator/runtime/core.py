@@ -23,8 +23,12 @@ MISSING_STATIC_VERSION_TTL_SECONDS = 5
 
 def feed_slug(api: ApiConfig) -> str:
     """Short stable name of a realtime feed, for its status file."""
-    url_hash = hashlib.sha1(api.url.encode()).hexdigest()[:8]
-    return f"{'-'.join(api.services)}-{url_hash}"
+    return f"{'-'.join(api.services)}-{feed_hash(api)}"
+
+
+def feed_hash(api: ApiConfig) -> str:
+    """8 hex characters identifying a realtime feed (feedId column, file names)."""
+    return hashlib.sha1(api.url.encode()).hexdigest()[:8]
 
 
 def feed_id(provider_name: str, api: ApiConfig) -> str:
@@ -169,6 +173,12 @@ def process_payload(
         hashes,
         api.services,
         fetch_time,
-        row_metadata(provider.name, fetch_time, header_timestamp, static_version),
+        row_metadata(
+            provider.name,
+            fetch_time,
+            header_timestamp,
+            static_version,
+            feed_hash(api),
+        ),
     )
     return ProcessResult(snapshot, unchanged, result, summary)

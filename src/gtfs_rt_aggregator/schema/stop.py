@@ -12,6 +12,7 @@ stop_schema = pa.schema(
         # Timestamp from the feed header, and static version current at fetch time
         pa.field("feedTimestamp", pa.timestamp("us", tz="UTC"), nullable=True),
         pa.field("staticVersion", pa.string(), nullable=True),
+        pa.field("feedId", pa.string(), nullable=True),
         # Hash of the entity, to skip unchanged fetches and deduplicate rows
         pa.field("contentHash", pa.string(), nullable=True),
         pa.field("stopId", pa.string(), nullable=True),

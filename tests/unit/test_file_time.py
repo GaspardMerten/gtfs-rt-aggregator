@@ -33,5 +33,21 @@ class TestFileTime(unittest.TestCase):
         self.assertIsNone(parse_file_time("latest"))
 
 
+class TestFeedSuffix(unittest.TestCase):
+    def test_round_trip(self):
+        from datetime import datetime, timezone
+
+        from src.gtfs_rt_aggregator.utils.file_time import (
+            format_file_time,
+            parse_file_time,
+        )
+
+        when = datetime(2026, 10, 25, 1, 30, tzinfo=timezone.utc)
+        name = format_file_time(when, "1a2b3c4d")
+        self.assertEqual(name, "2026-10-25_01-30-00Z-1a2b3c4d")
+        self.assertEqual(parse_file_time(name), when)
+        self.assertEqual(parse_file_time("2026-10-25_01-30-00Z"), when)
+
+
 if __name__ == "__main__":
     unittest.main()

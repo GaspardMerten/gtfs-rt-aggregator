@@ -130,6 +130,26 @@ def _rows(entity_ids, hashes, times):
 
 
 class TestDeduplicate(unittest.TestCase):
+    def test_feeds_deduplicated_apart(self):
+        # Two feeds of one service (e.g. two operators) fetched at different
+        # times, with the same entity id: each feed's unchanged entity is one
+        # row; the other feed's fetch times are not gaps
+        table = _rows(["1"] * 6, ["x", "y"] * 3, [10, 11, 20, 21, 30, 31])
+        table = table.append_column("feedId", pa.array(["a", "b"] * 3))
+        result = deduplicate(table)
+        self.assertEqual(result.num_rows, 2)
+        self.assertEqual(sorted(result["lastSeen"].to_pylist()), [30, 31])
+
+        # Streaming compaction passes fetch times by feed
+        result = deduplicate(
+            table,
+            {
+                "a": pa.array([10, 20, 30], pa.uint64()),
+                "b": pa.array([11, 21, 31], pa.uint64()),
+            },
+        )
+        self.assertEqual(result.num_rows, 2)
+
     def test_consecutive_runs(self):
         table = deduplicate(
             _rows(

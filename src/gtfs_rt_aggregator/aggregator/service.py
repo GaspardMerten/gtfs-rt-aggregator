@@ -22,19 +22,28 @@ from ..utils.serializer import ParquetSerializer
 TIMESTAMP = pa.timestamp("us", tz="UTC")
 
 
-def _fetch_times(path: str) -> set:
-    """Every fetch time found in a file (fetchTime, firstSeen, lastSeen)."""
-    times = set()
-    names = [
-        c
-        for c in ("fetchTime", "firstSeen", "lastSeen")
-        if c in pq.read_schema(path).names
-    ]
-    for batch in pq.ParquetFile(path).iter_batches(columns=names, batch_size=262_144):
-        for name in names:
-            times.update(pc.unique(batch.column(name)).to_pylist())
-    times.discard(None)
-    return times
+def _fetch_times(path: str, times: Dict[Optional[str], set]):
+    """Add every fetch time found in a file (fetchTime, firstSeen, lastSeen), by feedId."""
+    available = pq.read_schema(path).names
+    names = [c for c in ("fetchTime", "firstSeen", "lastSeen") if c in available]
+    with_feed = "feedId" in available
+    for batch in pq.ParquetFile(path).iter_batches(
+        columns=names + (["feedId"] if with_feed else []), batch_size=262_144
+    ):
+        table = pa.Table.from_batches([batch])
+        feeds = pc.unique(table["feedId"]).to_pylist() if with_feed else [None]
+        for feed in feeds:
+            rows = table
+            if with_feed:
+                rows = table.filter(
+                    pc.is_null(table["feedId"])
+                    if feed is None
+                    else pc.fill_null(pc.equal(table["feedId"], feed), False)
+                )
+            found = times.setdefault(feed, set())
+            for name in names:
+                found.update(pc.unique(rows[name]).to_pylist())
+            found.discard(None)
 
 
 # How long after its end a period is aggregated even without a file from the
@@ -573,7 +582,7 @@ class AggregatorService:
                     c for c in self.config.output.sort_by if all(c in n for n in names)
                 ]
 
-            sorted_paths, times = [], set()
+            sorted_paths, times = [], {}
             for index, (path, local) in enumerate(downloaded):
                 if posixpath.basename(path) == name and sorted_by(local) == keys:
                     # Compacted since 0.6.0 with the same settings: already sorted
@@ -591,7 +600,7 @@ class AggregatorService:
                     os.remove(local)
                     sorted_paths.append(prepared)
                 if deduplicate:
-                    times.update(_fetch_times(sorted_paths[-1]))
+                    _fetch_times(sorted_paths[-1], times)
 
             output = os.path.join(tmp, "out.parquet")
             rows = compact_files(
@@ -599,7 +608,14 @@ class AggregatorService:
                 keys,
                 output,
                 deduplicate_rows=deduplicate,
-                times=pa.array(sorted(times), TIMESTAMP) if deduplicate else None,
+                times=(
+                    {
+                        feed: pa.array(sorted(values), TIMESTAMP)
+                        for feed, values in times.items()
+                    }
+                    if deduplicate
+                    else None
+                ),
             )
             storage.save_file(output, compacted)
             return rows

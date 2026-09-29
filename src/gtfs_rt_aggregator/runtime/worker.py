@@ -11,7 +11,7 @@ import os
 import shutil
 import tarfile
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -21,7 +21,12 @@ import pytz
 
 from ..aggregator.service import AggregatorService
 from ..config.models import GtfsRtConfig
-from ..runtime.core import StaticVersions, process_payload, realtime_feeds
+from ..runtime.core import (
+    StaticVersions,
+    feed_hash,
+    process_payload,
+    realtime_feeds,
+)
 from ..runtime.spool import Spool, read_json, write_atomic, write_json
 from ..static.service import StaticService
 from ..utils.file_time import format_file_time, parse_file_time
@@ -161,7 +166,8 @@ def process_item(item_path: str) -> Dict:
                     )
                 )
             else:
-                path = f"{provider.name}/{service_type}/individual/{format_file_time(fetch_time)}.parquet"
+                name = format_file_time(fetch_time, feed_hash(api))
+                path = f"{provider.name}/{service_type}/individual/{name}.parquet"
                 ctx.spool.put_ready(provider.name, path, data)
                 written.append(path)
     # Only once written: after a failure, the same content is tried again
@@ -188,6 +194,7 @@ def _add_to_window(
                 "service": service_type,
                 "start": start.isoformat(),
                 "end": end.isoformat(),
+                "feed_hash": feed_hash(api),
             },
         )
     part = folder / f"part-{name}.parquet"
@@ -218,11 +225,12 @@ def close_window(folder: str) -> Dict:
     table = pa.concat_tables(
         [pq.read_table(p) for p in parts], promote_options="default"
     )
-    first = datetime.strptime(parts[0].stem[len("part-") :], "%Y%m%dT%H%M%S.%fZ")
-    path = (
-        f"{window['provider']}/{window['service']}/individual/"
-        f"{first.strftime('%Y-%m-%d_%H-%M-%S')}Z.parquet"
-    )
+    first = datetime.strptime(
+        parts[0].stem[len("part-") :], "%Y%m%dT%H%M%S.%fZ"
+    ).replace(tzinfo=timezone.utc)
+    # Windows opened before 0.7.3 have no feed_hash
+    name = format_file_time(first, window.get("feed_hash"))
+    path = f"{window['provider']}/{window['service']}/individual/{name}.parquet"
     ctx.spool.put_ready(
         window["provider"],
         path,

@@ -134,6 +134,9 @@ A provider needs at least one realtime or static feed.
 
 `[[providers.apis]]` is accepted as an old name for `[[providers.realtime]]`.
 
+A provider can have several feeds of the same service, e.g. one per operator. Their rows go to the same aggregated
+files, and `feedId` tells them apart; deduplication is done feed by feed.
+
 With `deduplicate = true`, a vehicle standing still for ten minutes, polled every 30 s, is one row instead of twenty.
 If the entity changes and later returns to an earlier state, that is a new row.
 
@@ -270,7 +273,7 @@ run_pipeline_from_toml("configuration.toml")
 ### Layout
 
 ```
-ovapi/VehiclePosition/individual/2026-09-28_14-00-20Z.parquet                        # one fetch or block (UTC)
+ovapi/VehiclePosition/individual/2026-09-28_14-00-20Z-1a2b3c4d.parquet               # one fetch or block (UTC, feed id)
 provider=ovapi/service=VehiclePosition/date=2026-09-28/16-00-00_to_17-00-00.parquet  # aggregated period (local time)
 provider=ovapi/service=VehiclePosition/date=2026-09-27/day.parquet                   # compacted day
 ovapi/raw/provider=ovapi/feed=VehiclePosition-1a2b3c4d/date=2026-09-28/14-1790000000.tar.zst  # raw archive
@@ -295,6 +298,7 @@ Each row has the entity's fields plus:
 - `fetchTime`: fetch time (timestamp, UTC)
 - `feedTimestamp`: time in the feed header (timestamp, UTC)
 - `staticVersion`: the provider's static version at fetch time, to join with the right timetable
+- `feedId`: 8 characters identifying the realtime feed the row comes from
 - `contentHash`: hash of the entity
 - `firstSeen`, `lastSeen`: with `deduplicate = true`, after aggregation (timestamps, UTC)
 

@@ -1,3 +1,4 @@
+import re
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -11,9 +12,16 @@ _OFFSET_FORMAT = "%Y-%m-%d_%H-%M-%S%z"
 _LOCAL_FORMAT = "%Y-%m-%d_%H-%M-%S"
 
 
-def format_file_time(dt: datetime) -> str:
-    """Name for an aware datetime."""
-    return dt.astimezone(timezone.utc).strftime(FILE_TIME_FORMAT)
+# Individual files end with their feed's id (0.7.3), e.g.
+# 2026-10-25_01-30-00Z-1a2b3c4d: feeds of one provider giving the same service
+# can fetch in the same second
+_FEED_SUFFIX = re.compile(r"-[0-9a-f]{8}$")
+
+
+def format_file_time(dt: datetime, feed: Optional[str] = None) -> str:
+    """Name for an aware datetime (and a feed id, for individual files)."""
+    name = dt.astimezone(timezone.utc).strftime(FILE_TIME_FORMAT)
+    return f"{name}-{feed}" if feed else name
 
 
 def parse_file_time(name: str) -> Optional[datetime]:
@@ -23,6 +31,7 @@ def parse_file_time(name: str) -> Optional[datetime]:
     Returns an aware datetime, a naive local datetime for names from before
     0.3.0, or None if the name does not match.
     """
+    name = _FEED_SUFFIX.sub("", name)
     try:
         return datetime.strptime(name, FILE_TIME_FORMAT).replace(tzinfo=timezone.utc)
     except ValueError:

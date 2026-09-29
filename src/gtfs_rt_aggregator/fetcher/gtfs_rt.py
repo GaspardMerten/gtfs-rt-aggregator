@@ -50,6 +50,7 @@ ROW_FIELDS = (
     "fetchTime",
     "feedTimestamp",
     "staticVersion",
+    "feedId",
 )
 
 
@@ -58,6 +59,7 @@ def row_metadata(
     fetch_time: datetime,
     header_timestamp: Optional[int],
     static_version: Optional[str],
+    feed_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Columns added to every realtime row besides fetchTime.
@@ -66,6 +68,8 @@ def row_metadata(
     @param fetch_time: Fetch time, aware, in the provider timezone (gives the date)
     @param header_timestamp: Timestamp of the feed header (Unix time), if any
     @param static_version: Static version current at fetch time, if any
+    @param feed_id: Short id of the realtime feed (see feed_hash): tells apart
+        the feeds of a provider that give the same service
     """
     try:
         feed_timestamp = (
@@ -80,6 +84,7 @@ def row_metadata(
         "date": fetch_time.date(),
         "feedTimestamp": feed_timestamp,
         "staticVersion": static_version,
+        "feedId": feed_id,
     }
 
 

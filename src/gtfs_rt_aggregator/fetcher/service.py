@@ -6,7 +6,7 @@ import pytz
 
 from ..config.models import ApiConfig, GtfsRtConfig, ProviderConfig
 from ..fetcher.gtfs_rt import GtfsRtFetcher
-from ..runtime.core import StaticVersions, feed_slug, process_payload
+from ..runtime.core import StaticVersions, feed_hash, feed_slug, process_payload
 from ..storage.base import StorageInterface
 from ..utils.file_time import format_file_time
 from ..utils.log_helper import setup_logger
@@ -110,7 +110,8 @@ class FetcherService:
             for service_type, table in result.tables.items():
                 if service_type not in service_types:
                     continue
-                path = f"{provider_name}/{service_type}/individual/{format_file_time(fetch_time)}.parquet"
+                name = format_file_time(fetch_time, feed_hash(api))
+                path = f"{provider_name}/{service_type}/individual/{name}.parquet"
                 storage.save_bytes(
                     ParquetSerializer.pyarrow_table_to_bytes(
                         table, compression="snappy"

@@ -147,13 +147,13 @@ def compact_files(
     keys: Sequence[str],
     output_path: str,
     deduplicate_rows: bool = False,
-    times: Optional[pa.Array] = None,
+    times=None,
     compression: str = "brotli",
 ) -> int:
     """
     Merge Parquet files, each already sorted by keys (see write_sorted), into
     one file sorted by keys. With deduplicate_rows, keys must start with
-    entityId then firstSeen, and times holds every fetch time of the day (for
+    entityId then firstSeen, and times holds every fetch time of the day by feedId (for
     gap detection). Returns the number of rows written.
     """
     schema = pa.unify_schemas(

@@ -158,6 +158,52 @@ class TestStreamingCompaction(unittest.TestCase):
                     expected.select(columns).to_pylist(),
                 )
 
+    def test_deduplicate_feeds_across_hours(self):
+        # Two feeds of one service, fetched 30 s apart, same entity ids
+        second = []
+        for table in self.hours:
+            shifted = pc.add(
+                table["fetchTime"], pa.scalar(30_000_000, pa.duration("us"))
+            )
+            second.append(table.set_column(2, "fetchTime", pc.cast(shifted, TS)))
+        self.hours = [
+            pa.concat_tables(
+                [
+                    a.append_column("feedId", pa.array(["a"] * a.num_rows)),
+                    b.append_column("feedId", pa.array(["b"] * b.num_rows)),
+                ]
+            )
+            for a, b in zip(self.hours, second)
+        ]
+        for index, table in enumerate(self.hours):
+            pq.write_table(table, self.paths[index])
+        whole = pa.concat_tables(self.hours)
+        expected = deduplicate(whole)
+        # Each feed alone deduplicates as well as a single feed would
+        self.assertEqual(
+            expected.num_rows,
+            2 * deduplicate(whole.filter(pc.equal(whole["feedId"], "a"))).num_rows,
+        )
+        times = {
+            feed: pc.unique(whole.filter(pc.equal(whole["feedId"], feed))["fetchTime"])
+            for feed in ("a", "b")
+        }
+        output = os.path.join(self.tmp, "feeds.parquet")
+        prepared = []
+        for index, table in enumerate(self.hours):
+            path = os.path.join(self.tmp, f"f{index}.parquet")
+            write_sorted(deduplicate(table), ["entityId", "firstSeen"], path, 50)
+            prepared.append(path)
+        module = "src.gtfs_rt_aggregator.aggregator.compaction"
+        with patch(f"{module}.ROW_BUDGET", 60), patch(f"{module}.MIN_BATCH_ROWS", 1):
+            compact_files(prepared, ["entityId", "firstSeen"], output, True, times)
+        columns = ["feedId", "entityId", "contentHash", "firstSeen", "lastSeen"]
+        key = lambda r: (r["feedId"], r["entityId"], r["firstSeen"])
+        self.assertEqual(
+            sorted(pq.read_table(output).select(columns).to_pylist(), key=key),
+            sorted(expected.select(columns).to_pylist(), key=key),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,10 +1,49 @@
-from typing import Optional
+from typing import Dict, Optional, Union
 
 import pyarrow as pa
 import pyarrow.compute as pc
 
+# Fetch times of each feed (feedId, None for rows without one)
+FeedTimes = Dict[Optional[str], pa.Array]
 
-def deduplicate(table: pa.Table, times: Optional[pa.Array] = None) -> pa.Table:
+
+def deduplicate(
+    table: pa.Table, times: Union[pa.Array, FeedTimes, None] = None
+) -> pa.Table:
+    """
+    Merge consecutive rows of the same entity with the same content, feed by
+    feed: a provider can have several feeds of the same service (e.g. one per
+    operator), with their own fetch times and entity ids. See
+    _deduplicate_feed. Returns rows sorted by entityId and firstSeen.
+    """
+    if "feedId" not in table.column_names:
+        return _deduplicate_feed(table, _feed_times(times, None))
+    feeds = pc.unique(table["feedId"]).to_pylist()
+    if len(feeds) == 1:
+        return _deduplicate_feed(table, _feed_times(times, feeds[0]))
+    parts = []
+    for feed in feeds:
+        mask = (
+            pc.is_null(table["feedId"])
+            if feed is None
+            else pc.fill_null(pc.equal(table["feedId"], feed), False)
+        )
+        parts.append(_deduplicate_feed(table.filter(mask), _feed_times(times, feed)))
+    result = pa.concat_tables(parts)
+    return result.take(
+        pc.sort_indices(
+            result, sort_keys=[("entityId", "ascending"), ("firstSeen", "ascending")]
+        )
+    )
+
+
+def _feed_times(times, feed) -> Optional[pa.Array]:
+    if isinstance(times, dict):
+        return times.get(feed)
+    return times
+
+
+def _deduplicate_feed(table: pa.Table, times: Optional[pa.Array] = None) -> pa.Table:
     """
     Merge consecutive rows of the same entity with the same content.
 

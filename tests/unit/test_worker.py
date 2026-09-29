@@ -20,7 +20,7 @@ from src.gtfs_rt_aggregator.config.models import (
     StorageConfig,
 )
 from src.gtfs_rt_aggregator.runtime import worker
-from src.gtfs_rt_aggregator.runtime.core import feed_id
+from src.gtfs_rt_aggregator.runtime.core import feed_hash, feed_id
 from src.gtfs_rt_aggregator.runtime.spool import Spool
 
 DATA = Path(__file__).parent.parent / "data"
@@ -80,8 +80,38 @@ class TestWorkerTasks(unittest.TestCase):
         self.assertEqual(result["parts"], 2)
         self.assertFalse(window.exists())
         (ready,) = self.spool.path("ready").rglob("*.parquet")
-        self.assertEqual(ready.name, "2026-09-29_08-01-00Z.parquet")
+        self.assertEqual(
+            ready.name, f"2026-09-29_08-01-00Z-{feed_hash(self.api)}.parquet"
+        )
         self.assertEqual(pq.read_table(ready).num_rows, 2 * 3549)
+
+    def test_feeds_of_one_service_fetched_in_the_same_second(self):
+        # A second feed of the same provider and service (e.g. another operator)
+        other = ApiConfig(
+            url="https://example.org/other/vp.pb",
+            services=["VehiclePosition"],
+            skip_unchanged=False,
+        )
+        self.config.providers[0].realtime.append(other)
+        worker.init_worker(self.config, str(self.tmp / "spool"), logging.INFO)
+        when = datetime(2026, 9, 29, 8, 1, tzinfo=timezone.utc)
+        worker.process_item(str(self._item(when)))
+        (window,) = self.spool.path("windows").glob("*/*/*")
+        worker.close_window(str(window))
+
+        self.feed = feed_id("p", other)
+        worker.process_item(str(self._item(when)))
+        ready = sorted(self.spool.path("ready").rglob("*.parquet"))
+        self.assertEqual(len(ready), 2)
+        feeds = {pq.read_table(r)["feedId"][0].as_py() for r in ready}
+        self.assertEqual(feeds, {feed_hash(self.api), feed_hash(other)})
+
+        # Both land in the same aggregation period
+        from src.gtfs_rt_aggregator.aggregator.service import AggregatorService
+
+        service = AggregatorService(self.config, {})
+        times = {service._extract_datetime_from_filename(r.name) for r in ready}
+        self.assertEqual(len(times), 1)
 
     def test_fetch_after_close_gets_its_own_window(self):
         first = datetime(2026, 9, 29, 8, 1, tzinfo=timezone.utc)
