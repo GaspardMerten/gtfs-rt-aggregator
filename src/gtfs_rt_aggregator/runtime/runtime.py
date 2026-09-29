@@ -152,7 +152,9 @@ class Runtime:
         self._pause_level = -1
         self._spool_size = 0
         self._log_level = logging.getLogger().getEffectiveLevel()
-        self._fetch_pool = self._normal_pool = self._heavy_pool = None
+        self._fetch_pool = self._normal_pool = self._heavy_pool = self._static_pool = (
+            None
+        )
         self._uploader = None
 
     # Lifecycle ---------------------------------------------------------------
@@ -210,17 +212,20 @@ class Runtime:
         )
         self._normal_pool = self._new_pool(self.runtime.worker_count())
         self._heavy_pool = self._new_pool(self.runtime.heavy_slots)
+        self._static_pool = self._new_pool(self.runtime.heavy_slots, tasks_per_worker=1)
         self._uploader = Uploader(self.spool, self.storages, self._stop)
         self._uploader.start()
         self._schedule_jobs()
 
-    def _new_pool(self, workers: int) -> ProcessPoolExecutor:
+    def _new_pool(
+        self, workers: int, tasks_per_worker: Optional[int] = None
+    ) -> ProcessPoolExecutor:
         return ProcessPoolExecutor(
             max_workers=workers,
             mp_context=_pool_context(),
             initializer=worker.init_worker,
             initargs=(self.config, str(self.spool.root), self._log_level),
-            max_tasks_per_child=self.runtime.max_tasks_per_worker,
+            max_tasks_per_child=tasks_per_worker or self.runtime.max_tasks_per_worker,
         )
 
     def _shutdown(self):
@@ -236,7 +241,7 @@ class Runtime:
         while self._in_flight and time.monotonic() < deadline:
             self._collect(stopping=True)
             time.sleep(0.2)
-        for pool in (self._normal_pool, self._heavy_pool):
+        for pool in (self._normal_pool, self._heavy_pool, self._static_pool):
             if pool is not None:
                 pool.shutdown(wait=False, cancel_futures=True)
         if self._uploader is not None:
@@ -432,7 +437,10 @@ class Runtime:
         now = time.monotonic()
         free = {
             "normal": self.runtime.worker_count() * 2 - self._count("normal"),
-            "heavy": self.runtime.heavy_slots - self._count("heavy"),
+            # Static conversions run in their own pool, but take a heavy slot
+            "heavy": self.runtime.heavy_slots
+            - self._count("heavy")
+            - self._count("static"),
         }
         threshold = self.runtime.heavy_threshold_mb * 1024 * 1024
 
@@ -471,7 +479,7 @@ class Runtime:
                 self._probing.add(lane)
 
         # Static feeds downloaded, then timed heavy tasks
-        if "heavy" in self._probing:
+        if "heavy" in self._probing or "static" in self._probing:
             return
         for feed in self.statics:
             if free["heavy"] <= 0:
@@ -487,7 +495,9 @@ class Runtime:
                     break
                 provider, static = self.statics[feed]
                 self._submit(
-                    Task("static", key, "heavy", {"folder": str(folder)}),
+                    # A fresh process per static feed: Polars keeps the memory
+                    # it used, the process ending gives it all back
+                    Task("static", key, "static", {"folder": str(folder)}),
                     worker.process_static,
                     provider.name,
                     static.name,
@@ -510,7 +520,9 @@ class Runtime:
         self._heavy_queue.append(Task(kind, name, "heavy", dict(args)))
 
     def _pool(self, lane: str) -> ProcessPoolExecutor:
-        return self._heavy_pool if lane == "heavy" else self._normal_pool
+        return {"heavy": self._heavy_pool, "static": self._static_pool}.get(
+            lane, self._normal_pool
+        )
 
     def _submit(self, task: Task, function, *args, **kwargs):
         try:
@@ -662,15 +674,15 @@ class Runtime:
         logger.error(
             f"A {lane} worker process died (out of memory?): replacing the pool"
         )
-        old = self._pool(lane)
-        old.shutdown(wait=False, cancel_futures=True)
-        new = self._new_pool(
-            self.runtime.heavy_slots if lane == "heavy" else self.runtime.worker_count()
-        )
+        self._pool(lane).shutdown(wait=False, cancel_futures=True)
         if lane == "heavy":
-            self._heavy_pool = new
+            self._heavy_pool = self._new_pool(self.runtime.heavy_slots)
+        elif lane == "static":
+            self._static_pool = self._new_pool(
+                self.runtime.heavy_slots, tasks_per_worker=1
+            )
         else:
-            self._normal_pool = new
+            self._normal_pool = self._new_pool(self.runtime.worker_count())
 
     # Windows and raw archive ------------------------------------------------------
 

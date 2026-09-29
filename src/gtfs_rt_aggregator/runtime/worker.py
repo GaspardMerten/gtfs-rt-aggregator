@@ -5,6 +5,7 @@ take and return only plain values, so they work with any start method.
 """
 
 import functools
+import gc
 import logging
 import os
 import shutil
@@ -96,6 +97,13 @@ def _timed(task):
         result = task(*args, **kwargs) or {}
         result["seconds"] = round(time.monotonic() - start, 3)
         result["peak_memory_mb"] = round(_peak_memory_mb())
+        # Hand memory back to the system between tasks: Arrow's allocator
+        # keeps freed memory otherwise (a static feed can leave ~1 GB held)
+        gc.collect()
+        try:
+            pa.default_memory_pool().release_unused()
+        except AttributeError:  # older pyarrow
+            pass
         return result
 
     return wrapper

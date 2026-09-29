@@ -36,6 +36,15 @@ class _Feed(http.server.BaseHTTPRequestHandler):
     lock = threading.Lock()
 
     def do_GET(self):
+        if self.path.startswith("/gtfs.zip"):
+            from tests.unit.test_static_service import GTFS_FILES, _make_zip
+
+            body = _make_zip(GTFS_FILES)
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         if self.path.startswith("/garbage"):
             body = b"this is not a protobuf message" * 10
         else:
@@ -193,6 +202,30 @@ class TestRuntime(unittest.TestCase):
         self._run(self._config(), 6, during=restore)
         self.assertGreaterEqual(len(self._individual()), 4)
         self.assertEqual(list(Path(self.tmp, "spool", "ready").rglob("*.parquet")), [])
+
+    def test_static_feed(self):
+        from src.gtfs_rt_aggregator.config.models import StaticConfig
+
+        config = self._config()
+        config.providers[0].static.append(StaticConfig(url=self.base_url + "/gtfs.zip"))
+        self._run(config, 8)
+        latest = json.loads(
+            Path(self.tmp, "out", "p", "static", "latest.json").read_text()
+        )
+        for path in latest["tables"].values():
+            self.assertTrue(Path(self.tmp, "out", path).exists(), path)
+        # The rows carry the static version once it is stored
+        import pyarrow.parquet as pq
+
+        versions = set()
+        for file in self._individual():
+            versions |= set(
+                pq.read_table(file, columns=["staticVersion"])[
+                    "staticVersion"
+                ].to_pylist()
+            )
+        self.assertIn(latest["version"], versions)
+        self.assertEqual(list(Path(self.tmp, "spool", "static").rglob("feed.zip")), [])
 
     def test_spool_full_pauses_fetching(self):
         from unittest.mock import patch

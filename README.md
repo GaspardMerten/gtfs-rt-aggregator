@@ -237,7 +237,7 @@ is a new row. Fetches skipped as unchanged are not counted, so `lastSeen` is the
   route unknown to the static feed): added trips are not in the static timetable (default `false`)
 
 Realtime entities often carry only a trip id, so `route_types` and `route_ids` are resolved through the trips and
-routes of the provider's latest static version (checked at most once a minute): the provider needs a
+routes of the provider's latest static version (checked once a minute, every 5 seconds until the first version is stored): the provider needs a
 `[[providers.static]]` feed. Trip updates and
 vehicle positions are matched by trip or route (a vehicle without a trip is dropped), alerts by any informed route,
 route type or trip; other entity types are kept. Until the first static version is stored, rows are not filtered.
@@ -260,7 +260,8 @@ scheduler ─▶ fetch threads ─▶ spool/incoming ─▶ worker processes ─
   dropped right away.
 - **Worker processes** (a fixed pool, `runtime.workers`) parse, filter and convert each fetch to Parquet, one at a time
   per feed and in fetch order. Memory-heavy work goes to a separate pool (`runtime.heavy_slots`, 1 by default): large
-  fetches, static feeds, aggregation and compaction, so they never run side by side.
+  fetches, static feeds, aggregation and compaction, so they never run side by side. Each static feed is converted in a
+  new process, which gives all its memory back when done.
 - **The upload thread** moves results to storage, and checks they arrived. While storage is down, results wait on
   disk.
 - A fetch whose processing fails (or whose worker is killed, e.g. out of memory) is retried, and moved to the spool's

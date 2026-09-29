@@ -15,8 +15,10 @@ from ..fetcher.gtfs_rt import GtfsRtFetcher, row_metadata
 from ..static.service import manifest_tables, read_latest, static_base
 from ..storage.base import StorageInterface
 
-# How long the static version found for a provider is reused
+# How long the static version found for a provider is reused; when none is
+# stored yet (first start), it is looked for again sooner
 STATIC_VERSION_TTL_SECONDS = 60
+MISSING_STATIC_VERSION_TTL_SECONDS = 5
 
 
 def feed_slug(api: ApiConfig) -> str:
@@ -60,8 +62,14 @@ class StaticVersions:
             return None, None
         base = static_base(provider.name, static.name)
         cached = self._cache.get(base)
-        if cached and time.time() - cached[0] < STATIC_VERSION_TTL_SECONDS:
-            return cached[1], cached[2]
+        if cached:
+            ttl = (
+                STATIC_VERSION_TTL_SECONDS
+                if cached[1]
+                else MISSING_STATIC_VERSION_TTL_SECONDS
+            )
+            if time.time() - cached[0] < ttl:
+                return cached[1], cached[2]
         try:
             latest = read_latest(
                 self.storages.get(provider.name, self.storages["global"]),
