@@ -14,10 +14,21 @@ from ..fetcher.filter import build_filter
 from ..fetcher.gtfs_rt import GtfsRtFetcher, row_metadata
 from ..static.service import manifest_tables, read_latest, static_base
 from ..storage.base import StorageInterface, storage_for
+from ..utils.redact import strip_query
 
 # How long the static version found for a provider is reused; when none is
 # stored yet (first start), it is looked for again sooner
 STATIC_VERSION_TTL_SECONDS = 60
+
+
+class StaticNotReady(Exception):
+    """
+    A feed's filter needs the static version, which cannot be read yet (not
+    stored yet after the first start, or storage unavailable). The fetch
+    must wait: stored unfiltered, it would archive the rows the filter drops.
+    """
+
+
 MISSING_STATIC_VERSION_TTL_SECONDS = 5
 
 
@@ -143,11 +154,11 @@ def process_payload(
             f"{provider.name}|{api.static}|{static_version}",
         )
         if entity_filter is None:
-            logger.warning(
-                f"{api.url}: no static version stored yet, filter not applied"
+            raise StaticNotReady(
+                f"{provider.name}: the filter of {strip_query(api.url)} needs a "
+                "static version, none can be read yet"
             )
-        else:
-            entities = [e for e in entities if entity_filter.keep(e)]
+        entities = [e for e in entities if entity_filter.keep(e)]
 
     # Same entities as the previous fetch (in any order): nothing new
     hashes = [GtfsRtFetcher.entity_hash(e) for e in entities]

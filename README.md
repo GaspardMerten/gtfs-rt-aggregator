@@ -154,7 +154,8 @@ the last stored fetch that had the entity, which can be earlier than the last ti
   `false`, needs `route_types` or `route_ids`)
 
 `route_types` and `route_ids` are resolved through the trips and routes of the provider's latest static version, so the
-provider needs a `[[providers.static]]` feed. Until the first static version is stored, rows are not filtered. Trip
+provider needs a `[[providers.static]]` feed. Until a static version can be read (the first one is being downloaded,
+or storage is down), fetches wait in the spool; after 3 hours they are dropped, never stored unfiltered. Trip
 updates and vehicle positions match by trip or route (vehicles without a trip are dropped). Alerts match by any
 informed route, route type or trip. Other entity types are always kept.
 

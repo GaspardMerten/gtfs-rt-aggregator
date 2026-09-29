@@ -64,6 +64,8 @@ RETRY_MAX_SECONDS = 300
 SHUTDOWN_WAIT_SECONDS = 30
 # Longest a realtime download may take (each attempt)
 REALTIME_DOWNLOAD_MAX_SECONDS = 300
+# Fetches waiting for the static version their filter needs are retried this often
+STATIC_RETRY_SECONDS = 30
 # Errors that another attempt cannot fix: quarantined right away
 PERMANENT_ERRORS = ("DecodeError",)
 
@@ -177,7 +179,10 @@ class Runtime:
         self._status_dirty: set = set()
         self._written: Dict[str, bytes] = {}  # status files as last written
         self._window_failures: Dict[str, int] = {}
-        self._rerun: Dict[str, Task] = {}  # heavy tasks to run again once done
+        self._rerun: Dict[str, Task] = {}
+        self._waiting_static: set = (
+            set()
+        )  # feeds waiting for a static version  # heavy tasks to run again once done
         self._spool_lock = None
         self._paused: set = set()
         self._pause_level = -1
@@ -752,11 +757,30 @@ class Runtime:
             )
             back = self.spool.path("incoming", item.parent.name, item.name)
             self._retry_at.pop(str(back), None)
+            if error is not None and error.startswith("StaticNotReady"):
+                # Not the fetch's fault: waits, in order, for the static version
+                self.spool.release(
+                    item,
+                    error,
+                    self.runtime.max_attempts,
+                    count_attempt=False,
+                    suspect=False,
+                )
+                self._retry_at[str(back)] = time.monotonic() + STATIC_RETRY_SECONDS
+                with self._lock:
+                    bisect.insort(self._queues.setdefault(task.key, []), back)
+                    self._update_status(task.key, waiting_for_static=True)
+                if task.key not in self._waiting_static:
+                    self._waiting_static.add(task.key)
+                    logger.warning(f"{error}: fetches wait in the spool")
+                return
+            self._waiting_static.discard(task.key)
             if error is None:
                 self.spool.done(item, archive=self.config.raw.enabled)
                 with self._lock:
                     self._update_status(
                         task.key,
+                        waiting_for_static=False,
                         **result.get("summary", {}),
                         last_processed_seconds=result.get("seconds"),
                         worker_peak_memory_mb=result.get("peak_memory_mb"),

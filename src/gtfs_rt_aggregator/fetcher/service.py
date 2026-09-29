@@ -7,7 +7,13 @@ import pytz
 from ..aggregator import fetch_times
 from ..config.models import ApiConfig, GtfsRtConfig, ProviderConfig
 from ..fetcher.gtfs_rt import GtfsRtFetcher
-from ..runtime.core import StaticVersions, feed_hash, feed_slug, process_payload
+from ..runtime.core import (
+    StaticNotReady,
+    StaticVersions,
+    feed_hash,
+    feed_slug,
+    process_payload,
+)
 from ..storage.base import StorageInterface, storage_for
 from ..utils.file_time import format_file_time
 from ..utils.log_helper import setup_logger
@@ -71,16 +77,25 @@ class FetcherService:
 
         try:
             data = GtfsRtFetcher.fetch_feed(url, headers, api.retries)
-            result = process_payload(
-                data,
-                fetch_time,
-                provider,
-                api,
-                storage,
-                self._static_versions,
-                state.get("snapshot"),
-                job_logger,
-            )
+            try:
+                result = process_payload(
+                    data,
+                    fetch_time,
+                    provider,
+                    api,
+                    storage,
+                    self._static_versions,
+                    state.get("snapshot"),
+                    job_logger,
+                )
+            except StaticNotReady as e:
+                # Nowhere to keep it until the static version is there: never
+                # stored unfiltered
+                job_logger.warning(f"{e}; fetch skipped")
+                status.update(
+                    last_success=fetch_time.isoformat(), skipped_no_static=True
+                )
+                return
             status.update(last_success=fetch_time.isoformat(), **result.summary)
             if result.tables is None:
                 job_logger.info(

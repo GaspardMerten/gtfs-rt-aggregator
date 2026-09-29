@@ -268,7 +268,8 @@ class TestFilter(_FetcherTest):
             sorted(self._rows()["trip_tripId"].to_pylist()), ["280007323", "280007326"]
         )
 
-    def test_no_static_version_yet_keeps_everything(self):
+    def test_no_static_version_yet_stores_nothing(self):
+        # Stored unfiltered, the fetch would archive the rows the filter drops
         api = ApiConfig(
             url=URL,
             services=["VehiclePosition"],
@@ -276,7 +277,8 @@ class TestFilter(_FetcherTest):
         )
         service = self._service(api, [StaticConfig(url="https://example.org/gtfs.zip")])
         self._run(service)
-        self.assertEqual(self._rows().num_rows, 3549)
+        self.assertEqual(self._individual(), [])
+        self.assertTrue(self._status()["skipped_no_static"])
 
     def test_route_filter_needs_static(self):
         with self.assertRaises(ValueError):

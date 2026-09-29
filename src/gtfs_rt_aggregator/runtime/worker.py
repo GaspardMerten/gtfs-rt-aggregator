@@ -22,6 +22,7 @@ import pytz
 from ..aggregator.service import AggregatorService
 from ..config.models import GtfsRtConfig
 from ..runtime.core import (
+    StaticNotReady,
     StaticVersions,
     feed_hash,
     process_payload,
@@ -59,6 +60,9 @@ class _Context:
     def storage(self, provider_name: str):
         return storage_for(self.storages, provider_name)
 
+
+# How long a fetch waits for the static version its filter needs
+STATIC_WAIT_MAX_SECONDS = 3 * 3600
 
 _CTX: Optional[_Context] = None
 # Arguments of init_worker, to build the context on first use
@@ -189,16 +193,24 @@ def process_item(item_path: str) -> Dict:
     fetch_time = datetime.fromisoformat(meta["fetch_time"]).astimezone(tz)
     state = ctx.spool.state(feed)
 
-    result = process_payload(
-        item.read_bytes(),
-        fetch_time,
-        provider,
-        api,
-        ctx.storage(provider.name),
-        ctx.static_versions,
-        state.get("snapshot"),
-        logger,
-    )
+    try:
+        result = process_payload(
+            item.read_bytes(),
+            fetch_time,
+            provider,
+            api,
+            ctx.storage(provider.name),
+            ctx.static_versions,
+            state.get("snapshot"),
+            logger,
+        )
+    except StaticNotReady as e:
+        age = (datetime.now(timezone.utc) - fetch_time).total_seconds()
+        if age < STATIC_WAIT_MAX_SECONDS:
+            raise  # kept in the spool, tried again (see Runtime._finish)
+        # Never stored unfiltered: dropped after waiting that long
+        logger.error(f"{e}; fetch of {fetch_time.isoformat()} dropped")
+        return {"feed": feed, "summary": {"dropped_no_static": True}, "written": []}
     written = []
     if result.tables is not None:
         times = fetch_times.of_fetch(feed_hash(api), fetch_time)

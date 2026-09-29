@@ -126,6 +126,27 @@ class TestWorkerTasks(unittest.TestCase):
         times = {service._extract_datetime_from_filename(r.name) for r in ready}
         self.assertEqual(len(times), 1)
 
+    def test_waits_for_the_static_version_of_its_filter(self):
+        from datetime import timedelta
+
+        from src.gtfs_rt_aggregator.config.models import FilterConfig, StaticConfig
+        from src.gtfs_rt_aggregator.runtime.core import StaticNotReady
+
+        self.api.filter = FilterConfig(route_types=[2])
+        self.config.providers[0].static.append(
+            StaticConfig(url="https://example.org/gtfs.zip")
+        )
+        worker.init_worker(self.config, str(self.tmp / "spool"), logging.INFO)
+        # No static version stored yet: nothing written, the fetch waits
+        with self.assertRaises(StaticNotReady):
+            worker.process_item(str(self._item(datetime.now(timezone.utc))))
+        self.assertEqual(list(self.spool.path("windows").rglob("*.parquet")), [])
+        # Waiting too long: dropped, never stored unfiltered
+        old = datetime.now(timezone.utc) - timedelta(hours=4)
+        result = worker.process_item(str(self._item(old)))
+        self.assertEqual(result["written"], [])
+        self.assertTrue(result["summary"]["dropped_no_static"])
+
     def test_fetch_after_close_gets_its_own_window(self):
         first = datetime(2026, 9, 29, 8, 1, tzinfo=timezone.utc)
         worker.process_item(str(self._item(first)))

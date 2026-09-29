@@ -6,6 +6,7 @@ import tempfile
 import threading
 import time
 import unittest
+from pathlib import Path
 from datetime import datetime, timezone
 from unittest.mock import MagicMock
 
@@ -215,6 +216,28 @@ class TestHeavyTasks(unittest.TestCase):
             other.run()
         # No clean-shutdown marker for the running pipeline's next recovery
         self.assertFalse(other.spool.path("clean-shutdown").exists())
+
+    def test_fetch_waiting_for_static_keeps_its_attempts(self):
+        from src.gtfs_rt_aggregator.runtime.runtime import Task
+
+        feed = next(iter(self.runtime.feeds))
+        item = self.runtime.spool.new_item(
+            feed, datetime(2026, 9, 29, 8, tzinfo=timezone.utc)
+        )
+        tmp = item.with_name(item.name + ".part")
+        tmp.write_bytes(b"x")
+        self.runtime.spool.commit_item(item, tmp, {"feed": feed, "attempt": 1})
+        claimed = self.runtime.spool.claim(item)
+        task = Task("item", feed, "normal", {"item": str(claimed)})
+        for _ in range(5):
+            self.runtime._finish(task, None, "StaticNotReady: p: no static")
+            (back,) = self.runtime._queues[feed]
+            self.runtime._queues[feed].clear()
+            task.info["item"] = str(self.runtime.spool.claim(back))
+        meta = self.runtime.spool.meta(Path(task.info["item"]))
+        self.assertEqual(meta["attempt"], 1)
+        self.assertNotIn("suspect", meta)
+        self.assertEqual(self.runtime.spool.quarantined(), 0)
 
     def test_window_not_blamed_for_another_crash(self):
         from src.gtfs_rt_aggregator.runtime.runtime import Task
