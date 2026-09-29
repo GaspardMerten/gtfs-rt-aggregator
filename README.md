@@ -166,6 +166,8 @@ base_path = "gtfs-feeds"  # Optional: subfolder within the bucket
     against 3.5 GB when sorted in memory.
   - **compacted_name**: Name of that file, in the day's folder (default `"day.parquet"`)
   - **sort_by**: Columns the compacted file is sorted by (default `["entityId", "fetchTime"]`)
+  - **trip_stop_events**: Write one row per trip and stop for each finished service date (default `false`, needs the
+    `static` extra). See "Trip stop events".
 
 - **providers**: List of data providers
   - **name**: Name of the provider (used for directory structure, must be unique)
@@ -344,6 +346,46 @@ import polars as pl
 pl.scan_iceberg("s3://my-bucket/iceberg/TripUpdate/metadata/<latest>.metadata.json")
 ```
 
+### Trip stop events
+
+With `trip_stop_events = true` in `[output]`, every provider with trip updates and a static feed gets a daily
+`TripStopEvent` file, in the `path_template` folder of the service date (e.g.
+`provider=be/service=TripStopEvent/date=2026-10-24/day.parquet`). One row per trip and stop of that service date:
+
+| Column | Meaning |
+|---|---|
+| `provider`, `service_date`, `date` | `date` equals `service_date` (same partition column as the other services) |
+| `trip_id`, `route_id`, `trip_start_time` | from the trip descriptor, the route from the timetable if missing |
+| `stop_sequence`, `stop_id` | updates matched to the timetable by `stop_sequence`, else by `stop_id` |
+| `scheduled_arrival`, `scheduled_departure` | from the static `stop_times`, as Unix seconds (right past 24:00 and on DST days) |
+| `first_arrival_delay`, `last_arrival_delay`, `first_departure_delay`, `last_departure_delay` | first and last prediction, in seconds |
+| `last_predicted_arrival`, `last_predicted_departure` | last predicted times, as Unix seconds |
+| `first_seen`, `last_seen`, `prediction_count` | when the stop's predictions were made, how many |
+| `observed` | the last prediction was made after the predicted time (or the stop left the feed while the trip stayed in it) |
+| `delay_propagated` | the stop had no update of its own: the delay comes from the stop before |
+| `trip_schedule_relationship`, `stop_schedule_relationship` | e.g. `CANCELED`, `ADDED`; `SKIPPED`, `NO_DATA` |
+| `static_version` | static version used (the one the updates were fetched with) |
+
+- A service date is built once, after D+1 is over and aggregated, from the trip updates of the local days D-1, D and
+  D+1 (predictions made the evening before, trips past midnight). Each run builds one day, in a process of its own.
+- Delays only (e.g. SNCB) or times only (e.g. Entur) both work: the missing one is computed from the schedule.
+- Trips without `startDate` are assigned to the day whose scheduled run contains their updates; trips without
+  `trip_id`, by route and start time. Runs of frequency-based trips are told apart by start time. Canceled trips keep their scheduled stops, without times. Added trips unknown to
+  the timetable keep their updates, without a schedule.
+- To build the days before it was enabled: `gtfs-rt-pipeline configuration.toml --trip-stop-events-backfill 30`.
+- With Iceberg, add `"TripStopEvent"` to `iceberg.services`.
+
+```sql
+-- Average arrival delay per route, from the last prediction of observed stops
+SELECT route_id, avg(last_arrival_delay) / 60 AS minutes
+FROM read_parquet('out/provider=be/service=TripStopEvent/date=2026-10-24/day.parquet')
+WHERE observed GROUP BY ALL ORDER BY minutes DESC;
+```
+
+### Upgrading to 0.7.0
+
+- Optional `TripStopEvent` daily files (see "Trip stop events").
+
 ### Upgrading to 0.6.1
 
 - Optional Iceberg tables (see above), with the `iceberg` extra.
@@ -418,6 +460,12 @@ Register every compacted day in the Iceberg tables (converting files stored befo
 
 ```bash
 gtfs-rt-pipeline configuration.toml --iceberg-backfill
+```
+
+Build the missing `TripStopEvent` days among the last 30 days, then exit:
+
+```bash
+gtfs-rt-pipeline configuration.toml --trip-stop-events-backfill 30
 ```
 
 Rewrite aggregated files stored before 0.6.0 with the current types, then exit:

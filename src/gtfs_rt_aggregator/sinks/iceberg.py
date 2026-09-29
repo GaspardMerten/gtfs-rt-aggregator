@@ -108,7 +108,7 @@ class IcebergSink:
             table = None
             known: Optional[Dict[str, int]] = None
             for provider in self.config.providers:
-                if not any(service in api.services for api in provider.realtime):
+                if not self._stores(provider, service):
                     continue
                 storage = self.storages.get(provider.name, self.storage)
                 if storage is not self.storage:
@@ -142,6 +142,13 @@ class IcebergSink:
             if table is not None and self.settings.write_version_hint:
                 self._write_version_hint(service, table)
         return registered
+
+    def _stores(self, provider, service: str) -> bool:
+        if service == "TripStopEvent":
+            return self.config.output.trip_stop_events and any(
+                "TripUpdate" in api.services for api in provider.realtime
+            )
+        return any(service in api.services for api in provider.realtime)
 
     def _existing_table(self, service: str):
         from pyiceberg.exceptions import NoSuchTableError
@@ -186,9 +193,9 @@ class IcebergSink:
         with tempfile.NamedTemporaryFile(suffix=".parquet") as local:
             self.storage.read_to_file(path, local.name)
             schema = pq.read_schema(local.name)
-            if (
-                pa.types.is_integer(schema.field("fetchTime").type)
-                or "date" not in schema.names
+            if "date" not in schema.names or (
+                "fetchTime" in schema.names
+                and pa.types.is_integer(schema.field("fetchTime").type)
             ):
                 logger.warning(
                     f"Iceberg: {path} was written before 0.6.0, not registered: "

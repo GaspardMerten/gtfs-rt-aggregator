@@ -350,6 +350,10 @@ class OutputConfig(BaseModel):
         default_factory=lambda: ["entityId", "fetchTime"],
         description="Columns a compacted day is sorted by",
     )
+    trip_stop_events: bool = Field(
+        False,
+        description="Once a service date is over, write one row per trip and stop (service TripStopEvent), from the trip updates and the static timetable",
+    )
 
     @field_validator("path_template")
     @classmethod
@@ -378,14 +382,14 @@ class OutputConfig(BaseModel):
 
     @model_validator(mode="after")
     def validate_compaction(self):
-        if self.compact_daily:
+        if self.compact_daily or self.trip_stop_events:
             from datetime import datetime
             import posixpath
 
-            def folder(start):
+            def folder(start, service="s"):
                 return posixpath.dirname(
                     self.path_template.format(
-                        provider="p", service="s", start=start, end=start
+                        provider="p", service=service, start=start, end=start
                     )
                 )
 
@@ -395,7 +399,12 @@ class OutputConfig(BaseModel):
                 datetime(2026, 1, 1, 23, 59)
             ):
                 raise ValueError(
-                    "compact_daily needs a path_template with one folder per day (e.g. date={start:%Y-%m-%d}/)"
+                    "compact_daily and trip_stop_events need a path_template with one folder per day (e.g. date={start:%Y-%m-%d}/)"
+                )
+            if folder(datetime(2026, 1, 1)) == folder(datetime(2026, 1, 1), "t"):
+                # The day files of all services would have the same path
+                raise ValueError(
+                    "compact_daily and trip_stop_events need {service} in the folders of path_template, not only in the file name"
                 )
         return self
 
@@ -508,7 +517,13 @@ class IcebergConfig(BaseModel):
     @field_validator("services")
     @classmethod
     def validate_services(cls, v):
-        valid = {"VehiclePosition", "TripUpdate", "Alert", "TripModifications"}
+        valid = {
+            "VehiclePosition",
+            "TripUpdate",
+            "Alert",
+            "TripModifications",
+            "TripStopEvent",
+        }
         invalid = sorted(set(v) - valid)
         if invalid:
             raise ValueError(f"Invalid Iceberg services: {', '.join(invalid)}")
@@ -541,6 +556,17 @@ class GtfsRtConfig(BaseModel):
         if duplicates:
             raise ValueError(f"Provider names must be unique: {', '.join(duplicates)}")
         return providers
+
+    @model_validator(mode="after")
+    def validate_trip_stop_events(self):
+        if self.output.trip_stop_events:
+            import importlib.util
+
+            if importlib.util.find_spec("polars") is None:
+                raise ValueError(
+                    "trip_stop_events needs Polars: pip install 'gtfs_rt_aggregator[static]'"
+                )
+        return self
 
     @model_validator(mode="after")
     def validate_iceberg(self):

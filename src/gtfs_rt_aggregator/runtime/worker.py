@@ -268,6 +268,16 @@ def compact(**kwargs) -> Dict:
 
 
 @_timed
+def trip_stop_events(provider_name: str, days_back: int = 7) -> Dict:
+    from ..aggregator.trip_stop_service import TripStopEventsService
+
+    service = TripStopEventsService(_ctx().config, _ctx().storages)
+    # One day per task: the lane stays free for other heavy tasks in between
+    days = service.run_once(provider_name, days_back, max_days=1)
+    return {"days": [day.isoformat() for day in days]}
+
+
+@_timed
 def iceberg_sync(days_back: Optional[int] = 7) -> Dict:
     from ..sinks.iceberg import IcebergSink
 

@@ -25,6 +25,12 @@ def main():
         help="Convert files stored before 0.6.0, then register every compacted day in Iceberg, then exit",
     )
     parser.add_argument(
+        "--trip-stop-events-backfill",
+        type=int,
+        metavar="DAYS",
+        help="Build the missing TripStopEvent days among the last DAYS days, then exit",
+    )
+    parser.add_argument(
         "--convert-old-files",
         action="store_true",
         help="Rewrite aggregated files stored before 0.6.0 with the current types, then exit",
@@ -52,6 +58,23 @@ def main():
             converted = convert_old_files(config, storages)
             registered = IcebergSink(config, storages).sync(days_back=None)
             print(f"Converted {converted} files, registered {registered} days")
+            return
+        if args.trip_stop_events_backfill:
+            from ..aggregator.trip_stop_service import (
+                TripStopEventsService,
+                trip_update_feed,
+            )
+            from ..pipeline import create_storages
+
+            config = load_config_from_toml(args.toml_path)
+            service = TripStopEventsService(config, create_storages(config))
+            days = 0
+            for provider in config.providers:
+                if trip_update_feed(provider) is not None:
+                    days += len(
+                        service.run_once(provider.name, args.trip_stop_events_backfill)
+                    )
+            print(f"Built {days} TripStopEvent days")
             return
         if args.convert_old_files:
             from ..aggregator.convert import convert_old_files

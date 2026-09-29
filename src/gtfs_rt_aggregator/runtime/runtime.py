@@ -52,6 +52,8 @@ INDEX_EVERY_SECONDS = 30
 WINDOWS_EVERY_SECONDS = 5
 RAW_EVERY_SECONDS = 60
 SPOOL_SIZE_EVERY_SECONDS = 10
+# Each run builds at most one TripStopEvent day
+TRIP_STOP_EVENTS_EVERY_SECONDS = 1800
 # A raw hour is bundled this long after it ended (late fetches)
 RAW_GRACE_SECONDS = 120
 # Waits before retrying a failed item: 10 s, 20 s, 40 s... at most 5 min
@@ -286,6 +288,27 @@ class Runtime:
                     kind, name, args
                 ),
             )
+
+        if self.config.output.trip_stop_events:
+            from ..aggregator.trip_stop_service import trip_update_feed
+
+            for provider in self.config.providers:
+                api = trip_update_feed(provider)
+                if api is None or provider.static_for(api) is None:
+                    continue
+                name = f"TripStopEvent - {provider.name}"
+                add(
+                    name,
+                    TRIP_STOP_EVENTS_EVERY_SECONDS,
+                    # A fresh process per run, as static feeds: Polars keeps
+                    # the memory it used
+                    lambda name=name, provider=provider.name: self._queue_heavy(
+                        "trip_stop_events",
+                        name,
+                        {"provider_name": provider},
+                        lane="static",
+                    ),
+                )
 
         if self.config.iceberg is not None:
             add(
@@ -526,16 +549,17 @@ class Runtime:
                 "compact": worker.compact,
                 "iceberg_sync": worker.iceberg_sync,
                 "iceberg_maintain": worker.iceberg_maintain,
+                "trip_stop_events": worker.trip_stop_events,
             }.get(task.kind, worker.aggregate)
             self._submit(task, function, **task.info)
             free["heavy"] -= 1
 
-    def _queue_heavy(self, kind: str, name: str, args: Dict):
+    def _queue_heavy(self, kind: str, name: str, args: Dict, lane: str = "heavy"):
         if name in self._keys_in_flight or any(
             t.key == name for t in self._heavy_queue
         ):
             return
-        self._heavy_queue.append(Task(kind, name, "heavy", dict(args)))
+        self._heavy_queue.append(Task(kind, name, lane, dict(args)))
 
     def _pool(self, lane: str) -> ProcessPoolExecutor:
         return {"heavy": self._heavy_pool, "static": self._static_pool}.get(
