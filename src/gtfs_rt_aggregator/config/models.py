@@ -440,7 +440,10 @@ class RuntimeConfig(BaseModel):
 
     def worker_count(self) -> int:
         if self.workers == "auto":
-            return max(1, (os.cpu_count() or 2) - 1)
+            from ..utils.cpu import available_cpus
+
+            # CPUs minus one for the main process, the fetch and upload threads
+            return max(1, available_cpus() - 1)
         return self.workers
 
 

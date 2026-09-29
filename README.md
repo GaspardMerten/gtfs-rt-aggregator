@@ -137,13 +137,31 @@ base_path = "gtfs-feeds"  # Optional: subfolder within the bucket
   - **params**: Backend-specific parameters (`bucket_name` is required for GCS; `endpoint`, `access_key`, `secret_key`
     and `bucket_name` for MinIO)
 
+- **runtime**: Optional, how the pipeline runs (see "How it runs" below)
+  - **spool_dir**: Folder of downloads and results waiting to be processed or uploaded (default
+    `<TMPDIR>/gtfs_rt_aggregator-spool`). Use a persistent disk: what is in it survives restarts.
+  - **spool_max_gb**: Past this size, feeds stop being fetched, lowest `priority` first (default `10`)
+  - **fetch_threads**: Downloads running at the same time (default `16`)
+  - **workers**: Worker processes; `"auto"` is the number of CPUs minus one, at least 1 (default `"auto"`)
+  - **heavy_slots**: Worker processes for memory-heavy work: fetches larger than `heavy_threshold_mb`, static feeds,
+    aggregation and compaction (default `1`)
+  - **heavy_threshold_mb**: Fetches larger than this go to the heavy workers (default `8`)
+  - **max_attempts**: Tries per fetch before it is moved to the spool's `quarantine/` folder (default `3`)
+  - **startup_jitter_seconds**: Each job first runs at a random time within this delay (or its interval, if shorter),
+    not all at once (default `60`)
+  - **max_tasks_per_worker**: A worker process is replaced after this many tasks (default `200`)
+
+- **raw**: Optional archive of the raw GTFS-RT fetches, to rebuild the Parquet files after a bug
+  - **enabled**: Keep every fetch, bundled per feed and hour (default `false`)
+  - **prefix**: Folder of the archive in each provider's storage (default `"raw"`)
+
 - **output**: Optional, where aggregated files go
   - **path_template**: Path of each aggregated file. Fields: `provider`, `service`, `start` and `end` (the period, in
     the provider's timezone, with `strftime` formats). Default:
     `"provider={provider}/service={service}/date={start:%Y-%m-%d}/{start:%H-%M-%S}_to_{end:%H-%M-%S}.parquet"`
   - **compact_daily**: Merge the aggregated files of each finished day into one file (default `false`). Runs at
-    startup, then every 24 hours, on the last 7 days. Needs one folder per day in `path_template`. The whole day is
-    read in memory.
+    startup, then every 24 hours, on the last 7 days. Needs one folder per day in `path_template`. Streams: memory
+    stays around one hourly file, whatever the size of the day.
   - **compacted_name**: Name of that file, in the day's folder (default `"day.parquet"`)
   - **sort_by**: Columns the compacted file is sorted by (default `["entityId", "fetchTime"]`)
 
@@ -163,8 +181,12 @@ base_path = "gtfs-feeds"  # Optional: subfolder within the bucket
     - **refresh_seconds**: How often to fetch data from this API (default `60`)
     - **frequency_minutes**: The time interval (in minutes) for grouping files (default `60`)
     - **check_interval_seconds**: How often to check for new files to aggregate (default `300`)
-    - **accumulate_minutes**: Keep fetches in memory and write them in blocks of this many minutes (default `0`: write every fetch right away). Blocks follow the clock in the provider's timezone: `15` gives 16:00-16:15, 16:15-16:30, and so on, and `1440` gives one block per day. The value must divide 1440 and `frequency_minutes`. A block is written when the next one starts, or when the pipeline stops cleanly. If the process is killed, the current block is lost. A whole block sits in memory, so use short blocks for large feeds.
-    - **accumulate_concatenate**: Write each block as one Parquet file instead of one file per fetch (default `true`)
+    - **accumulate_minutes**: Write fetches in blocks of this many minutes, as one file per block (default `0`: one
+      file per fetch). Blocks follow the clock in the provider's timezone: `15` gives 16:00-16:15, 16:15-16:30, and so
+      on, and `1440` gives one block per day. The value must divide 1440 and `frequency_minutes`. A block is kept on
+      disk in the spool until it ends, so it survives restarts and crashes.
+    - **priority**: When the spool is full, feeds with the lowest priority stop being fetched first (default `0`)
+    - **accumulate_concatenate**: No longer used (blocks are always one file)
   - **static**: List of GTFS static feeds for this provider (needs the `static` extra)
     - **url**: URL of the GTFS zip
     - **index_url** and **url_pattern**: Instead of `url`, for feeds published under a new URL for each version: the
@@ -187,11 +209,15 @@ set. Write `$${` for a literal `${`.
 
 Besides the entity's fields, each row has:
 
-- `fetchTime`: when it was fetched (Unix time)
-- `feedTimestamp`: the time in the feed's header (Unix time)
+- `provider` and `date`: the provider, and the local date of the fetch in its timezone
+- `fetchTime`: when it was fetched (timestamp, UTC)
+- `feedTimestamp`: the time in the feed's header (timestamp, UTC)
 - `staticVersion`: the provider's static version current at that time, to join with the right timetable later
 - `contentHash`: a hash of the entity, used to skip unchanged fetches and to deduplicate
-- with `deduplicate = true`, after aggregation: `firstSeen` and `lastSeen`
+- with `deduplicate = true`, after aggregation: `firstSeen` and `lastSeen` (timestamps, UTC)
+
+Times inside the entities (e.g. a vehicle's `timestamp`, or `time` in a stop time update) stay Unix seconds, as in
+GTFS-RT. No column is an unsigned integer, so the files can be read by engines without them (e.g. Iceberg).
 
 **Unchanged fetches.** With `skip_unchanged` (the default), a fetch is not stored when its entities are exactly those of
 the previous fetch, in any order, even if the header time changed. If you poll every 30 s and the feed changes every
@@ -207,6 +233,8 @@ is a new row. Fetches skipped as unchanged are not counted, so `lastSeen` is the
 - `route_types`: GTFS route types, as numbers or ranges, e.g. `[2, "100-199"]` for rail
 - `route_ids`: route ids
 - `trip_ids`: trip ids
+- `keep_unmatched_added`: also keep ADDED, NEW and DUPLICATED trips whose route cannot be resolved (no route id, or a
+  route unknown to the static feed): added trips are not in the static timetable (default `false`)
 
 Realtime entities often carry only a trip id, so `route_types` and `route_ids` are resolved through the trips and
 routes of the provider's latest static version (checked at most once a minute): the provider needs a
@@ -221,12 +249,37 @@ the fetch was unchanged. The URL is stored without its query string, which may h
 A period is aggregated once a file from the next period exists, or 5 minutes after it ended: a feed that stops
 changing stores no new files. Files that arrive later are added to the period's file.
 
+### How it runs
+
+```
+scheduler ─▶ fetch threads ─▶ spool/incoming ─▶ worker processes ─▶ spool/ready ─▶ upload thread ─▶ storage
+```
+
+- **Fetch threads** only download, streaming each fetch to a file in the spool (`runtime.spool_dir`): a fetch is
+  never held in memory and never waits for processing. A fetch identical, byte for byte, to the previous one is
+  dropped right away.
+- **Worker processes** (a fixed pool, `runtime.workers`) parse, filter and convert each fetch to Parquet, one at a time
+  per feed and in fetch order. Memory-heavy work goes to a separate pool (`runtime.heavy_slots`, 1 by default): large
+  fetches, static feeds, aggregation and compaction, so they never run side by side.
+- **The upload thread** moves results to storage, and checks they arrived. While storage is down, results wait on
+  disk.
+- A fetch whose processing fails (or whose worker is killed, e.g. out of memory) is retried, and moved to the spool's
+  `quarantine/` folder after `runtime.max_attempts`. On restart, whatever was in progress is picked up again.
+- When the spool grows past `runtime.spool_max_gb`, feeds stop being fetched, lowest `priority` first, until it is
+  below 90 % again. Nothing already on disk is dropped.
+- `_status/index.json` in the global storage summarises every feed: last success and error, feed age, fetches
+  waiting and the age of the oldest, spool size. Each worker logs its peak memory.
+
+Converting protobuf to Parquet builds Arrow columns straight from the protobuf messages, without an intermediate
+dict per message: a feed of 77,000 trip updates (28 MB) takes a few seconds.
+
 ### Storage Layout
 
 ```
 ovapi/VehiclePosition/individual/2026-09-28_14-00-20Z.parquet                        # one fetch (or block), UTC
 provider=ovapi/service=VehiclePosition/date=2026-09-28/16-00-00_to_17-00-00.parquet  # aggregated, local time
 provider=ovapi/service=VehiclePosition/date=2026-09-27/day.parquet                   # compacted day
+ovapi/raw/provider=ovapi/feed=VehiclePosition-1a2b3c4d/date=2026-09-28/14-1790000000.tar.zst  # raw archive (optional)
 ovapi/static/2026-09-28_01-00-00Z/stops.parquet                 # one static version (UTC), one file per table
 ovapi/static/2026-09-28_01-00-00Z/manifest.json
 ovapi/static/latest.json                                        # manifest of the latest version
@@ -245,6 +298,22 @@ WHERE date = '2026-09-28'
 Individual files and static versions are named after their fetch time in UTC (the `Z` suffix), so the hour that repeats when clocks go back never produces the same name twice. Aggregation periods, daily folders and aggregated files use the provider's timezone; on the night clocks go back, the repeated hour ends up in a single aggregated file covering both passes.
 
 A new static version is stored only when a file inside the zip changed. The pipeline first asks the server whether the feed changed since the last check (ETag / Last-Modified), then compares the checksum and size of each file in the zip. A zip rebuilt with the same files is not stored again. Each version is a full copy of the feed (unless `reuse_unchanged_tables` is set: `manifest.json` then gives the path of each table), converted table by table with gtfs-parquet's `convert_gtfs_zip`, so the feed is never fully in memory: the German national feed (a 298 MB zip, 40 million stop times) takes about a minute and 0.5 GB of RAM. Static jobs limit Polars to 4 threads, since its memory grows with the thread count; set `POLARS_MAX_THREADS` to change it. Rows keep the order of the source files. The zip and the converted tables are kept in a temporary folder until uploaded (about 1.5 GB for the German feed): if `/tmp` is in RAM (tmpfs, common in containers), point `TMPDIR` to a disk. If a check is still running when the next one is due, the next one is skipped.
+
+### Upgrading to 0.6.0
+
+- The pipeline runs with a disk spool, a fixed pool of worker processes and an upload thread, instead of one process
+  per job (see "How it runs"). Set `runtime.spool_dir` to a persistent disk. Passing a `SchedulerClass` to
+  `GtfsRtPipeline` still selects the old way of running, which is deprecated.
+- Realtime files are ready for Iceberg and other engines without unsigned integers:
+  - `fetchTime`, `feedTimestamp`, `firstSeen` and `lastSeen` are timestamps (microseconds, UTC) instead of Unix
+    seconds. Times inside the entities (e.g. a vehicle's `timestamp`) stay Unix seconds, as in GTFS-RT.
+  - Unsigned integer columns are now signed 64-bit integers.
+  - Every row has `provider` and `date` (the local date of `fetchTime`) columns.
+  Files written by earlier versions keep their types; the aggregator converts them when it reads them, so old and
+  new files are merged into the new types.
+- `accumulate_minutes` blocks live on disk in the spool instead of in memory; `accumulate_concatenate` is ignored.
+- `FetcherService.run_once` stores each fetch right away (no accumulation); the runtime does the rest.
+- New options: `[runtime]`, `[raw]`, per-feed `priority`, and `filter.keep_unmatched_added`.
 
 ### Upgrading to 0.5.1
 
@@ -333,6 +402,7 @@ run_pipeline(config)
 src/gtfs_rt_aggregator/
   ├── __init__.py                # Package initialization
   ├── pipeline.py                # Main pipeline implementation
+  ├── runtime/                   # Spool, fetch threads, worker processes, upload thread
   ├── aggregator/                # Aggregation functionality
   ├── config/                    # Configuration loading and validation
   ├── fetcher/                   # GTFS-RT data fetching functionality
