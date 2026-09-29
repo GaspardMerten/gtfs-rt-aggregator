@@ -22,6 +22,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Iterator, List, Optional
 
+# Written by a shutdown that went to the end (see recover)
+CLEAN_SHUTDOWN = "clean-shutdown"
+
 SUBDIRS = (
     "incoming",
     "processing",
@@ -82,19 +85,6 @@ class Spool:
         write_json(item.with_suffix(".json"), meta)
         os.replace(tmp, item)
 
-    def pending(self, feed: str) -> List[Path]:
-        """Fetches of a feed waiting for a worker, oldest first."""
-        folder = self.path("incoming", feed)
-        if not folder.is_dir():
-            return []
-        return sorted(p for p in folder.glob("*.pb") if p.with_suffix(".json").exists())
-
-    def feeds_with_pending(self) -> List[str]:
-        folder = self.path("incoming")
-        return sorted(
-            d.name for d in folder.iterdir() if d.is_dir() and any(d.glob("*.pb"))
-        )
-
     def claim(self, item: Path) -> Path:
         """
         Move a fetch to processing/. Returns its new path. The .pb moves
@@ -111,19 +101,26 @@ class Spool:
         return read_json(item.with_suffix(".json")) or {}
 
     def release(
-        self, item: Path, error: str, max_attempts: int, count_attempt: bool = True
+        self,
+        item: Path,
+        error: str,
+        max_attempts: int,
+        count_attempt: bool = True,
+        suspect: Optional[bool] = None,
     ) -> bool:
         """
         A fetch failed: back to incoming/ for another try, or to quarantine/
         after max_attempts. With count_attempt False (its worker died while
         other fetches ran beside it, so it may not be the cause), the fetch is
-        marked "suspect" instead: it will next run alone. Returns True if
-        quarantined.
+        marked "suspect" instead (unless suspect is False): it will next run
+        alone. Returns True if quarantined.
         """
         meta = self.meta(item)
         if count_attempt:
             meta["attempt"] = meta.get("attempt", 1) + 1
-        elif error != "cancelled":
+            # Blamed on its own: no longer needs to run alone
+            meta.pop("suspect", None)
+        elif suspect if suspect is not None else error != "cancelled":
             meta["suspect"] = True
         meta["last_error"] = error
         quarantined = meta.get("attempt", 1) > max_attempts
@@ -189,11 +186,18 @@ class Spool:
 
     # Recovery and size ------------------------------------------------------
 
+    def mark_clean_shutdown(self):
+        (self.root / CLEAN_SHUTDOWN).touch()
+
     def recover(self, max_attempts: int) -> Dict[str, int]:
         """
         After a crash or restart: fetches left in processing/ go back to
-        incoming/ (counting an attempt), temporary files are deleted.
+        incoming/ (counting an attempt after a crash, not after a clean
+        shutdown), temporary files are deleted.
         """
+        marker = self.root / CLEAN_SHUTDOWN
+        clean = marker.exists()
+        marker.unlink(missing_ok=True)
         counts = {"requeued": 0, "quarantined": 0, "tmp_removed": 0}
         # A claim interrupted between its two renames: sidecar still in incoming/
         for item in self.path("processing").glob("*/*.pb"):
@@ -205,7 +209,13 @@ class Spool:
             if not sidecar.with_suffix(".pb").exists():
                 sidecar.unlink(missing_ok=True)
         for item in sorted(self.path("processing").glob("*/*.pb")):
-            if self.release(item, "interrupted (restart)", max_attempts):
+            if self.release(
+                item,
+                "interrupted (restart)",
+                max_attempts,
+                count_attempt=not clean,
+                suspect=False,
+            ):
                 counts["quarantined"] += 1
             else:
                 counts["requeued"] += 1
@@ -222,11 +232,9 @@ class Spool:
         return counts
 
     def size_bytes(self) -> int:
-        """Size of the spool, quarantine excepted (it never drains by itself)."""
+        """Size of the spool, quarantine included: it only drains by hand."""
         total = 0
         for dirpath, dirnames, filenames in os.walk(self.root):
-            if Path(dirpath) == self.root and "quarantine" in dirnames:
-                dirnames.remove("quarantine")
             for name in filenames:
                 try:
                     total += os.stat(os.path.join(dirpath, name)).st_size
@@ -234,22 +242,9 @@ class Spool:
                     pass
         return total
 
-    def backlog(self) -> Dict[str, Dict]:
-        """Per feed: fetches waiting, and the age of the oldest (seconds)."""
-        now = datetime.now(timezone.utc)
-        result = {}
-        for feed in self.feeds_with_pending():
-            items = self.pending(feed)
-            if not items:
-                continue
-            oldest = datetime.strptime(items[0].stem, "%Y%m%dT%H%M%S.%fZ").replace(
-                tzinfo=timezone.utc
-            )
-            result[feed] = {
-                "waiting": len(items),
-                "oldest_age_seconds": round((now - oldest).total_seconds()),
-            }
-        return result
-
     def quarantined(self) -> int:
-        return sum(1 for _ in self.path("quarantine").glob("*/*.pb"))
+        """Fetches and static downloads in quarantine/."""
+        quarantine = self.path("quarantine")
+        return sum(1 for _ in quarantine.glob("*/*.pb")) + sum(
+            1 for _ in quarantine.glob("static/*/*/meta.json")
+        )

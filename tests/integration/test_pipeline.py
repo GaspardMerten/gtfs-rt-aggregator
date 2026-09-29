@@ -4,7 +4,7 @@ import logging
 import unittest
 from datetime import datetime, timedelta
 from io import BytesIO
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 
 import pandas as pd
 import pytz
@@ -176,47 +176,14 @@ class TestFullPipeline(unittest.TestCase):
                 # The actual data might not have a provider column, so we don't test for it
 
     def test_pipeline_integration(self):
-        """
-        Test the GtfsRtPipeline class that orchestrates the entire flow.
-        """
-        # Mock the storage factory and scheduler
-        with (
-            patch("src.gtfs_rt_aggregator.storage.create_storage") as mock_create,
-            patch(
-                "src.gtfs_rt_aggregator.utils.scheduler.SchedulerClass"
-            ) as mock_scheduler_class,
-        ):
-
-            # Configure storage mock
-            mock_create.return_value = self.storage
-
-            # Configure scheduler mock
-            mock_scheduler = MagicMock()
-            mock_scheduler_class.return_value = mock_scheduler
-
-            # Create the pipeline
-            pipeline = GtfsRtPipeline(self.config, mock_scheduler)
-
-            # Verify that services were created correctly
-            self.assertIsNotNone(pipeline.fetcher_service)
-            self.assertIsNotNone(pipeline.aggregator_service)
-            self.assertIsNotNone(pipeline.scheduler)
-
-            # Start the pipeline (this should set up scheduling but not actually run because of our mock)
+        """GtfsRtPipeline runs the runtime until stopped."""
+        with patch("src.gtfs_rt_aggregator.pipeline.Runtime") as runtime_class:
+            pipeline = GtfsRtPipeline(self.config)
             pipeline.start()
-
-            # Verify that add_schedules was called at least once
-            # The exact number of calls can vary based on implementation
-            self.assertTrue(mock_scheduler.add_schedules.call_count > 0)
-
-            # Verify scheduler was started
-            mock_scheduler.start.assert_called_once()
-
-            # Stop the pipeline
+            runtime_class.assert_called_once_with(self.config, pipeline.storages)
+            runtime_class.return_value.run.assert_called_once()
             pipeline.stop()
-
-            # Verify scheduler was stopped
-            mock_scheduler.stop.assert_called_once()
+            runtime_class.return_value.stop.assert_called_once()
 
 
 if __name__ == "__main__":

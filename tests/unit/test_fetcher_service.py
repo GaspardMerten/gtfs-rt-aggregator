@@ -1,14 +1,8 @@
-import multiprocessing
 import os
-import pickle
-import tempfile
 import unittest
-from datetime import datetime
 from io import BytesIO
-from unittest.mock import patch
 
 import pandas as pd
-import pytz
 
 from src.gtfs_rt_aggregator.config.models import (
     GtfsRtConfig,
@@ -17,7 +11,6 @@ from src.gtfs_rt_aggregator.config.models import (
     StorageConfig,
 )
 from src.gtfs_rt_aggregator.fetcher.service import FetcherService
-from src.gtfs_rt_aggregator.storage.filesystem import FileSystemStorage
 from tests.mocks import MockStorageInterface, MockServerManager
 
 # Start with a base port, but the actual port may change
@@ -78,33 +71,6 @@ class TestFetcherService(unittest.TestCase):
 
         # Create the fetcher service
         self.fetcher_service = FetcherService(self.config, self.storages)
-
-    def test_get_scheduling(self):
-        """Test that scheduling is correctly generated."""
-        schedules = self.fetcher_service.get_scheduling()
-
-        # Should have 3 schedules (one for each API)
-        self.assertEqual(len(schedules), 3)
-
-        # Each schedule should be a tuple with 4 elements
-        for schedule in schedules:
-            self.assertEqual(len(schedule), 4)
-
-            # First element should be the refresh seconds (60)
-            self.assertEqual(schedule[0], 60)
-
-            # Second element should be the run_once method
-            self.assertEqual(schedule[1], self.fetcher_service.run_once)
-
-            # Third element should be a name string
-            self.assertIsInstance(schedule[2], str)
-
-            # Fourth element should be a dict with arguments
-            self.assertIsInstance(schedule[3], dict)
-            self.assertIn("provider_name", schedule[3])
-            self.assertIn("url", schedule[3])
-            self.assertIn("service_types", schedule[3])
-            self.assertIn("timezone", schedule[3])
 
     def test_run_once_alerts(self):
         """Test fetching alerts."""

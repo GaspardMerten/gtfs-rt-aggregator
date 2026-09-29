@@ -89,19 +89,9 @@ class FileSystemStorage(StorageInterface):
         shutil.copyfile(self._get_full_path(path), local_path)
 
     def read_bytes(self, path: str) -> bytes:
-        """Read binary data from the file system."""
-        self.logger.debug(f"Reading data from {path}")
-
-        try:
-            full_path = self._get_full_path(path)
-            with open(full_path, "rb") as f:
-                data = f.read()
-
-            self.logger.debug(f"Successfully read {len(data)} bytes from {full_path}")
-            return data
-        except Exception as e:
-            self.logger.error(f"Error reading file {path}: {str(e)}", exc_info=True)
-            return b""
+        """Read binary data from the file system (FileNotFoundError if missing)."""
+        with open(self._get_full_path(path), "rb") as f:
+            return f.read()
 
     def list_files(self, directory: str, pattern: Optional[str] = None) -> List[str]:
         """List files in the file system matching a pattern."""

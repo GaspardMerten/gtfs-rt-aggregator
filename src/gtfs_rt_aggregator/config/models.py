@@ -1,6 +1,6 @@
-import os
 from typing import List, Optional, Dict, Any, Union
 
+from ..utils.redact import strip_query
 from pydantic import (
     AliasChoices,
     BaseModel,
@@ -11,10 +11,18 @@ from pydantic import (
 )
 
 
-class StorageConfig(BaseModel):
+class _Model(BaseModel):
+    # Validation errors would print the values, which can be secrets (API
+    # keys in URLs and headers, storage credentials)
+    model_config = ConfigDict(hide_input_in_errors=True)
+
+
+class StorageConfig(_Model):
     """Storage configuration."""
 
-    type: str = Field(..., description="Storage type ('filesystem' or 'gcs')")
+    type: str = Field(
+        ..., description="Storage type: filesystem, gcs, or minio (also s3)"
+    )
     params: Dict[str, Any] = Field(
         default_factory=dict, description="Storage-specific parameters"
     )
@@ -22,8 +30,11 @@ class StorageConfig(BaseModel):
     @field_validator("type")
     @classmethod
     def validate_storage_type(cls, v: str) -> str:
-        # Unknown types are rejected by StorageFactory, which also accepts
-        # types registered at runtime
+        known = ("filesystem", "gcs", "google", "google_cloud_storage", "minio", "s3")
+        if v.lower() not in known:
+            raise ValueError(
+                f"Unsupported storage type {v!r}: use filesystem, gcs or minio"
+            )
         return v.lower()
 
     @model_validator(mode="after")
@@ -43,7 +54,7 @@ class StorageConfig(BaseModel):
         return self
 
 
-class FilterConfig(BaseModel):
+class FilterConfig(_Model):
     """Rows of a realtime feed to keep. A row is kept if it matches any rule."""
 
     model_config = ConfigDict(extra="forbid")
@@ -102,7 +113,7 @@ class FilterConfig(BaseModel):
         return bool(self.route_types or self.route_ids)
 
 
-class ApiConfig(BaseModel):
+class ApiConfig(_Model):
     """GTFS-RT (realtime) feed configuration for a provider."""
 
     # Catch typos such as refresh_second instead of silently using the default
@@ -127,11 +138,7 @@ class ApiConfig(BaseModel):
     accumulate_minutes: int = Field(
         0,
         ge=0,
-        description="Keep fetches in memory and write them in clock-aligned blocks of this many minutes (0 writes every fetch right away)",
-    )
-    accumulate_concatenate: bool = Field(
-        True,
-        description="Write each block as one Parquet file instead of one file per fetch",
+        description="Collect fetches on disk and store them as one file per clock-aligned block of this many minutes (0 stores every fetch right away)",
     )
     headers: Dict[str, str] = Field(
         default_factory=dict,
@@ -159,6 +166,21 @@ class ApiConfig(BaseModel):
         0,
         description="When the spool is full, feeds with the lowest priority stop being fetched first",
     )
+
+    @model_validator(mode="before")
+    @classmethod
+    def drop_removed_options(cls, values):
+        if isinstance(values, dict) and "accumulate_concatenate" in values:
+            import warnings
+
+            values = dict(values)
+            values.pop("accumulate_concatenate")
+            warnings.warn(
+                "accumulate_concatenate is ignored since 0.7.4 (a window is always one file): remove it",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+        return values
 
     @model_validator(mode="after")
     def validate_accumulate_minutes(self):
@@ -189,7 +211,7 @@ class ApiConfig(BaseModel):
         return v
 
 
-class StaticConfig(BaseModel):
+class StaticConfig(_Model):
     """GTFS static feed configuration for a provider."""
 
     # Catch typos such as check_minute instead of silently using the default
@@ -245,7 +267,7 @@ class StaticConfig(BaseModel):
         return self
 
 
-class ProviderConfig(BaseModel):
+class ProviderConfig(_Model):
     """Provider configuration."""
 
     model_config = ConfigDict(populate_by_name=True)
@@ -271,8 +293,25 @@ class ProviderConfig(BaseModel):
         None, description="Provider-specific storage configuration (overrides global)"
     )
 
+    @field_validator("name")
+    @classmethod
+    def validate_name(cls, v: str) -> str:
+        # The name is a folder in the storage and in the spool, where "global"
+        # and "__global__" hold files of the global storage
+        if not v or v in ("global", "__global__", ".", "..") or "/" in v or "\\" in v:
+            raise ValueError(
+                f"Invalid provider name {v!r}: it must not be empty, global, __global__, . or .., or contain / or \\"
+            )
+        return v
+
     @model_validator(mode="after")
     def validate_feeds(self):
+        # Provider defaults, for the feeds that do not set their own
+        for api in self.realtime:
+            for option in ("frequency_minutes", "check_interval_seconds"):
+                value = getattr(self, option)
+                if value is not None and option not in api.model_fields_set:
+                    setattr(api, option, value)
         if not self.realtime and not self.static:
             raise ValueError(
                 f"Provider {self.name} has no realtime or static feed defined"
@@ -287,14 +326,25 @@ class ProviderConfig(BaseModel):
             raise ValueError(
                 f"Static feed names of provider {self.name} cannot be a realtime service type: {sorted(services & set(names))}"
             )
+        urls = [api.url for api in self.realtime]
+        if len(urls) != len(set(urls)):
+            raise ValueError(f"Provider {self.name} lists the same realtime feed twice")
+        # Feeds sharing a service write to the same files, aggregated together
+        for service in services:
+            feeds = [api for api in self.realtime if service in api.services]
+            for option in ("frequency_minutes", "deduplicate"):
+                if len({getattr(api, option) for api in feeds}) > 1:
+                    raise ValueError(
+                        f"The {service} feeds of provider {self.name} must have the same {option}"
+                    )
         for api in self.realtime:
             if api.static is not None and api.static not in names:
                 raise ValueError(
-                    f"Realtime feed {api.url} of provider {self.name} refers to static feed {api.static!r}, which is not defined"
+                    f"Realtime feed {strip_query(api.url)} of provider {self.name} refers to static feed {api.static!r}, which is not defined"
                 )
             if api.filter and api.filter.needs_static and self.static_for(api) is None:
                 raise ValueError(
-                    f"The route filter of {api.url} needs a static feed in provider {self.name}"
+                    f"The route filter of {strip_query(api.url)} needs a static feed in provider {self.name}"
                     + (
                         ' (several are defined: set static = "<name>")'
                         if self.static
@@ -332,7 +382,7 @@ DEFAULT_PATH_TEMPLATE = (
 )
 
 
-class OutputConfig(BaseModel):
+class OutputConfig(_Model):
     model_config = ConfigDict(extra="forbid")
 
     path_template: str = Field(
@@ -409,7 +459,7 @@ class OutputConfig(BaseModel):
         return self
 
 
-class RuntimeConfig(BaseModel):
+class RuntimeConfig(_Model):
     """How the pipeline runs: spool on disk, threads and worker processes."""
 
     model_config = ConfigDict(extra="forbid")
@@ -465,7 +515,7 @@ class RuntimeConfig(BaseModel):
         return self.workers
 
 
-class RawConfig(BaseModel):
+class RawConfig(_Model):
     """Optional archive of the raw GTFS-RT fetches."""
 
     model_config = ConfigDict(extra="forbid")
@@ -480,7 +530,7 @@ class RawConfig(BaseModel):
     )
 
 
-class IcebergConfig(BaseModel):
+class IcebergConfig(_Model):
     """Optional Iceberg tables over the compacted days (extra: iceberg)."""
 
     model_config = ConfigDict(extra="forbid")
@@ -550,7 +600,7 @@ class IcebergConfig(BaseModel):
         return v
 
 
-class GtfsRtConfig(BaseModel):
+class GtfsRtConfig(_Model):
     """Main configuration for the GTFS-RT fetcher and aggregator."""
 
     storage: StorageConfig = Field(..., description="Global storage configuration")
@@ -586,6 +636,16 @@ class GtfsRtConfig(BaseModel):
                 raise ValueError(
                     "trip_stop_events needs Polars: pip install 'gtfs_rt_aggregator[static]'"
                 )
+            for provider in self.providers:
+                statics = {
+                    getattr(provider.static_for(api), "name", None)
+                    for api in provider.realtime
+                    if "TripUpdate" in api.services
+                }
+                if len(statics) > 1:
+                    raise ValueError(
+                        f"trip_stop_events: the TripUpdate feeds of provider {provider.name} must use the same static feed"
+                    )
         return self
 
     @model_validator(mode="after")
@@ -602,65 +662,3 @@ class GtfsRtConfig(BaseModel):
                     "[iceberg] needs PyIceberg: pip install 'gtfs_rt_aggregator[iceberg]'"
                 )
         return self
-
-    def get_provider_storage(self, provider_name: str) -> StorageConfig:
-        """
-        Get storage configuration for a provider.
-
-        @param provider_name: Name of the provider
-        @return Storage configuration for the provider
-        @raises ValueError: If provider is not found
-        """
-        # Find the provider
-        provider = None
-        for p in self.providers:
-            if p.name == provider_name:
-                provider = p
-                break
-
-        if not provider:
-            raise ValueError(f"Provider not found: {provider_name}")
-
-        # Use provider-specific storage if available, otherwise use global
-        return provider.storage or self.storage
-
-    def get_effective_api_config(self, provider_name: str, api_url: str) -> ApiConfig:
-        """
-        Get effective API configuration for a provider and URL.
-
-        @param provider_name: Name of the provider
-        @param api_url: URL of the API
-        @return Effective API configuration
-        @raises ValueError: If provider or API is not found
-        """
-        # Find the provider
-        provider = None
-        for p in self.providers:
-            if p.name == provider_name:
-                provider = p
-                break
-
-        if not provider:
-            raise ValueError(f"Provider not found: {provider_name}")
-
-        # Find the API
-        api = None
-        for a in provider.realtime:
-            if a.url == api_url:
-                api = a
-                break
-
-        if not api:
-            raise ValueError(f"API not found: {api_url}")
-
-        # Apply provider defaults if needed
-        if provider.frequency_minutes is not None and api.frequency_minutes == 60:
-            api.frequency_minutes = provider.frequency_minutes
-
-        if (
-            provider.check_interval_seconds is not None
-            and api.check_interval_seconds == 300
-        ):
-            api.check_interval_seconds = provider.check_interval_seconds
-
-        return api

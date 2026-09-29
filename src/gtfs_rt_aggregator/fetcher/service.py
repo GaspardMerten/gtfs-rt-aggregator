@@ -4,10 +4,11 @@ from typing import Dict, List, Any, Optional, Tuple
 
 import pytz
 
+from ..aggregator import fetch_times
 from ..config.models import ApiConfig, GtfsRtConfig, ProviderConfig
 from ..fetcher.gtfs_rt import GtfsRtFetcher
 from ..runtime.core import StaticVersions, feed_hash, feed_slug, process_payload
-from ..storage.base import StorageInterface
+from ..storage.base import StorageInterface, storage_for
 from ..utils.file_time import format_file_time
 from ..utils.log_helper import setup_logger
 from ..utils.redact import redact
@@ -43,27 +44,6 @@ class FetcherService:
         provider = next(p for p in self.config.providers if p.name == provider_name)
         api = next(a for a in provider.realtime if a.url == url)
         return provider, api
-
-    def get_scheduling(self) -> List[Tuple[Any, callable, str, Dict[str, Any]]]:
-        """
-        Get the scheduling configuration for the fetcher service.
-
-        Returns:
-            List of tuples containing (interval in seconds, function, name, arguments)
-        """
-        schedules = []
-        for provider in self.config.providers:
-            for api in provider.realtime:
-                args = {
-                    "provider_name": provider.name,
-                    "url": api.url,
-                    "service_types": api.services,
-                    "timezone": provider.timezone,
-                    "headers": api.headers,
-                }
-                name = f"Fetcher - {provider.name} - {feed_slug(api)}"
-                schedules.append((api.refresh_seconds, self.run_once, name, args))
-        return schedules
 
     def run_once(
         self,
@@ -112,6 +92,9 @@ class FetcherService:
                     continue
                 name = format_file_time(fetch_time, feed_hash(api))
                 path = f"{provider_name}/{service_type}/individual/{name}.parquet"
+                table = fetch_times.with_times(
+                    table, fetch_times.of_fetch(feed_hash(api), fetch_time)
+                )
                 storage.save_bytes(
                     ParquetSerializer.pyarrow_table_to_bytes(
                         table, compression="snappy"
@@ -130,9 +113,6 @@ class FetcherService:
             job_logger.error(f"Error in fetch job for {url}: {str(e)}", exc_info=True)
         finally:
             self._write_status(provider_name, api, state, status, storage, job_logger)
-
-    def flush_all(self):
-        """Nothing to flush: kept for compatibility (accumulation is done by the runtime)."""
 
     def _write_status(self, provider_name, api, state, status, storage, logger):
         """Write the feed's status.json, keeping the fields of earlier fetches."""
@@ -158,4 +138,4 @@ class FetcherService:
         @param provider_name: Name of the provider
         @return Storage interface for the provider
         """
-        return self.storages.get(provider_name, self.storages["global"])
+        return storage_for(self.storages, provider_name)

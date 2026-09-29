@@ -101,8 +101,8 @@ class TestAggregatorService(unittest.TestCase):
             patch.object(self.aggregator, "_aggregate_files") as mock_aggregate,
         ):
 
-            # Set up the mock to return a dictionary with one timestamp and 5 files
-            fake_timestamp = base_time
+            # A finished period with 5 files
+            fake_timestamp = base_time - timedelta(hours=2)
             fake_files = [f"file{i}.parquet" for i in range(5)]
             mock_group.return_value = {fake_timestamp: fake_files}
 

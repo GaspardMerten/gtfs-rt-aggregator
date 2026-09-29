@@ -74,7 +74,6 @@ vehicle_descriptor_type = pa.struct(
 
 trip_update_schema = pa.schema(
     [
-        # trip is required => nullable=False
         pa.field("entityId", pa.string(), nullable=False),
         pa.field("provider", pa.string(), nullable=True),
         # Local date of fetchTime, in the provider timezone
@@ -86,6 +85,7 @@ trip_update_schema = pa.schema(
         pa.field("feedId", pa.string(), nullable=True),
         # Hash of the entity, to skip unchanged fetches and deduplicate rows
         pa.field("contentHash", pa.string(), nullable=True),
+        # trip is required
         pa.field("trip", trip_descriptor_type, nullable=False),
         pa.field("vehicle", vehicle_descriptor_type, nullable=True),
         pa.field("stopTimeUpdate", pa.list_(stop_time_update_type), nullable=True),

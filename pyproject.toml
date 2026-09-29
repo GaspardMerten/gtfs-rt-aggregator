@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "gtfs_rt_aggregator"
-version = "0.7.3"
+version = "0.7.4"
 description = "GTFS-RT Fetcher and Aggregator to Parquet format"
 readme = "README.md"
 authors = [
@@ -22,7 +22,6 @@ dependencies = [
     "pyarrow>=14.0.0",
     "protobuf>=4.25.0",
     "pytz>=2023.3",
-    "schedule>=1.2.0",
     "requests>=2.31.0",
     "pydantic>=2.5.0",
     "google-cloud-storage>=2.13.0",

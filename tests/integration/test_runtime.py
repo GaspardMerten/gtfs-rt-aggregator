@@ -176,16 +176,13 @@ class TestRuntime(unittest.TestCase):
         names = [f.name for f in self._individual()]
         self.assertEqual(len(names), len(set(names)))
 
-    def test_quarantine_after_max_attempts(self):
-        from unittest.mock import patch
-
-        # Retries wait 10 s, 20 s... in production
-        with patch("src.gtfs_rt_aggregator.runtime.runtime.RETRY_BASE_SECONDS", 0.2):
-            self._run(self._config("/garbage", max_attempts=2), 4)
+    def test_undecodable_fetch_quarantined_at_once(self):
+        # Another attempt cannot fix a feed that does not decode
+        self._run(self._config("/garbage", max_attempts=5), 4)
         quarantined = self._spool_items("quarantine")
         self.assertGreaterEqual(len(quarantined), 1)
         meta = json.loads(quarantined[0].with_suffix(".json").read_text())
-        self.assertEqual(meta["attempt"], 3)
+        self.assertEqual(meta["attempt"], 2)
         self.assertIn("last_error", meta)
         self.assertEqual(self._individual(), [])
 

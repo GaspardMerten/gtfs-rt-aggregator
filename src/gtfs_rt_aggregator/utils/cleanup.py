@@ -15,6 +15,14 @@ STALE_AFTER_SECONDS = 12 * 3600
 CACHE_STALE_AFTER_SECONDS = 7 * 24 * 3600
 
 STATIC_WORK_PREFIX = "gtfs_rt_aggregator-static-"
+# Work folders of jobs (deleted when a job ends, unless it was killed)
+WORK_PREFIXES = (
+    STATIC_WORK_PREFIX,
+    "gtfs_rt_aggregator-merge-",
+    "gtfs_rt_aggregator-compact-",
+    "gtfs_rt_aggregator-convert-",
+    "gtfs_rt_aggregator-tse-",
+)
 
 
 def clean_stale_temp_files(temp_dir: str = None, now: float = None) -> int:
@@ -22,15 +30,18 @@ def clean_stale_temp_files(temp_dir: str = None, now: float = None) -> int:
     Delete this package's stale temporary folders and return how many were
     removed:
 
-    - static work folders (gtfs_rt_aggregator-static-*, and before 0.5.1
+    - work folders (gtfs_rt_aggregator-static-*, -merge-*... and before 0.5.1
       tmp* folders holding only feed.zip and/or parquet/)
     - old filter cache files (gtfs_rt_aggregator-<user>/filter-*.json)
     - multiprocessing Manager folders (pymp-*) whose socket nobody listens to
 
     Only folders owned by the current user and older than STALE_AFTER_SECONDS.
     """
+    from ..fetcher.filter import _user
+
     temp_dir = temp_dir or tempfile.gettempdir()
     now = now or time.time()
+    cache = f"gtfs_rt_aggregator-{_user()}"
     removed = 0
     try:
         entries = list(os.scandir(temp_dir))
@@ -42,15 +53,13 @@ def clean_stale_temp_files(temp_dir: str = None, now: float = None) -> int:
             if not entry.is_dir(follow_symlinks=False) or not _owned(entry):
                 continue
             age = now - entry.stat(follow_symlinks=False).st_mtime
-            if entry.name.startswith(
-                "gtfs_rt_aggregator-"
-            ) and not entry.name.startswith(STATIC_WORK_PREFIX):
+            if entry.name == cache:
                 removed += _clean_cache(entry.path, now)
                 continue
             if age < STALE_AFTER_SECONDS:
                 continue
             if (
-                entry.name.startswith(STATIC_WORK_PREFIX)
+                entry.name.startswith(WORK_PREFIXES)
                 or (
                     entry.name.startswith("tmp") and _is_old_static_work_dir(entry.path)
                 )

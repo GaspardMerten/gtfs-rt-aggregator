@@ -27,9 +27,11 @@ from ..runtime.core import (
     process_payload,
     realtime_feeds,
 )
+from ..storage.base import storage_for
 from ..runtime.spool import Spool, read_json, write_atomic, write_json
 from ..static.service import StaticService
-from ..utils.file_time import format_file_time, parse_file_time
+from ..utils.file_time import format_file_time
+from ..aggregator import fetch_times
 from ..utils.serializer import ParquetSerializer
 
 logger = logging.getLogger(__name__)
@@ -55,21 +57,28 @@ class _Context:
         return self._static
 
     def storage(self, provider_name: str):
-        return self.storages.get(provider_name, self.storages["global"])
+        return storage_for(self.storages, provider_name)
 
 
 _CTX: Optional[_Context] = None
+# Arguments of init_worker, to build the context on first use
+_INIT: Optional[tuple] = None
 
 
 def init_worker(config: GtfsRtConfig, spool_root: str, log_level: int):
     """Initializer of a worker process."""
-    global _CTX
+    global _CTX, _INIT
     # "kill -USR1 <worker pid>" prints what a worker is doing
     import faulthandler
     import signal
 
     if hasattr(signal, "SIGUSR1"):
         faulthandler.register(signal.SIGUSR1, all_threads=True)
+    # Ctrl+C and SIGTERM reach the whole process group: the main process
+    # stops the workers itself, once running tasks had time to finish
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    if hasattr(signal, "SIGTERM"):
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
     root = logging.getLogger()
     if not root.handlers:
         # Workers started by a fork server do not inherit the logging setup
@@ -83,12 +92,20 @@ def init_worker(config: GtfsRtConfig, spool_root: str, log_level: int):
     install_redaction()
     # Polars' memory grows with its thread count: see StaticService._convert
     os.environ.setdefault("POLARS_MAX_THREADS", "4")
-    _CTX = _Context(config, spool_root)
+    _CTX, _INIT = None, (config, spool_root)
 
 
 def _ctx() -> _Context:
+    """
+    The worker's context, built by its first task: an error (e.g. a storage
+    that cannot be reached) fails that task, which is retried, instead of
+    breaking the whole pool.
+    """
+    global _CTX
     if _CTX is None:
-        raise RuntimeError("init_worker was not called in this process")
+        if _INIT is None:
+            raise RuntimeError("init_worker was not called in this process")
+        _CTX = _Context(*_INIT)
     return _CTX
 
 
@@ -99,25 +116,32 @@ def _timed(task):
     @functools.wraps(task)
     def wrapper(*args, **kwargs):
         start = time.monotonic()
-        result = task(*args, **kwargs) or {}
-        result["seconds"] = round(time.monotonic() - start, 3)
-        result["peak_memory_mb"] = round(_peak_memory_mb())
-        # Hand memory back to the system between tasks: Arrow's allocator
-        # keeps freed memory otherwise (a static feed can leave ~1 GB held)
-        gc.collect()
         try:
-            pa.default_memory_pool().release_unused()
-        except AttributeError:  # older pyarrow
-            pass
-        return result
+            result = task(*args, **kwargs) or {}
+            result["seconds"] = round(time.monotonic() - start, 3)
+            result["peak_memory_mb"] = round(_peak_memory_mb())
+            return result
+        finally:
+            # Hand memory back to the system between tasks, failed ones too:
+            # Arrow's allocator keeps freed memory otherwise (a static feed
+            # can leave ~1 GB held)
+            gc.collect()
+            try:
+                pa.default_memory_pool().release_unused()
+            except AttributeError:  # older pyarrow
+                pass
 
     return wrapper
 
 
 def _peak_memory_mb() -> float:
-    from ..utils.scheduler import _peak_memory_mb as peak
+    """Peak resident memory of this process, in MB."""
+    import resource
+    import sys
 
-    return peak()
+    peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    # Kilobytes on Linux, bytes on macOS
+    return peak / (1024 * 1024 if sys.platform == "darwin" else 1024)
 
 
 # Realtime fetches -------------------------------------------------------------
@@ -150,8 +174,11 @@ def process_item(item_path: str) -> Dict:
     )
     written = []
     if result.tables is not None:
+        times = fetch_times.of_fetch(feed_hash(api), fetch_time)
         for service_type, table in result.tables.items():
-            data = ParquetSerializer.pyarrow_table_to_bytes(table, compression="snappy")
+            data = ParquetSerializer.pyarrow_table_to_bytes(
+                fetch_times.with_times(table, times), compression="snappy"
+            )
             if api.accumulate_minutes:
                 written.append(
                     _add_to_window(
@@ -185,6 +212,10 @@ def _add_to_window(
         start.replace(tzinfo=None) + timedelta(minutes=api.accumulate_minutes), start
     )
     folder = ctx.spool.path("windows", feed, service_type, format_file_time(start))
+    part = folder / f"part-{name}.parquet"
+    write_atomic(part, data)
+    # After the part: if the window was being closed meanwhile (its folder
+    # renamed), the part is in a new folder, which needs its window.json too
     if not (folder / "window.json").exists():
         write_json(
             folder / "window.json",
@@ -197,8 +228,6 @@ def _add_to_window(
                 "feed_hash": feed_hash(api),
             },
         )
-    part = folder / f"part-{name}.parquet"
-    write_atomic(part, data)
     return str(part)
 
 
@@ -211,8 +240,10 @@ def close_window(folder: str) -> Dict:
     """
     ctx = _ctx()
     original = Path(folder)
-    # Take the window: a fetch arriving now creates a new folder for itself
-    folder = original.with_name(original.name + f".closing-{os.getpid()}")
+    # Take the window: a fetch arriving now creates a new folder for itself.
+    # A window whose closing failed before keeps one .closing- suffix.
+    base = original.name.split(".closing-")[0]
+    folder = original.with_name(base + f".closing-{os.getpid()}")
     try:
         os.replace(original, folder)
     except FileNotFoundError:
@@ -222,8 +253,12 @@ def close_window(folder: str) -> Dict:
     if window is None or not parts:
         shutil.rmtree(folder, ignore_errors=True)
         return {"parts": 0}
-    table = pa.concat_tables(
-        [pq.read_table(p) for p in parts], promote_options="default"
+    tables, times = [], {}
+    for part in parts:
+        tables.append(pq.read_table(part))
+        fetch_times.merge(times, fetch_times.decode(tables[-1].schema.metadata))
+    table = fetch_times.with_times(
+        pa.concat_tables(tables, promote_options="default"), times
     )
     first = datetime.strptime(
         parts[0].stem[len("part-") :], "%Y%m%dT%H%M%S.%fZ"

@@ -9,13 +9,13 @@ import tempfile
 import zipfile
 from datetime import datetime
 from urllib.parse import urljoin
-from typing import Dict, List, Any, Optional, Tuple
+from typing import Dict, Any, Optional, Tuple
 
 import pytz
 import requests
 
 from ..config.models import GtfsRtConfig
-from ..storage.base import StorageInterface
+from ..storage.base import StorageInterface, storage_for
 from ..utils.file_time import format_file_time
 from ..utils.http import get_bytes, raise_for_status, with_retries
 from ..utils.log_helper import setup_logger
@@ -121,36 +121,6 @@ class StaticService:
                     "pip install -U 'gtfs_rt_aggregator[static]'"
                 )
 
-    def get_scheduling(self) -> List[Tuple[Any, callable, str, Dict[str, Any]]]:
-        """
-        Get the scheduling configuration for the static service.
-
-        Returns:
-            List of tuples containing (interval in seconds, function, name, arguments)
-        """
-        schedules = []
-        for provider in self.config.providers:
-            for feed in provider.static:
-                args = {
-                    "provider_name": provider.name,
-                    "feed_name": feed.name,
-                    "url": feed.url,
-                    "timezone": provider.timezone,
-                    "headers": feed.headers,
-                    "index_url": feed.index_url,
-                    "url_pattern": feed.url_pattern,
-                    "retries": feed.retries,
-                    "reuse_unchanged_tables": feed.reuse_unchanged_tables,
-                }
-                name = f"Static - {provider.name} - {feed.name} - {feed.url or feed.index_url}"
-                # Exclusive: two checks of the same feed must not run at once
-                schedules.append(
-                    (feed.check_minutes * 60, self.run_once, name, args, True)
-                )
-
-        self.logger.info(f"Created {len(schedules)} static feed schedules")
-        return schedules
-
     def run_once(
         self,
         provider_name: str,
@@ -230,7 +200,7 @@ class StaticService:
         """
         logger = logger or self.logger
         base = static_base(provider_name, feed_name)
-        storage = self.storages.get(provider_name, self.storages["global"])
+        storage = storage_for(self.storages, provider_name)
         latest = read_latest(storage, base, logger)
         fetch_time = datetime.now(pytz.timezone(timezone))
         if index_url:
@@ -283,7 +253,7 @@ class StaticService:
         """
         logger = logger or self.logger
         base = static_base(provider_name, feed_name)
-        storage = self.storages.get(provider_name, self.storages["global"])
+        storage = storage_for(self.storages, provider_name)
         latest = read_latest(storage, base, logger)
         saved_url, etag, last_modified = (
             meta["url"],

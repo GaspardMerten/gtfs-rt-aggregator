@@ -1,8 +1,7 @@
-"""0.5.1: no API keys in manifests, SIGTERM, temp cleanup, peak memory logs."""
+"""0.5.1: no API keys in manifests, temp cleanup."""
 
 import json
 import os
-import signal
 import socket
 import tempfile
 import time
@@ -10,13 +9,8 @@ import unittest
 
 from src.gtfs_rt_aggregator.static.service import scrub_urls
 from src.gtfs_rt_aggregator.utils.cleanup import clean_stale_temp_files
-from src.gtfs_rt_aggregator.utils.scheduler import SchedulerClass, _run_job
 from tests.mocks import MockStorageInterface
 from tests.unit.test_static_service import TestStaticService, _FeedHandler
-
-
-def _sleep(seconds):
-    time.sleep(seconds)
 
 
 class TestManifestUrls(TestStaticService):
@@ -98,47 +92,6 @@ class TestCleanup(unittest.TestCase):
                 sorted(os.listdir(tmp)),
                 ["gtfs_rt_aggregator-static-new", "pymp-live", "tmpother"],
             )
-
-
-class TestSignals(unittest.TestCase):
-    def test_sigterm_stops_like_ctrl_c(self):
-        sent = []
-
-        def send_sigterm():
-            if not sent:
-                sent.append(True)
-                os.kill(os.getpid(), signal.SIGTERM)
-            return True
-
-        before = signal.getsignal(signal.SIGTERM)
-        scheduler = SchedulerClass(lifecycle_callback=[("sigterm", send_sigterm)])
-        scheduler.add_schedules([(3600, _sleep, "sleeper", {"seconds": 30})])
-        scheduler.start()  # returns instead of being killed
-
-        self.assertFalse(scheduler.running)
-        self.assertEqual(signal.getsignal(signal.SIGTERM), before)
-
-    def test_job_processes_still_exit_on_sigterm(self):
-        scheduler = SchedulerClass()
-        previous = scheduler._handle_sigterm()
-        try:
-            scheduler._run_job_in_process(func=_sleep, job_label="sleeper", seconds=30)
-            process = scheduler.processes[0]
-            time.sleep(0.5)
-            process.terminate()
-            process.join(timeout=5)
-            self.assertEqual(process.exitcode, -signal.SIGTERM)
-        finally:
-            signal.signal(signal.SIGTERM, previous)
-
-
-class TestPeakMemory(unittest.TestCase):
-    def test_logged(self):
-        with self.assertLogs("src.gtfs_rt_aggregator.utils.scheduler", "INFO") as logs:
-            _run_job(_sleep, "Fetcher - nl - VehiclePosition", {"seconds": 0})
-        self.assertRegex(
-            logs.output[0], r"Fetcher - nl - VehiclePosition in .*peak memory \d+ MB"
-        )
 
 
 if __name__ == "__main__":

@@ -15,6 +15,10 @@ class RetryableStatus(requests.HTTPError):
     """HTTP status that is worth retrying."""
 
 
+class DownloadTooLong(IOError):
+    """A download went on for longer than allowed (a server trickling bytes)."""
+
+
 def with_retries(
     action: Callable[[], T],
     retries: int,
@@ -72,22 +76,28 @@ def download_to(
     retries: int,
     logger: logging.Logger,
     timeout: float = 60,
+    max_seconds: float = 3600,
 ) -> Tuple[int, str]:
     """
     Stream url to path, with retries. Returns its size and sha256.
 
     The body is written as it arrives, so a large feed never sits in memory.
+    timeout applies to each read; max_seconds to a whole attempt (a server
+    sending a byte every minute never times out otherwise).
     """
 
     def attempt() -> Tuple[int, str]:
         digest = hashlib.sha256()
         size = 0
+        deadline = time.monotonic() + max_seconds
         with requests.get(
             url, headers=headers, timeout=timeout, stream=True
         ) as response:
             raise_for_status(response)
             with open(path, "wb") as f:
                 for chunk in response.iter_content(chunk_size=1 << 20):
+                    if time.monotonic() > deadline:
+                        raise DownloadTooLong(f"GET {url} took over {max_seconds:.0f}s")
                     f.write(chunk)
                     digest.update(chunk)
                     size += len(chunk)

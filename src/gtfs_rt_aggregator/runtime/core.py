@@ -13,7 +13,7 @@ from ..config.models import ApiConfig, GtfsRtConfig, ProviderConfig
 from ..fetcher.filter import build_filter
 from ..fetcher.gtfs_rt import GtfsRtFetcher, row_metadata
 from ..static.service import manifest_tables, read_latest, static_base
-from ..storage.base import StorageInterface
+from ..storage.base import StorageInterface, storage_for
 
 # How long the static version found for a provider is reused; when none is
 # stored yet (first start), it is looked for again sooner
@@ -76,7 +76,7 @@ class StaticVersions:
                 return cached[1], cached[2]
         try:
             latest = read_latest(
-                self.storages.get(provider.name, self.storages["global"]),
+                storage_for(self.storages, provider.name),
                 base,
                 self.logger,
             )

@@ -1,6 +1,5 @@
 """Bring realtime tables written by earlier versions to the current schema."""
 
-from datetime import timezone as dt_timezone
 from functools import lru_cache
 from typing import Optional
 
@@ -14,15 +13,18 @@ TIMESTAMP = pa.timestamp("us", tz="UTC")
 _MAX_SECONDS = (2**63 - 1) // 1_000_000
 
 
+def flat(table: pa.Table) -> pa.Table:
+    """Nested columns flattened, with "." in names as "_" (as files store them)."""
+    table = table.flatten()
+    return table.rename_columns([c.replace(".", "_") for c in table.column_names])
+
+
 @lru_cache(maxsize=None)
 def stored_schema(service_type: str) -> pa.Schema:
-    """Schema of the files of a service: flattened, with "." in names as "_"."""
+    """Schema of the files of a service."""
     from ..fetcher.gtfs_rt import SERVICE_TYPE_TO_SCHEMA
 
-    empty = SERVICE_TYPE_TO_SCHEMA[service_type].empty_table().flatten()
-    return empty.rename_columns(
-        [c.replace(".", "_") for c in empty.column_names]
-    ).schema
+    return flat(SERVICE_TYPE_TO_SCHEMA[service_type].empty_table()).schema
 
 
 def conform(

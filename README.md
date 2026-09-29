@@ -135,10 +135,13 @@ A provider needs at least one realtime or static feed.
 `[[providers.apis]]` is accepted as an old name for `[[providers.realtime]]`.
 
 A provider can have several feeds of the same service, e.g. one per operator. Their rows go to the same aggregated
-files, and `feedId` tells them apart; deduplication is done feed by feed.
+files, and `feedId` tells them apart; deduplication is done feed by feed. Feeds of the same service must have the same
+`frequency_minutes` and `deduplicate`.
 
 With `deduplicate = true`, a vehicle standing still for ten minutes, polled every 30 s, is one row instead of twenty.
-If the entity changes and later returns to an earlier state, that is a new row.
+If the entity changes and later returns to an earlier state, that is a new row. So is an entity that was missing from a
+fetch in between. With `skip_unchanged = true`, a fetch identical to the previous one is not stored: `lastSeen` is then
+the last stored fetch that had the entity, which can be earlier than the last time the feed showed it.
 
 #### Filter
 
@@ -186,7 +189,7 @@ to a folder on disk.
 | `path_template` | `"provider={provider}/service={service}/date={start:%Y-%m-%d}/{start:%H-%M-%S}_to_{end:%H-%M-%S}.parquet"` | Path of each aggregated file. Fields: `provider`, `service`, `start`, `end` (period bounds in the provider's timezone, with `strftime` formats). |
 | `compact_daily` | `false` | Merge the aggregated files of each finished day into one sorted file. Runs at startup and every 24 hours, over the last 7 days. |
 | `compacted_name` | `"day.parquet"` | Name of that file in the day's folder. |
-| `sort_by` | `["entityId", "fetchTime"]` | Sort order of the compacted file. |
+| `sort_by` | `["entityId", "fetchTime"]` | Sort order of the aggregated and compacted files. |
 | `trip_stop_events` | `false` | Build a daily `TripStopEvent` file. Needs the `static` extra. See below. |
 
 `compact_daily` and `trip_stop_events` need a `path_template` with one folder per day and `{service}` in a folder name.
@@ -198,13 +201,13 @@ is picked up again after a restart, and waits there while storage is down.
 
 | Key | Default | Meaning |
 |---|---|---|
-| `spool_dir` | `<TMPDIR>/gtfs_rt_aggregator-spool` | Spool folder. Use a persistent disk. |
-| `spool_max_gb` | `10` | Past this size, feeds stop being fetched, lowest `priority` first. Nothing on disk is dropped. |
+| `spool_dir` | `<TMPDIR>/gtfs_rt_aggregator-spool` | Spool folder. Use a persistent disk. One pipeline per folder. |
+| `spool_max_gb` | `10` | Past this size (`quarantine/` included), feeds stop being fetched, lowest `priority` first. Nothing on disk is dropped. |
 | `fetch_threads` | `16` | Parallel downloads. |
 | `workers` | `"auto"` | Worker processes. `"auto"` is the available CPUs minus one, at least 1. |
 | `heavy_slots` | `1` | Worker processes for memory-heavy work (large fetches, static feeds, aggregation, compaction). |
 | `heavy_threshold_mb` | `8` | Fetches larger than this go to the heavy workers. |
-| `max_attempts` | `3` | Tries per fetch before it is moved to the spool's `quarantine/` folder. |
+| `max_attempts` | `3` | Tries per fetch before it is moved to the spool's `quarantine/` folder. A fetch that is not valid GTFS-RT goes there at once. |
 | `startup_jitter_seconds` | `60` | Each job first runs at a random time within this delay, so they do not all start at once. |
 | `max_tasks_per_worker` | `200` | A worker process is replaced after this many tasks. |
 
@@ -249,7 +252,8 @@ services = ["TripUpdate", "VehiclePosition"]
 gtfs-rt-pipeline configuration.toml [options]
 ```
 
-Without options, the pipeline runs until stopped. Each of the other options does one job and exits.
+Without options, the pipeline runs until stopped. Each of the other options does one job and exits. The exit status is
+1 on error.
 
 | Option | Effect |
 |---|---|

@@ -2,6 +2,7 @@
 
 import io
 import logging
+import signal
 import shutil
 import tarfile
 import tempfile
@@ -19,6 +20,7 @@ from src.gtfs_rt_aggregator.config.models import (
     RuntimeConfig,
     StorageConfig,
 )
+from src.gtfs_rt_aggregator.aggregator import fetch_times
 from src.gtfs_rt_aggregator.runtime import worker
 from src.gtfs_rt_aggregator.runtime.core import feed_hash, feed_id
 from src.gtfs_rt_aggregator.runtime.spool import Spool
@@ -46,12 +48,19 @@ class TestWorkerTasks(unittest.TestCase):
             ],
             runtime=RuntimeConfig(spool_dir=str(self.tmp / "spool")),
         )
+        # init_worker makes the process ignore them
+        self._signals = {
+            number: signal.getsignal(number)
+            for number in (signal.SIGINT, signal.SIGTERM)
+        }
         worker.init_worker(self.config, str(self.tmp / "spool"), logging.INFO)
         self.spool = Spool(str(self.tmp / "spool"))
         self.feed = feed_id("p", self.api)
 
     def tearDown(self):
         worker._CTX = None
+        for number, handler in self._signals.items():
+            signal.signal(number, handler)
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def _item(self, when: datetime) -> Path:
@@ -83,7 +92,11 @@ class TestWorkerTasks(unittest.TestCase):
         self.assertEqual(
             ready.name, f"2026-09-29_08-01-00Z-{feed_hash(self.api)}.parquet"
         )
-        self.assertEqual(pq.read_table(ready).num_rows, 2 * 3549)
+        table = pq.read_table(ready)
+        self.assertEqual(table.num_rows, 2 * 3549)
+        # Both fetch times are recorded (see fetch_times.py)
+        times = fetch_times.decode(table.schema.metadata)
+        self.assertEqual(len(times[feed_hash(self.api)]), 2)
 
     def test_feeds_of_one_service_fetched_in_the_same_second(self):
         # A second feed of the same provider and service (e.g. another operator)

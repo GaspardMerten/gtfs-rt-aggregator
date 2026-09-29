@@ -16,6 +16,7 @@ from ..config.models import (
     IcebergConfig,
 )
 from ..utils.log_helper import setup_logger
+from ..utils.redact import strip_query
 
 logger = setup_logger(__name__)
 
@@ -41,9 +42,7 @@ def load_config_from_toml(toml_path: Union[str, Path]) -> GtfsRtConfig:
         logger.error(f"Configuration file not found: {toml_path}")
         raise
     except Exception as e:
-        logger.error(
-            f"Error loading configuration from {toml_path}: {str(e)}", exc_info=True
-        )
+        logger.error(f"Error loading configuration from {toml_path}: {e}")
         raise
 
 
@@ -64,9 +63,7 @@ def load_config_from_toml_file(toml_file: BinaryIO) -> GtfsRtConfig:
         # Convert to Pydantic model
         return _convert_toml_to_config(expand_env(config_dict))
     except Exception as e:
-        logger.error(
-            f"Error loading configuration from file object: {str(e)}", exc_info=True
-        )
+        logger.error(f"Error loading configuration from file object: {e}")
         raise ValueError(f"Error loading configuration: {e}")
 
 
@@ -238,14 +235,16 @@ def _convert_toml_to_config(config_dict: Dict[str, Any]) -> GtfsRtConfig:
             services = api_dict.get("services", [])
             if not services:
                 logger.error(
-                    f"Missing required field: provider.realtime.services for provider {name} and URL {url}"
+                    f"Missing required field: provider.realtime.services for provider {name} and URL {strip_query(url)}"
                 )
                 raise ValueError(
-                    f"Missing required field: provider.realtime.services for provider {name} and URL {url}"
+                    f"Missing required field: provider.realtime.services for provider {name} and URL {strip_query(url)}"
                 )
 
             api = ApiConfig(**api_dict)
-            logger.debug(f"Realtime feed for {name}: {api.url} {api.services}")
+            logger.debug(
+                f"Realtime feed for {name}: {strip_query(api.url)} {api.services}"
+            )
 
             apis.append(api)
 

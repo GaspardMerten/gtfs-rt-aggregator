@@ -18,8 +18,9 @@ class GoogleCloudStorage(StorageInterface):
             bucket_name: Name of the GCS bucket
             base_path: Base path within the bucket
         """
+        super().__init__()
         self.bucket_name = bucket_name
-        self.base_path = base_path.rstrip("/")
+        self.base_path = base_path.strip("/")
         self.client = storage.Client()
         self.bucket = self.client.bucket(bucket_name)
 
@@ -51,31 +52,35 @@ class GoogleCloudStorage(StorageInterface):
         return f"gs://{self.bucket_name}/{self._get_full_path(path)}"
 
     def file_size(self, path: str) -> int:
-        return self.bucket.get_blob(self._get_full_path(path)).size
+        blob = self.bucket.get_blob(self._get_full_path(path))
+        if blob is None:
+            raise FileNotFoundError(f"{path} not found")
+        return blob.size
 
     def read_to_file(self, path: str, local_path: str):
         """Download to a local file without reading it in memory."""
-        self.bucket.blob(self._get_full_path(path)).download_to_filename(local_path)
+        from google.api_core.exceptions import NotFound
+
+        try:
+            self.bucket.blob(self._get_full_path(path)).download_to_filename(local_path)
+        except NotFound:
+            raise FileNotFoundError(f"{path} not found")
 
     def read_bytes(self, path: str) -> bytes:
         """Read binary data from Google Cloud Storage."""
+        from google.api_core.exceptions import NotFound
+
         try:
-            # Extract blob path
-            blob_path = self._extract_blob_path(path)
-
-            # Get the blob
-            blob = self.bucket.blob(blob_path)
-
-            # Download as bytes
-            return blob.download_as_bytes()
-        except Exception as e:
-            self.logger.error(f"Error reading file from GCS {path}: {e}")
-            return b""
+            return self.bucket.blob(self._extract_blob_path(path)).download_as_bytes()
+        except NotFound:
+            raise FileNotFoundError(f"{path} not found")
 
     def list_files(self, directory: str, pattern: Optional[str] = None) -> List[str]:
         """List files in Google Cloud Storage matching a pattern."""
-        # Get full directory path
+        # Folder prefix: "a/b/" so that "a/bc/..." is not listed
         full_dir = self._get_full_path(directory)
+        if full_dir and not full_dir.endswith("/"):
+            full_dir += "/"
 
         # List blobs with the directory prefix
         blobs = self.client.list_blobs(self.bucket_name, prefix=full_dir)
@@ -160,8 +165,9 @@ class GoogleCloudStorage(StorageInterface):
         Returns:
             Full path in the bucket
         """
+        path = path.lstrip("/")
         if self.base_path:
-            return f"{self.base_path}/{path}"
+            return f"{self.base_path}/{path}" if path else self.base_path
         return path
 
     def _extract_blob_path(self, path: str) -> str:

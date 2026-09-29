@@ -50,7 +50,6 @@ class _FetcherTest(unittest.TestCase):
             ],
         )
         service = FetcherService(config, {"global": self.storage})
-        self.addCleanup(service.flush_all)
         return service
 
     def _run(self, service, data=None):
@@ -170,33 +169,6 @@ class TestRobustness(_FetcherTest):
         ):
             self._run(service)
         self.assertEqual(len(self._individual()), 1)
-
-
-class TestTripModifications(unittest.TestCase):
-    def test_fields_kept(self):
-        from datetime import datetime
-
-        from google.transit import gtfs_realtime_pb2
-
-        message = gtfs_realtime_pb2.FeedMessage()
-        message.header.gtfs_realtime_version = "2.0"
-        entity = message.entity.add(id="m1")
-        selected = entity.trip_modifications.selected_trips.add()
-        selected.trip_ids.append("T1")
-        selected.shape_id = "S1"
-        modification = entity.trip_modifications.modifications.add()
-        modification.last_modified_time = 1742550861
-        modification.start_stop_selector.stop_id = "A"
-
-        header, parsed = GtfsRtFetcher.parse_feed_with_header(
-            message.SerializeToString()
-        )
-        table = GtfsRtFetcher.to_tables(parsed, ["TripModifications"], datetime.now())[
-            "TripModifications"
-        ]
-        row = table.to_pylist()[0]
-        self.assertEqual(row["selectedTrips"], [{"tripIds": ["T1"], "shapeId": "S1"}])
-        self.assertEqual(row["modifications"][0]["lastModifiedTime"], 1742550861)
 
 
 class TestFilter(_FetcherTest):
@@ -436,8 +408,51 @@ class TestKeepUnmatchedAdded(unittest.TestCase):
             FilterConfig(trip_ids=["T1"], keep_unmatched_added=True)
 
 
+# Integers MessageToDict writes as strings (64-bit)
+_INT64_KEYS = {"timestamp", "time", "start", "end", "lastModifiedTime"}
+
+
+def _ints(value):
+    if isinstance(value, dict):
+        return {
+            k: int(v) if k in _INT64_KEYS and isinstance(v, str) else _ints(v)
+            for k, v in value.items()
+        }
+    if isinstance(value, list):
+        return [_ints(v) for v in value]
+    return value
+
+
+def _dict_table(entities, service, fetch_time, meta):
+    """Reference: the table built through MessageToDict (the path before 0.6.0)."""
+    from datetime import timezone
+
+    from google.protobuf.json_format import MessageToDict
+
+    from src.gtfs_rt_aggregator.fetcher.gtfs_rt import SERVICE_TYPE_TO_SCHEMA
+
+    key = {"TripUpdate": "tripUpdate", "VehiclePosition": "vehicle", "Alert": "alert"}[
+        service
+    ]
+    rows = []
+    for entity in entities:
+        data = MessageToDict(entity)
+        if key in data:
+            rows.append(
+                {
+                    "entityId": data.get("id"),
+                    "contentHash": GtfsRtFetcher.entity_hash(entity),
+                    **_ints(data[key]),
+                    "fetchTime": fetch_time.astimezone(timezone.utc),
+                    **meta,
+                }
+            )
+    table = pa.Table.from_pylist(rows, schema=SERVICE_TYPE_TO_SCHEMA[service]).flatten()
+    return table.rename_columns([c.replace(".", "_") for c in table.column_names])
+
+
 class TestArrowBuilder(unittest.TestCase):
-    """The direct protobuf -> Arrow builder gives the same tables as the dict path."""
+    """The direct protobuf -> Arrow builder gives the same tables as MessageToDict."""
 
     def test_same_as_dict_path(self):
         from datetime import datetime
@@ -457,12 +472,7 @@ class TestArrowBuilder(unittest.TestCase):
                     message = GtfsRtFetcher.parse_message(f.read())
                 entities = list(message.entity)
                 meta = row_metadata("p", fetch_time, message.header.timestamp, "v1")
-                expected = GtfsRtFetcher.to_tables(
-                    GtfsRtFetcher.entities_by_service(entities),
-                    [service],
-                    fetch_time,
-                    meta,
-                )[service]
+                expected = _dict_table(entities, service, fetch_time, meta)
                 actual = GtfsRtFetcher.build_tables(
                     entities,
                     [GtfsRtFetcher.entity_hash(e) for e in entities],

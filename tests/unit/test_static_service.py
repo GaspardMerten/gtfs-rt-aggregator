@@ -229,15 +229,6 @@ class TestStaticService(unittest.TestCase):
         latest = json.loads(self.storage.get_bytes("nl/static/latest.json"))
         self.assertEqual(latest["version"], "2026-09-28_02-00-00Z")
 
-    def test_get_scheduling(self):
-        (schedule,) = self.service.get_scheduling()
-        seconds, func, _, args, exclusive = schedule
-        self.assertTrue(exclusive)
-        self.assertEqual(seconds, 3600)
-        self.assertEqual(func, self.service.run_once)
-        self.assertEqual(args["feed_name"], "static")
-        self.assertEqual(args["headers"], {"x-api-key": "secret"})
-
 
 class TestGtfsParquetVersion(unittest.TestCase):
     def test_version_tuple(self):

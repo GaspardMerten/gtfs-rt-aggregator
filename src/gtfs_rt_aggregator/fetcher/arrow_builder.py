@@ -121,22 +121,17 @@ class _Struct:
 
     def finish(self) -> pa.Array:
         children = [child.finish() for child in self.children]
-        present = sum(self.valid)
-        if present != len(self.valid):
+        valid = pa.array(self.valid, pa.bool_())
+        if not all(self.valid):
             # Children hold present rows only: spread them, nulls elsewhere
-            positions, next_position = [], 0
-            for valid in self.valid:
-                if valid:
-                    positions.append(next_position)
-                    next_position += 1
-                else:
-                    positions.append(None)
-            indices = pa.array(positions, pa.int64())
+            # (row i takes child row "present rows before i")
+            positions = pc.subtract(
+                pc.cumulative_sum(pc.cast(valid, pa.int64())), pa.scalar(1, pa.int64())
+            )
+            indices = pc.if_else(valid, positions, pa.scalar(None, pa.int64()))
             children = [pc.take(child, indices) for child in children]
         return pa.StructArray.from_arrays(
-            children,
-            fields=list(self.type),
-            mask=pa.array([not v for v in self.valid], pa.bool_()),
+            children, fields=list(self.type), mask=pc.invert(valid)
         )
 
 
@@ -168,7 +163,7 @@ class _List:
             pa.array(self.offsets, pa.int32()),
             self.child.finish(),
             type=self.type,
-            mask=pa.array([not v for v in self.valid], pa.bool_()),
+            mask=pc.invert(pa.array(self.valid, pa.bool_())),
         )
 
 

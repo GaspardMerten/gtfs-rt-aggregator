@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from ..utils.log_helper import setup_logger
 
@@ -66,6 +66,7 @@ class StorageInterface(ABC):
 
         @param path: Path or identifier of the data to read
         @return Binary data
+        @raises FileNotFoundError: If there is no such file
         """
         pass
 
@@ -110,3 +111,8 @@ class StorageInterface(ABC):
         @return True if the file exists, False otherwise
         """
         pass
+
+
+def storage_for(storages: Dict[str, "StorageInterface"], provider_name: str):
+    """The provider's own storage, else the global one."""
+    return storages.get(provider_name, storages["global"])

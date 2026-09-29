@@ -114,8 +114,10 @@ class TestCli(unittest.TestCase):
         # Mock sys.argv with a non-existent config file
         test_args = ["gtfs_rt_aggregator", "nonexistent_file.toml"]
         with patch.object(sys, "argv", test_args):
-            # Run the CLI
-            main()
+            # Run the CLI: it exits with status 1
+            with self.assertRaises(SystemExit) as exit_info:
+                main()
+        self.assertEqual(exit_info.exception.code, 1)
 
         # Check that an error message was printed
         # We don't care about the number of calls, just that the last one is the error

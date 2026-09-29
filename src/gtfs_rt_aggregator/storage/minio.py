@@ -45,20 +45,32 @@ class MinioStorage(StorageInterface):
             secure=secure,
         )
 
-        # Ensure the bucket exists
-        if not self.client.bucket_exists(bucket_name):
-            self.logger.info(f"Bucket '{bucket_name}' does not exist, creating it")
-            self.client.make_bucket(bucket_name)
-
+        # Checked on the first write, not here: creating a storage must not
+        # need the network (the pipeline starts during an outage too)
+        self._bucket_checked = False
         self.logger.info(
             f"Initialized MinIO storage with endpoint: {endpoint}, bucket: {bucket_name}"
         )
+
+    def _ensure_bucket(self):
+        if self._bucket_checked:
+            return
+        if not self.client.bucket_exists(self.bucket_name):
+            self.logger.info(f"Bucket '{self.bucket_name}' does not exist, creating it")
+            try:
+                self.client.make_bucket(self.bucket_name)
+            except S3Error as e:
+                # Created by another process meanwhile
+                if e.code not in ("BucketAlreadyOwnedByYou", "BucketAlreadyExists"):
+                    raise
+        self._bucket_checked = True
 
     def save_bytes(self, data: bytes, path: str) -> str:
         """Save binary data to MinIO storage."""
         self.logger.debug(f"Saving {len(data)} bytes to {path}")
 
         object_name = self._get_object_name(path)
+        self._ensure_bucket()
 
         try:
             # Write the data
@@ -80,6 +92,7 @@ class MinioStorage(StorageInterface):
     def save_file(self, local_path: str, path: str) -> str:
         """Upload a local file to MinIO storage without reading it in memory."""
         object_name = self._get_object_name(path)
+        self._ensure_bucket()
         self.client.fput_object(
             bucket_name=self.bucket_name,
             object_name=object_name,
@@ -91,17 +104,23 @@ class MinioStorage(StorageInterface):
         return f"s3://{self.bucket_name}/{self._get_object_name(path)}"
 
     def file_size(self, path: str) -> int:
-        return self.client.stat_object(
-            self.bucket_name, self._get_object_name(path)
-        ).size
+        try:
+            return self.client.stat_object(
+                self.bucket_name, self._get_object_name(path)
+            ).size
+        except S3Error as e:
+            raise _not_found(e, path)
 
     def read_to_file(self, path: str, local_path: str):
         """Download to a local file without reading it in memory."""
-        self.client.fget_object(
-            bucket_name=self.bucket_name,
-            object_name=self._get_object_name(path),
-            file_path=local_path,
-        )
+        try:
+            self.client.fget_object(
+                bucket_name=self.bucket_name,
+                object_name=self._get_object_name(path),
+                file_path=local_path,
+            )
+        except S3Error as e:
+            raise _not_found(e, path)
 
     def read_bytes(self, path: str) -> bytes:
         """Read binary data from MinIO storage."""
@@ -110,22 +129,19 @@ class MinioStorage(StorageInterface):
         object_name = self._get_object_name(path)
 
         try:
-            # Get the object
             response = self.client.get_object(
                 bucket_name=self.bucket_name, object_name=object_name
             )
-
-            # Read the data
-            data = response.read()
-            response.close()
-
-            self.logger.debug(f"Successfully read {len(data)} bytes from {object_name}")
-            return data
         except S3Error as e:
-            self.logger.error(
-                f"Error reading data from {object_name}: {str(e)}", exc_info=True
-            )
-            raise
+            raise _not_found(e, path)
+        try:
+            data = response.read()
+        finally:
+            # Give the connection back to the pool
+            response.close()
+            response.release_conn()
+        self.logger.debug(f"Successfully read {len(data)} bytes from {object_name}")
+        return data
 
     def list_files(self, directory: str, pattern: Optional[str] = None) -> List[str]:
         """List files in MinIO storage matching a pattern."""
@@ -243,3 +259,10 @@ class MinioStorage(StorageInterface):
         if self.base_path:
             return f"{self.base_path}/{path}" if path else self.base_path
         return path
+
+
+def _not_found(error: S3Error, path: str) -> Exception:
+    """FileNotFoundError for a missing object, as the other backends raise."""
+    if error.code in ("NoSuchKey", "NoSuchBucket"):
+        return FileNotFoundError(f"{path} not found")
+    return error

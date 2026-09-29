@@ -21,13 +21,13 @@ import logging
 import posixpath
 import warnings
 from datetime import datetime, timedelta, timezone
-from typing import Dict, Iterable, List, Optional
+from typing import Dict, Iterable, Optional
 
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytz
 
-from ..aggregator.convert import aggregated_root
+from ..aggregator.paths import aggregated_root, day_folder
 from ..config.models import GtfsRtConfig, StorageConfig
 from ..storage.base import StorageInterface
 
@@ -152,7 +152,8 @@ class IcebergSink:
                         service, provider.name, path, uri, table
                     )
                     if done:
-                        known = None  # read again after a commit
+                        if known is not None:
+                            known[uri] = size
                         registered += 1
             if table is not None and self.settings.write_version_hint:
                 self._write_version_hint(service, table)
@@ -189,13 +190,9 @@ class IcebergSink:
         paths = []
         for back in range(1, days_back + 1):
             day = today - timedelta(days=back)
-            start = tz.localize(datetime(day.year, day.month, day.day))
-            folder = posixpath.dirname(
-                self.config.output.path_template.format(
-                    provider=provider.name, service=service, start=start, end=start
-                )
+            path = posixpath.join(
+                day_folder(self.config, provider.name, service, day, tz), name
             )
-            path = posixpath.join(folder, name)
             if storage.file_exists(path):
                 paths.append(path)
         return paths
@@ -205,23 +202,15 @@ class IcebergSink:
         Add a day file, replacing the day's earlier file, in one commit.
         Returns the table and whether the file was registered.
         """
-        import tempfile
-
         from pyiceberg.expressions import And, EqualTo
 
-        with tempfile.NamedTemporaryFile(suffix=".parquet") as local:
-            self.storage.read_to_file(path, local.name)
-            schema = pq.read_schema(local.name)
-            if "date" not in schema.names or (
-                "fetchTime" in schema.names
-                and pa.types.is_integer(schema.field("fetchTime").type)
-            ):
-                logger.warning(
-                    f"Iceberg: {path} was written before 0.6.0, not registered: "
-                    "run --iceberg-backfill"
-                )
-                return table, False
-            dates = pq.read_table(local.name, columns=["date"])["date"].unique()
+        schema, dates = self._schema_and_dates(path, uri)
+        if dates is None:
+            logger.warning(
+                f"Iceberg: {path} was written before 0.6.0, not registered: "
+                "run --iceberg-backfill"
+            )
+            return table, False
         if len(dates) != 1:
             raise ValueError(f"{path} holds {len(dates)} dates, expected one")
         day = dates[0].as_py().isoformat()
@@ -272,6 +261,38 @@ class IcebergSink:
                 logger.info(f"Iceberg: concurrent commit on {service}, retrying")
         logger.info(f"Iceberg: registered {service} {provider} {day}")
         return table, True
+
+    def _schema_and_dates(self, path: str, uri: str):
+        """
+        Schema and dates of a day file (dates None if written before 0.6.0).
+        Read through PyIceberg's FileIO, which reads only the footer and the
+        date column; the whole file is downloaded if that fails.
+        """
+        import tempfile
+
+        def read(source):
+            file = pq.ParquetFile(source)
+            schema = file.schema_arrow
+            if "date" not in schema.names or (
+                "fetchTime" in schema.names
+                and pa.types.is_integer(schema.field("fetchTime").type)
+            ):
+                return schema, None
+            return schema, file.read(columns=["date"])["date"].unique()
+
+        try:
+            from pyiceberg.io.pyarrow import PyArrowFileIO
+
+            io_properties = _io_properties(self.config.storage)
+            with PyArrowFileIO(io_properties).new_input(uri).open() as stream:
+                return read(stream)
+        except Exception as e:
+            logger.debug(
+                f"Iceberg: reading {uri} in place failed ({e}), downloading it"
+            )
+        with tempfile.NamedTemporaryFile(suffix=".parquet") as local:
+            self.storage.read_to_file(path, local.name)
+            return read(local.name)
 
     def _write_version_hint(self, service: str, table):
         """metadata/version-hint.text: name of the latest metadata file, without .metadata.json."""

@@ -1,8 +1,4 @@
 from ..storage.base import StorageInterface
-from ..storage.factory import (
-    StorageFactory,
-    create_storage_from_config,
-)
 from ..storage.filesystem import FileSystemStorage
 from ..storage.gcs import GoogleCloudStorage
 from ..storage.minio import MinioStorage
@@ -13,9 +9,7 @@ __all__ = [
     "FileSystemStorage",
     "GoogleCloudStorage",
     "MinioStorage",
-    "StorageFactory",
     "create_storage",
-    "create_storage_from_config",
 ]
 
 logger = setup_logger(__name__)

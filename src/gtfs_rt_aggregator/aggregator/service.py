@@ -1,49 +1,46 @@
+import json
 import os
 import posixpath
 import tempfile
 from datetime import datetime, timedelta
-from io import BytesIO
 from typing import Dict, List, Any, Optional, Tuple
 
-import pyarrow as pa
-import pyarrow.compute as pc
 import pyarrow.parquet as pq
 import pytz
 
+from . import fetch_times
 from ..aggregator.compaction import compact_files, sorted_by, write_sorted
 from ..aggregator.dedup import deduplicate as deduplicate_rows
+from ..aggregator.paths import aggregated_root, day_files, day_folder
 from ..config.models import GtfsRtConfig
 from ..schema.conform import conform
-from ..storage.base import StorageInterface
+from ..storage.base import StorageInterface, storage_for
 from ..utils.log_helper import setup_logger
 from ..utils.file_time import parse_file_time
-from ..utils.serializer import ParquetSerializer
 
-TIMESTAMP = pa.timestamp("us", tz="UTC")
+# Parquet metadata key listing the files merged into an aggregated or
+# compacted file ("name:size"): if the process stops after writing it but
+# before deleting them, they are recognised and not merged twice
+SOURCES_METADATA = b"gtfs_rt_aggregator.sources"
 
 
-def _fetch_times(path: str, times: Dict[Optional[str], set]):
-    """Add every fetch time found in a file (fetchTime, firstSeen, lastSeen), by feedId."""
-    available = pq.read_schema(path).names
-    names = [c for c in ("fetchTime", "firstSeen", "lastSeen") if c in available]
-    with_feed = "feedId" in available
-    for batch in pq.ParquetFile(path).iter_batches(
-        columns=names + (["feedId"] if with_feed else []), batch_size=262_144
-    ):
-        table = pa.Table.from_batches([batch])
-        feeds = pc.unique(table["feedId"]).to_pylist() if with_feed else [None]
-        for feed in feeds:
-            rows = table
-            if with_feed:
-                rows = table.filter(
-                    pc.is_null(table["feedId"])
-                    if feed is None
-                    else pc.fill_null(pc.equal(table["feedId"], feed), False)
-                )
-            found = times.setdefault(feed, set())
-            for name in names:
-                found.update(pc.unique(rows[name]).to_pylist())
-            found.discard(None)
+def _source_key(path: str, local_path: str) -> str:
+    return f"{posixpath.basename(path)}:{os.path.getsize(local_path)}"
+
+
+def _sources(local_path: str) -> set:
+    metadata = pq.read_schema(local_path).metadata or {}
+    value = metadata.get(SOURCES_METADATA)
+    return set(json.loads(value)) if value else set()
+
+
+def service_feeds(provider) -> Dict[str, list]:
+    """Realtime feeds of a provider by service type, in configuration order."""
+    feeds: Dict[str, list] = {}
+    for api in provider.realtime:
+        for service in api.services:
+            feeds.setdefault(service, []).append(api)
+    return feeds
 
 
 # How long after its end a period is aggregated even without a file from the
@@ -74,40 +71,34 @@ class AggregatorService:
 
     def get_scheduling(self) -> List[Tuple[Any, callable, str, Dict[str, Any]]]:
         """
-        Get the scheduling configuration for the aggregator service.
+        Jobs of the aggregator: one aggregation (and one compaction, with
+        compact_daily) per provider and service type. Several feeds of a
+        service share its files, and its settings (checked by ProviderConfig).
 
         Returns:
-            List of tuples containing (schedule job, function, arguments)
+            (interval in seconds, function, name, arguments, service) tuples,
+            service being "<provider>/<service type>"
         """
-        self.logger.debug("Creating aggregation schedules")
         schedules = []
-
-        # Create schedules for each provider and API
         for provider in self.config.providers:
-            for api in provider.realtime:
-                # Get the check interval
-                check_interval = api.check_interval_seconds
-
-                # Create the function arguments
+            for service, feeds in service_feeds(provider).items():
+                api = feeds[0]
                 args = {
                     "provider_name": provider.name,
-                    "service_types": api.services,
+                    "service_types": [service],
                     "frequency_minutes": api.frequency_minutes,
                     "timezone": provider.timezone,
                     "deduplicate": api.deduplicate,
                 }
-
-                self.logger.debug(
-                    f"Created schedule for provider {provider.name}, check interval {check_interval}s"
+                interval = min(feed.check_interval_seconds for feed in feeds)
+                name = f"Aggregator - {provider.name} - {service}"
+                schedules.append(
+                    (interval, self.run_once, name, args, f"{provider.name}/{service}")
                 )
-                name = f"Aggregator - {provider.name} - {api.services} - {api.frequency_minutes}m"
-                # Add to schedules
-                schedules.append((check_interval, self.run_once, name, args))
-
                 if self.config.output.compact_daily:
                     compact_args = {
                         "provider_name": provider.name,
-                        "service_types": api.services,
+                        "service_types": [service],
                         "timezone": provider.timezone,
                         "deduplicate": api.deduplicate,
                     }
@@ -115,12 +106,11 @@ class AggregatorService:
                         (
                             24 * 3600,
                             self.compact_once,
-                            f"Compaction - {provider.name} - {api.services}",
+                            f"Compaction - {provider.name} - {service}",
                             compact_args,
-                            True,
+                            f"{provider.name}/{service}",
                         )
                     )
-
         self.logger.info(f"Created {len(schedules)} aggregation schedules")
         return schedules
 
@@ -177,12 +167,7 @@ class AggregatorService:
         Returns:
             Storage interface for the provider
         """
-        # Use provider-specific storage if available, otherwise use global
-        storage = self.storages.get(provider_name, self.storages["global"])
-        self.logger.debug(
-            f"Using {'provider-specific' if provider_name in self.storages else 'global'} storage for provider {provider_name}"
-        )
-        return storage
+        return storage_for(self.storages, provider_name)
 
     def _aggregate_service_type(
         self,
@@ -227,6 +212,9 @@ class AggregatorService:
 
         logger.debug(f"Created {len(grouped_files)} time groups")
 
+        # Most recent period with a file
+        latest = max(grouped_files) if grouped_files else None
+
         # Process each group
         for group_time, group_files in grouped_files.items():
             if not group_files:
@@ -242,30 +230,13 @@ class AggregatorService:
                 group_time,
             )
 
-            # Check if there's at least one file from the next time period
-            has_next_period_file = False
-            for file_path in files:
-                file_dt = self._extract_datetime_from_filename(file_path, timezone)
-                if file_dt:
-                    file_dt = (
-                        timezone.localize(file_dt)
-                        if file_dt.tzinfo is None
-                        else file_dt
-                    )
-                    rounded_time = self._get_rounded_time(file_dt, frequency_minutes)
-                    if rounded_time >= next_period:
-                        has_next_period_file = True
-                        break
-
-            # A feed that stopped changing produces no file for the next period
-            # (unchanged fetches are not stored): close the period anyway once
-            # it is well over. Files arriving later are added to its file.
-            if not has_next_period_file and datetime.now(
+            # Wait for a file from the next time period. A feed that stopped
+            # changing produces none (unchanged fetches are not stored): close
+            # the period anyway once it is well over. Files arriving later are
+            # added to its file.
+            if latest < next_period and datetime.now(
                 timezone
-            ) >= next_period + timedelta(seconds=PERIOD_GRACE_SECONDS):
-                has_next_period_file = True
-
-            if not has_next_period_file:
+            ) < next_period + timedelta(seconds=PERIOD_GRACE_SECONDS):
                 logger.info(
                     f"Skipping group {group_time} for {service_type} - no files from next period yet"
                 )
@@ -341,110 +312,51 @@ class AggregatorService:
         deduplicate: bool = False,
     ):
         """
-        Aggregate files into a single file.
+        Merge the individual files of a period into its aggregated file, then
+        delete them. Files that cannot be read are moved to error/.
 
         Args:
             provider_name: Name of the provider
             service_type: Service type
-            files: List of files to aggregate
-            group_time: Group time
+            files: Individual files of the period
+            group_time: Start of the period
+            next_period: End of the period
             storage: Storage interface to use
             logger: Logger to use
+            deduplicate: Merge consecutive identical rows (firstSeen / lastSeen)
         """
         logger = logger or self.logger
         logger.info(
             f"Aggregating {len(files)} files for {provider_name}/{service_type} at {group_time}"
         )
-
-        error_files = []
-
-        def read(data: bytes) -> pa.Table:
-            # Files from earlier versions get the current schema
-            return conform(
-                pq.read_table(BytesIO(data)),
+        path = self.output_path(provider_name, service_type, group_time, next_period)
+        try:
+            # Added to an existing file instead of replacing it: files can
+            # arrive after their period was aggregated (a slow fetch), and when
+            # clocks go back both passes of the repeated hour share the same
+            # file name
+            merged = self._merge_files(
+                storage,
+                files,
+                path,
                 service_type,
                 provider_name,
                 group_time.tzinfo,
+                deduplicate,
+                logger,
             )
-
-        try:
-            # Read all files
-            table = None
-
-            for file_path in files:
-                # Read the file
-                logger.debug(f"Reading file: {file_path}")
-                data = storage.read_bytes(file_path)
-
-                if table is None:
-                    table = read(data)
-                    if table.num_rows <= 0:
-                        logger.warning(
-                            f"Empty DataFrame for {provider_name}/{service_type} at {group_time}"
-                        )
-                        table = None
-                else:
-                    try:
-                        table = pa.concat_tables(
-                            [table, read(data)],
-                            # Files from different versions may have different columns
-                            promote_options="default",
-                        )
-                    except Exception as e:
-                        logger.error(
-                            f"Error concatenating tables: {str(e)}", exc_info=True
-                        )
-                        error_files.append(file_path)
-
-            logger.debug(
-                f"Combined DataFrame has {round(table.num_rows / len(files))} records on average, for {len(files)} files"
-            )
-
-            path = self.output_path(
-                provider_name, service_type, group_time, next_period
-            )
-
-            # Add to an existing file instead of replacing it: files can arrive
-            # after their period was aggregated (a slow fetch), and when clocks
-            # go back both passes of the repeated hour share the same file name
-            if storage.file_exists(path):
-                logger.info(f"Adding {len(files)} files to existing {path}")
-                table = pa.concat_tables(
-                    [read(storage.read_bytes(path)), table],
-                    promote_options="default",
-                )
-
-            if deduplicate:
-                before = table.num_rows
-                table = deduplicate_rows(table)
-                logger.info(f"Deduplicated {before} rows into {table.num_rows}")
-
-            # Convert to Parquet bytes
-            logger.debug("Converting combined DataFrame to Parquet")
-            parquet_bytes = ParquetSerializer.pyarrow_table_to_bytes(table)
-
-            # Save to storage
-            logger.debug(f"Saving grouped file to {path}")
-            saved_path = storage.save_bytes(parquet_bytes, path)
-
-            logger.info(
-                f"Grouped {len(files)} files with {table.num_rows} records to {saved_path}"
-            )
-
-            # Delete individual files
-            logger.debug(f"Deleting {len(files)} individual files")
-
-            for file_path in files:
-                if file_path in error_files:
-                    storage.rename_file(
-                        file_path, file_path.replace("individual", "error")
-                    )
-                else:
-                    storage.delete_file(file_path)
-                logger.debug(f"Removed individual file: {file_path}")
-
         except Exception as e:
-            logger.error(f"Error aggregating files: {str(e)}", exc_info=True)
+            logger.error(f"Error aggregating files into {path}: {e}", exc_info=True)
+            return
+
+        for file_path in merged["failed"]:
+            storage.rename_file(file_path, file_path.replace("individual", "error"))
+        for file_path in merged["merged"] + merged["skipped"]:
+            if storage.delete_file(file_path) is False:
+                logger.error(f"Could not delete aggregated file {file_path}")
+        logger.info(
+            f"Grouped {len(merged['merged'])} files with {merged['rows']} records to {path}"
+        )
 
     def output_path(
         self, provider_name: str, service_type: str, start: datetime, end: datetime
@@ -491,45 +403,37 @@ class AggregatorService:
                 )
             for back in range(skip_days + 1, last + 1):
                 day = today - timedelta(days=back)
-                start = tz.localize(datetime(day.year, day.month, day.day))
-                folder = posixpath.dirname(
-                    self.output_path(provider_name, service_type, start, start)
-                )
+                folder = day_folder(self.config, provider_name, service_type, day, tz)
                 try:
-                    files = sorted(
-                        f
-                        for f in storage.list_files(folder, "*.parquet")
-                        # Some backends also list files in subfolders
-                        if posixpath.dirname(f) == folder
-                    )
+                    files = day_files(storage, folder)
                     compacted = posixpath.join(folder, name)
-                    parts = [f for f in files if posixpath.basename(f) != name]
+                    parts = [f for f in files if f != compacted]
                     if not parts:
                         continue
-                    rows = self._compact_day(
+                    merged = self._merge_files(
                         storage,
-                        files,
-                        name,
+                        parts,
                         compacted,
                         service_type,
                         provider_name,
                         tz,
                         deduplicate,
+                        logger,
                     )
-                    for f in parts:
+                    for f in merged["merged"] + merged["skipped"]:
                         if storage.delete_file(f) is False:
-                            # Left in place, it would be counted twice next time
+                            # Left in place, it is recognised next time (sources)
                             logger.error(f"Could not delete compacted file {f}")
+                    for f in merged["failed"]:
+                        logger.error(f"Could not read {f}: left out of {compacted}")
                     logger.info(
-                        f"Compacted {len(parts)} files into {compacted} ({rows} rows)"
+                        f"Compacted {len(merged['merged'])} files into {compacted} ({merged['rows']} rows)"
                     )
                 except Exception as e:
                     logger.error(f"Error compacting {folder}: {e}", exc_info=True)
 
     def _oldest_day_back(self, storage, provider_name, service_type, tz, today) -> int:
         """How many days before today the oldest stored day folder is (0 if none)."""
-        from .convert import aggregated_root
-
         root = aggregated_root(self.config, provider_name, service_type)
         folders = {
             posixpath.dirname(p)
@@ -542,83 +446,126 @@ class AggregatorService:
             if not folders:
                 break
             day = today - timedelta(days=back)
-            start = tz.localize(datetime(day.year, day.month, day.day))
-            folder = posixpath.dirname(
-                self.output_path(provider_name, service_type, start, start)
-            )
+            folder = day_folder(self.config, provider_name, service_type, day, tz)
             if folder in folders:
                 folders.discard(folder)
                 oldest = back
         return oldest
 
-    def _compact_day(
+    def _merge_files(
         self,
         storage,
-        files,
-        name,
-        compacted,
-        service_type,
-        provider_name,
+        paths: List[str],
+        output: str,
+        service_type: str,
+        provider_name: str,
         tz,
-        deduplicate,
-    ) -> int:
+        deduplicate: bool,
+        logger,
+    ) -> Dict[str, Any]:
         """
-        Merge a day's files into one sorted file, streaming (see compaction.py):
-        memory stays around one hourly file, whatever the size of the day.
+        Merge files into output (with what output already holds), sorted by
+        output.sort_by (entityId, firstSeen when deduplicating), streaming (see
+        compaction.py): memory stays around one input file, whatever the
+        size of the output. The output records the fetch times of its rows
+        (see fetch_times.py) and the files merged into it.
+
+        Returns rows (written), merged (paths merged), skipped (paths already
+        in output) and failed (paths that could not be read). An existing
+        output that cannot be read raises: it is never replaced.
         """
-        with tempfile.TemporaryDirectory(prefix="gtfs_rt_aggregator-compact-") as tmp:
-            downloaded = []
-            for index, path in enumerate(files):
+        with tempfile.TemporaryDirectory(prefix="gtfs_rt_aggregator-merge-") as tmp:
+            # (path, local copy); the output first, if it exists
+            inputs, done = [], set()
+            if storage.file_exists(output):
+                local = os.path.join(tmp, "previous.parquet")
+                storage.read_to_file(output, local)
+                done = _sources(local)
+                inputs.append((output, local))
+
+            # Source key ("name:size") of each file merged, or already merged
+            keys_of: Dict[str, str] = {}
+            skipped, failed = [], []
+            for index, path in enumerate(paths):
                 local = os.path.join(tmp, f"in-{index}.parquet")
-                storage.read_to_file(path, local)
-                downloaded.append((path, local))
+                try:
+                    storage.read_to_file(path, local)
+                    pq.read_schema(local)
+                except Exception as e:
+                    logger.error(f"Could not read {path}: {e}")
+                    failed.append(path)
+                    continue
+                keys_of[path] = _source_key(path, local)
+                if keys_of[path] in done:
+                    # Merged by a run stopped before deleting it
+                    skipped.append(path)
+                    os.remove(local)
+                else:
+                    inputs.append((path, local))
 
             if deduplicate:
                 keys = ["entityId", "firstSeen"]
             else:
                 # Sort columns present in every file
-                names = [set(pq.read_schema(local).names) for _, local in downloaded]
+                names = [set(pq.read_schema(local).names) for _, local in inputs]
                 keys = [
                     c for c in self.config.output.sort_by if all(c in n for n in names)
                 ]
 
-            sorted_paths, times = [], {}
-            for index, (path, local) in enumerate(downloaded):
-                if posixpath.basename(path) == name and sorted_by(local) == keys:
-                    # Compacted since 0.6.0 with the same settings: already sorted
+            merged, sorted_paths, times = [], [], {}
+            for index, (path, local) in enumerate(inputs):
+                if sorted_by(local) == keys:
+                    # Written since 0.6.0 with the same settings: already sorted
+                    fetch_times.of_file(local, times)
                     sorted_paths.append(local)
                 else:
-                    # One file in memory at a time
-                    table = conform(
-                        pq.read_table(local), service_type, provider_name, tz
-                    )
+                    try:
+                        # One file in memory at a time
+                        table = pq.read_table(local)
+                        fetch_times.merge(
+                            times, fetch_times.decode(table.schema.metadata)
+                        )
+                        table = conform(table, service_type, provider_name, tz)
+                    except Exception as e:
+                        if path == output:
+                            raise
+                        logger.error(f"Could not read {path}: {e}")
+                        failed.append(path)
+                        continue
+                    fetch_times.from_table(table, times)
                     if deduplicate:
-                        table = deduplicate_rows(table)
+                        table = deduplicate_rows(table, fetch_times.to_arrays(times))
                     prepared = os.path.join(tmp, f"sorted-{index}.parquet")
                     write_sorted(table, keys, prepared)
                     del table
                     os.remove(local)
                     sorted_paths.append(prepared)
-                if deduplicate:
-                    _fetch_times(sorted_paths[-1], times)
+                if path != output:
+                    merged.append(path)
+            if not merged:
+                return {"rows": 0, "merged": [], "skipped": skipped, "failed": failed}
 
-            output = os.path.join(tmp, "out.parquet")
+            # Skipped files are listed again: their deletion may fail again
+            sources = sorted(keys_of[p] for p in merged + skipped)
+            result = os.path.join(tmp, "out.parquet")
             rows = compact_files(
                 sorted_paths,
                 keys,
-                output,
+                result,
                 deduplicate_rows=deduplicate,
-                times=(
-                    {
-                        feed: pa.array(sorted(values), TIMESTAMP)
-                        for feed, values in times.items()
-                    }
-                    if deduplicate
-                    else None
-                ),
+                times=fetch_times.to_arrays(times) if deduplicate else None,
+                metadata={
+                    **fetch_times.encode(times),
+                    SOURCES_METADATA: json.dumps(sources).encode(),
+                },
             )
-            storage.save_file(output, compacted)
-            return rows
+            storage.save_file(result, output)
+            return {
+                "rows": rows,
+                "merged": merged,
+                "skipped": skipped,
+                "failed": failed,
+            }
 
     def _extract_datetime_from_filename(
         self, filename: str, timezone: Optional[pytz.BaseTzInfo] = None

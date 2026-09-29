@@ -38,6 +38,7 @@ from ..aggregator.service import AggregatorService
 from ..config.models import GtfsRtConfig
 from ..runtime import worker
 from ..runtime.core import feed_slug, realtime_feeds
+from ..storage.base import storage_for
 from ..runtime.spool import Spool, item_name, read_json, write_json
 from ..static.service import StaticService
 from ..utils.cleanup import clean_stale_temp_files
@@ -61,10 +62,31 @@ RETRY_BASE_SECONDS = 10
 RETRY_MAX_SECONDS = 300
 # How long shutdown waits for downloads and running tasks
 SHUTDOWN_WAIT_SECONDS = 30
+# Longest a realtime download may take (each attempt)
+REALTIME_DOWNLOAD_MAX_SECONDS = 300
+# Errors that another attempt cannot fix: quarantined right away
+PERMANENT_ERRORS = ("DecodeError",)
 
 
 def default_spool_dir() -> str:
     return os.path.join(tempfile.gettempdir(), "gtfs_rt_aggregator-spool")
+
+
+def _filesystem_type(path: str) -> Optional[str]:
+    """Type of the filesystem holding path (Linux only, else None)."""
+    try:
+        with open("/proc/mounts") as f:
+            mounts = [line.split()[1:3] for line in f]
+    except OSError:
+        return None
+    path = os.path.realpath(path)
+    best = None
+    for mount_point, fs_type in mounts:
+        if (path == mount_point or path.startswith(mount_point.rstrip("/") + "/")) and (
+            best is None or len(mount_point) > len(best[0])
+        ):
+            best = (mount_point, fs_type)
+    return best[1] if best else None
 
 
 def _retry_delay(attempt: int) -> float:
@@ -96,6 +118,9 @@ class Task:
     lane: str
     info: Dict = field(default_factory=dict)
     pool: Optional[ProcessPoolExecutor] = None
+    # Heavy tasks with the same lock never run at once (e.g. the aggregation
+    # and the compaction of one provider's service: both rewrite its files)
+    lock: Optional[str] = None
 
 
 def _pool_context():
@@ -150,6 +175,9 @@ class Runtime:
         self._last_sha: Dict[str, str] = {}
         self._status: Dict[str, Dict] = {}
         self._status_dirty: set = set()
+        self._written: Dict[str, bytes] = {}  # status files as last written
+        self._window_failures: Dict[str, int] = {}
+        self._spool_lock = None
         self._paused: set = set()
         self._pause_level = -1
         self._spool_size = 0
@@ -181,13 +209,7 @@ class Runtime:
         self._stop.set()
 
     def _handle_sigterm(self):
-        main_pid = os.getpid()
-
         def handler(signum, frame):
-            if os.getpid() != main_pid:
-                signal.signal(signal.SIGTERM, signal.SIG_DFL)
-                os.kill(os.getpid(), signal.SIGTERM)
-                return
             logger.info("Stopping (SIGTERM)")
             self._stop.set()
 
@@ -197,6 +219,12 @@ class Runtime:
             return None
 
     def _start(self):
+        self._lock_spool()
+        if _filesystem_type(str(self.spool.root)) == "tmpfs":
+            logger.warning(
+                f"The spool ({self.spool.root}) is in memory (tmpfs): fetches "
+                "waiting there are lost on reboot. Set runtime.spool_dir to a disk folder"
+            )
         removed = clean_stale_temp_files()
         if removed:
             logger.info(f"Removed {removed} stale temporary files or folders")
@@ -204,6 +232,13 @@ class Runtime:
         if any(recovered.values()):
             logger.info(f"Spool recovered after restart: {recovered}")
         self._queues = self.spool.queued_items()
+        orphans = sorted(set(self._queues) - set(self.feeds))
+        if orphans:
+            logger.warning(
+                f"Fetches of feeds no longer in the configuration wait in "
+                f"{self.spool.path('incoming')}: {', '.join(orphans)} "
+                "(delete them, or add the feeds back)"
+            )
         for items in self._queues.values():
             for item in items:
                 if self.spool.meta(item).get("suspect"):
@@ -245,14 +280,42 @@ class Runtime:
             time.sleep(0.2)
         for pool in (self._normal_pool, self._heavy_pool, self._static_pool):
             if pool is not None:
+                # Workers ignore SIGINT and SIGTERM (see init_worker): tasks
+                # still running now are stopped; their items stay on disk
+                processes = list((getattr(pool, "_processes", None) or {}).values())
                 pool.shutdown(wait=False, cancel_futures=True)
+                for process in processes:
+                    if process.is_alive():
+                        process.kill()
         if self._uploader is not None:
             self._uploader.join(timeout=SHUTDOWN_WAIT_SECONDS)
             self._uploader.drain(timeout=30)
             self._write_statuses(force=True)
             self._write_index()
             self._uploader.drain(timeout=10)
+        # Fetches interrupted now were not at fault: no attempt counted
+        self.spool.mark_clean_shutdown()
+        if self._spool_lock is not None:
+            self._spool_lock.close()
+            self._spool_lock = None
         logger.info("Stopped")
+
+    def _lock_spool(self):
+        """Refuse to share the spool with another running pipeline."""
+        try:
+            import fcntl
+        except ImportError:  # Windows
+            return
+        handle = open(self.spool.path("lock"), "a")
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            handle.close()
+            raise RuntimeError(
+                f"Another pipeline uses the spool {self.spool.root}: give each "
+                "pipeline its own runtime.spool_dir"
+            )
+        self._spool_lock = handle
 
     # Scheduling --------------------------------------------------------------
 
@@ -279,13 +342,13 @@ class Runtime:
             )
 
         aggregator = AggregatorService(self.config, self.storages)
-        for seconds, func, name, args, *_ in aggregator.get_scheduling():
+        for seconds, func, name, args, lock in aggregator.get_scheduling():
             kind = "compact" if func.__name__ == "compact_once" else "aggregate"
             add(
                 name,
                 seconds,
-                lambda kind=kind, name=name, args=args: self._queue_heavy(
-                    kind, name, args
+                lambda kind=kind, name=name, args=args, lock=lock: self._queue_heavy(
+                    kind, name, args, lock=lock
                 ),
             )
 
@@ -307,6 +370,8 @@ class Runtime:
                         name,
                         {"provider_name": provider},
                         lane="static",
+                        # Reads the TripUpdate files the compaction rewrites
+                        lock=f"{provider}/TripUpdate",
                     ),
                 )
 
@@ -354,8 +419,14 @@ class Runtime:
                     logger.error(
                         f"Error in {job.name}: {redact(str(e))}", exc_info=True
                     )
-        self._collect()
-        self._dispatch()
+        # An error here must not stop the loop (and with it the pipeline)
+        for step in (self._collect, self._dispatch):
+            try:
+                step()
+            except Exception as e:
+                logger.error(
+                    f"Error in {step.__name__}: {redact(str(e))}", exc_info=True
+                )
 
     # Fetch lane ----------------------------------------------------------------
 
@@ -386,7 +457,12 @@ class Runtime:
         tmp = item.with_name(item.name + ".part")
         try:
             size, sha256 = download_to(
-                api.url, api.headers, str(tmp), api.retries, logger
+                api.url,
+                api.headers,
+                str(tmp),
+                api.retries,
+                logger,
+                max_seconds=REALTIME_DOWNLOAD_MAX_SECONDS,
             )
             status.update(last_success=fetch_time.isoformat(), size=size)
             if api.skip_unchanged and self._last_sha.get(feed) == sha256:
@@ -543,8 +619,15 @@ class Runtime:
                 )
                 free["heavy"] -= 1
                 break
-        while free["heavy"] > 0 and self._heavy_queue:
-            task = self._heavy_queue.pop(0)
+        locked = {t.lock for t in self._in_flight.values() if t.lock}
+        for task in list(self._heavy_queue):
+            if free["heavy"] <= 0:
+                break
+            if task.lock in locked:
+                continue
+            self._heavy_queue.remove(task)
+            if task.lock:
+                locked.add(task.lock)
             function = {
                 "compact": worker.compact,
                 "iceberg_sync": worker.iceberg_sync,
@@ -554,12 +637,19 @@ class Runtime:
             self._submit(task, function, **task.info)
             free["heavy"] -= 1
 
-    def _queue_heavy(self, kind: str, name: str, args: Dict, lane: str = "heavy"):
+    def _queue_heavy(
+        self,
+        kind: str,
+        name: str,
+        args: Dict,
+        lane: str = "heavy",
+        lock: Optional[str] = None,
+    ):
         if name in self._keys_in_flight or any(
             t.key == name for t in self._heavy_queue
         ):
             return
-        self._heavy_queue.append(Task(kind, name, lane, dict(args)))
+        self._heavy_queue.append(Task(kind, name, lane, dict(args), lock=lock))
 
     def _pool(self, lane: str) -> ProcessPoolExecutor:
         return {"heavy": self._heavy_pool, "static": self._static_pool}.get(
@@ -635,13 +725,10 @@ class Runtime:
             self._busy_feeds.pop(task.key, None)
             item = Path(task.info["item"])
             self._suspects.discard(
-                str(
-                    item.parent.parent.parent
-                    / "incoming"
-                    / item.parent.name
-                    / item.name
-                )
+                str(self.spool.path("incoming", item.parent.name, item.name))
             )
+            back = self.spool.path("incoming", item.parent.name, item.name)
+            self._retry_at.pop(str(back), None)
             if error is None:
                 self.spool.done(item, archive=self.config.raw.enabled)
                 with self._lock:
@@ -656,10 +743,13 @@ class Runtime:
             count = not cancelled and (
                 not crashed or alone or bool(task.info.get("suspect"))
             )
+            permanent = count and error.startswith(PERMANENT_ERRORS)
             quarantined = self.spool.release(
-                item, error, self.runtime.max_attempts, count_attempt=count
+                item,
+                error,
+                0 if permanent else self.runtime.max_attempts,
+                count_attempt=count,
             )
-            back = self.spool.path("incoming", item.parent.name, item.name)
             if not quarantined:
                 attempt = self.spool.meta(back).get("attempt", 1)
                 self._retry_at[str(back)] = time.monotonic() + (
@@ -681,6 +771,10 @@ class Runtime:
                 )
         elif task.kind == "static" and cancelled:
             pass  # still waiting in spool/static, dispatched again
+        elif task.kind == "static" and error is None:
+            self._retry_at.pop(task.info["folder"], None)
+        elif task.kind == "window" and error is not None:
+            self._window_failed(task, error)
         elif task.kind == "static" and error is not None:
             folder = Path(task.info["folder"])
             meta = read_json(folder / "meta.json") or {}
@@ -695,6 +789,15 @@ class Runtime:
                 target.parent.mkdir(parents=True, exist_ok=True)
                 write_json(folder / "meta.json", meta)
                 os.replace(folder, target)
+                # The feed is downloaded again at its next check: keep only
+                # what tells why it failed
+                for path in target.iterdir():
+                    if path.name != "meta.json":
+                        (
+                            path.unlink(missing_ok=True)
+                            if path.is_file()
+                            else shutil.rmtree(path, ignore_errors=True)
+                        )
                 logger.error(
                     f"Static feed {task.key} failed ({error}); moved to quarantine/"
                 )
@@ -707,10 +810,39 @@ class Runtime:
         elif error is not None:
             logger.error(f"{task.key} failed: {error}")
         elif result is not None:
+            if task.kind == "window":
+                self._window_failures.pop(task.info["base"], None)
+                self._retry_at.pop(task.key, None)
+            if task.kind == "compact" and self.config.iceberg is not None:
+                # The compaction rewrote day files in place: the tables must
+                # point to the new ones before readers see a size mismatch
+                self._queue_heavy("iceberg_sync", "Iceberg sync", {})
             logger.info(
                 f"{task.kind} {task.key} done in {result.get('seconds')}s, "
                 f"worker peak memory {result.get('peak_memory_mb')} MB"
             )
+
+    def _window_failed(self, task: Task, error: str):
+        """Retry a window later; after max_attempts, move it to quarantine/."""
+        base = task.info["base"]
+        failures = self._window_failures.get(base, 0) + 1
+        self._window_failures[base] = failures
+        if failures > self.runtime.max_attempts:
+            # The worker renamed the folder to <base>.closing-<pid>
+            for folder in Path(base).parent.glob(Path(base).name + ".closing-*"):
+                target = self.spool.path(
+                    "quarantine",
+                    "windows",
+                    *folder.relative_to(self.spool.path("windows")).parts,
+                )
+                target.parent.mkdir(parents=True, exist_ok=True)
+                os.replace(folder, target)
+            self._window_failures.pop(base, None)
+            self._retry_at.pop(task.key, None)
+            logger.error(f"Closing {base} failed ({error}); moved to quarantine/")
+            return
+        self._retry_at[task.key] = time.monotonic() + _retry_delay(failures)
+        logger.error(f"Closing {base} failed ({error}); will retry")
 
     def _replace_pool(self, lane: str):
         logger.error(
@@ -732,8 +864,13 @@ class Runtime:
         now = datetime.now(timezone.utc)
         for window_json in self.spool.path("windows").glob("*/*/*/window.json"):
             folder = window_json.parent
-            key = f"window {folder}"
-            if key in self._keys_in_flight:
+            # A window that failed to close keeps its .closing-<pid> name
+            base = str(folder).split(".closing-")[0]
+            key = f"window {base}"
+            if (
+                key in self._keys_in_flight
+                or self._retry_at.get(key, 0) > time.monotonic()
+            ):
                 continue
             window = read_json(window_json)
             if window is None:
@@ -744,7 +881,9 @@ class Runtime:
             if self._count("normal") >= self.runtime.worker_count() * 2:
                 return
             self._submit(
-                Task("window", key, "normal"), worker.close_window, str(folder)
+                Task("window", key, "normal", {"base": base}),
+                worker.close_window,
+                str(folder),
             )
 
     def _has_older(self, feed: str, end: datetime) -> bool:
@@ -826,11 +965,18 @@ class Runtime:
                 continue
             provider, api = self.feeds[feed]
             document = {"url": strip_query(api.url), "services": api.services, **status}
-            self.spool.put_ready(
+            self._put_if_changed(
                 provider.name,
                 f"{provider.name}/_status/{feed_slug(api)}.json",
                 _json(document),
             )
+
+    def _put_if_changed(self, provider: str, path: str, data: bytes):
+        """Queue a status file for upload, unless it is the same as last time."""
+        if self._written.get(path) == data:
+            return
+        self.spool.put_ready(provider, path, data)
+        self._written[path] = data
 
     def _write_index(self):
         with self._lock:
@@ -888,7 +1034,23 @@ class Uploader(threading.Thread):
                 logger.error(f"Upload thread error: {redact(str(e))}", exc_info=True)
                 uploaded = 0
             if not uploaded:
-                self.stop_event.wait(1)
+                # During an outage, the next retry may be minutes away: no
+                # walk of the whole ready/ folder every second meanwhile
+                now = time.monotonic()
+                self._retry_at = {
+                    p: t for p, t in self._retry_at.items() if t > now - 3600
+                }
+                self._failures = {
+                    p: n for p, n in self._failures.items() if p in self._retry_at
+                }
+                wait = 1.0
+                if self._retry_at and self._pending_is_retrying():
+                    wait = min(30.0, max(1.0, min(self._retry_at.values()) - now))
+                self.stop_event.wait(wait)
+
+    def _pending_is_retrying(self) -> bool:
+        """Whether every file waiting failed before (nothing new to upload)."""
+        return all(path in self._retry_at for path in self.spool.ready_files())
 
     def drain(self, timeout: float):
         deadline = time.monotonic() + timeout
@@ -915,12 +1077,10 @@ class Uploader(threading.Thread):
                 continue
             relative = path.relative_to(ready).parts
             provider, storage_path = relative[0], "/".join(relative[1:])
-            storage = self.storages.get(provider, self.storages["global"])
+            storage = storage_for(self.storages, provider)
             try:
                 before = os.stat(path)
                 storage.save_file(str(path), storage_path)
-                if not storage.file_exists(storage_path):
-                    raise IOError(f"{storage_path} missing after upload")
                 # Rewritten while uploading (e.g. a status): keep the new version
                 after = os.stat(path)
                 if (after.st_ino, after.st_mtime_ns) == (
@@ -933,7 +1093,10 @@ class Uploader(threading.Thread):
                 self._failures.pop(path, None)
                 uploaded += 1
             except FileNotFoundError:
-                continue  # uploaded by the other thread meanwhile
+                # Uploaded by the other thread meanwhile
+                self._retry_at.pop(path, None)
+                self._failures.pop(path, None)
+                continue
             except Exception as e:
                 failures = self._failures.get(path, 0) + 1
                 self._failures[path] = failures

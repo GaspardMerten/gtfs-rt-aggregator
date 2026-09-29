@@ -1,5 +1,6 @@
 import argparse
 import logging
+import sys
 
 from ..config.loader import load_config_from_toml
 from ..pipeline import run_pipeline_from_toml, scrub_static_urls
@@ -17,7 +18,11 @@ def main():
 
     # Add optional arguments
     parser.add_argument(
-        "--log-level", type=str, default="INFO", help="Logging level (default: INFO)"
+        "--log-level",
+        type=str.upper,
+        default="INFO",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
+        help="Logging level (default: INFO)",
     )
     parser.add_argument(
         "--iceberg-backfill",
@@ -104,7 +109,8 @@ def main():
             return
         run_pipeline_from_toml(args.toml_path)
     except Exception as e:
-        print(f"Error: {e}")
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":

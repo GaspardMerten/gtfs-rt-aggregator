@@ -5,11 +5,14 @@ downloaded, and build_trip_stop_events writes
 
     <folder of path_template(service="TripStopEvent", start=D)>/<compacted_name>
 
-A day is built once, when its output is missing and D+1 is over and
-aggregated (trips of D run up to about 33:00, updates come up to WINDOW_MAX
-after a run's start).
+A day is built when D+1 is over and aggregated (trips of D run up to about
+33:00, updates come up to WINDOW_MAX after a run's start), and built again
+when its TripUpdate files change (late files, the compaction of D+1): the
+names and sizes of the files each day was built from are kept in
+<provider>/_state/trip_stop_events.json.
 """
 
+import hashlib
 import json
 import logging
 import os
@@ -24,7 +27,8 @@ import pytz
 
 from ..config.models import ApiConfig, GtfsRtConfig, ProviderConfig
 from ..static.service import manifest_tables, read_latest, static_base
-from ..storage.base import StorageInterface
+from ..storage.base import StorageInterface, storage_for
+from .paths import day_files, day_folder
 
 logger = logging.getLogger(__name__)
 
@@ -64,19 +68,12 @@ class TripStopEventsService:
         self.storages = storages
 
     def _storage(self, provider_name: str) -> StorageInterface:
-        return self.storages.get(provider_name, self.storages["global"])
-
-    def _folder(self, provider: str, service: str, day: date, tz) -> str:
-        start = tz.localize(datetime(day.year, day.month, day.day))
-        return posixpath.dirname(
-            self.config.output.path_template.format(
-                provider=provider, service=service, start=start, end=start
-            )
-        )
+        return storage_for(self.storages, provider_name)
 
     def output_path(self, provider: str, day: date, tz) -> str:
         return posixpath.join(
-            self._folder(provider, SERVICE, day, tz), self.config.output.compacted_name
+            day_folder(self.config, provider, SERVICE, day, tz),
+            self.config.output.compacted_name,
         )
 
     def run_once(
@@ -102,6 +99,8 @@ class TripStopEventsService:
         now = (now or datetime.now(pytz.utc)).astimezone(tz)
         period = timedelta(minutes=api.frequency_minutes)
         storage = self._storage(provider_name)
+        state = self._read_state(storage, provider_name)
+        listings: Dict[date, List[str]] = {}
         written = []
         for back in range(days_back, 1, -1):
             if max_days is not None and len(written) >= max_days:
@@ -113,24 +112,67 @@ class TripStopEventsService:
                 + period
                 + READY_GRACE
             )
-            if now < ready or storage.file_exists(
-                self.output_path(provider_name, day, tz)
-            ):
+            if now < ready:
                 continue
             try:
+                inputs = self._signature(storage, provider_name, day, tz, listings)
+                if storage.file_exists(self.output_path(provider_name, day, tz)):
+                    known = state.get(day.isoformat())
+                    if known is None:
+                        # Built before 0.7.4: taken as up to date
+                        state[day.isoformat()] = inputs
+                        self._write_state(storage, provider_name, state, now, days_back)
+                    if known in (None, inputs):
+                        continue
+                    logger.info(
+                        f"{SERVICE}: {provider_name} {day} changed, building it again"
+                    )
                 if self.build_day(provider, static.name, day, tz):
                     written.append(day)
+                    state[day.isoformat()] = inputs
+                    self._write_state(storage, provider_name, state, now, days_back)
             except Exception:
                 logger.exception(f"{SERVICE}: failed for {provider_name} {day}")
         return written
 
+    def _signature(self, storage, provider: str, day: date, tz, listings) -> str:
+        """Names and sizes of the TripUpdate files of D-1, D and D+1, hashed."""
+        entries = []
+        for offset in (-1, 0, 1):
+            other = day + timedelta(days=offset)
+            if other not in listings:
+                listings[other] = [
+                    f"{posixpath.basename(path)}:{storage.file_size(path)}"
+                    for path in self._day_files(storage, provider, other, tz)
+                ]
+            entries += [f"{other}/{entry}" for entry in listings[other]]
+        return hashlib.sha1("\n".join(entries).encode()).hexdigest()
+
+    @staticmethod
+    def _state_path(provider: str) -> str:
+        return f"{provider}/_state/trip_stop_events.json"
+
+    def _read_state(self, storage, provider: str) -> Dict[str, str]:
+        path = self._state_path(provider)
+        try:
+            if storage.file_exists(path):
+                return json.loads(storage.read_bytes(path))
+        except (OSError, ValueError) as e:
+            logger.warning(f"{SERVICE}: could not read {path} ({e})")
+        return {}
+
+    def _write_state(self, storage, provider, state, now, days_back):
+        oldest = (now.date() - timedelta(days=days_back + 3)).isoformat()
+        for day in [d for d in state if d < oldest]:
+            del state[day]
+        storage.save_bytes(
+            json.dumps(state, indent=2, sort_keys=True).encode(),
+            self._state_path(provider),
+        )
+
     def _day_files(self, storage, provider: str, day: date, tz) -> List[str]:
-        folder = self._folder(provider, "TripUpdate", day, tz)
-        return sorted(
-            f
-            for f in storage.list_files(folder, "*.parquet")
-            # Some backends also list files in subfolders
-            if posixpath.dirname(f) == folder
+        return day_files(
+            storage, day_folder(self.config, provider, "TripUpdate", day, tz)
         )
 
     def build_day(

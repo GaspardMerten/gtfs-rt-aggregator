@@ -12,7 +12,7 @@ Nulls sort last, as in pyarrow's sort.
 import json
 import os
 import tempfile
-from typing import Iterator, List, Optional, Sequence, Tuple
+from typing import Dict, Iterator, List, Optional, Sequence, Tuple
 
 import pyarrow as pa
 import pyarrow.compute as pc
@@ -149,12 +149,14 @@ def compact_files(
     deduplicate_rows: bool = False,
     times=None,
     compression: str = "brotli",
+    metadata: Optional[Dict[bytes, bytes]] = None,
 ) -> int:
     """
     Merge Parquet files, each already sorted by keys (see write_sorted), into
     one file sorted by keys. With deduplicate_rows, keys must start with
-    entityId then firstSeen, and times holds every fetch time of the day by feedId (for
-    gap detection). Returns the number of rows written.
+    entityId then firstSeen, and times holds every fetch time by feedId (for
+    gap detection). metadata is added to the output's schema metadata.
+    Returns the number of rows written.
     """
     schema = pa.unify_schemas(
         [pq.read_schema(p).remove_metadata() for p in sorted_paths],
@@ -193,7 +195,10 @@ def compact_files(
             )
         if deduplicate_rows:
             chunks = _deduplicated(chunks, times, schema)
-        metadata = {SORT_KEYS_METADATA: json.dumps(list(keys)).encode()}
+        metadata = {
+            **(metadata or {}),
+            SORT_KEYS_METADATA: json.dumps(list(keys)).encode(),
+        }
         return _write(chunks, output_path, schema.with_metadata(metadata), compression)
 
 
@@ -216,8 +221,16 @@ def _deduplicated(chunks, times, schema) -> Iterator[pa.Table]:
         if carry is not None:
             chunk = pa.concat_tables([carry, chunk])
         chunk = align(deduplicate(chunk, times), schema)
+        if not chunk.num_rows:
+            carry = None
+            continue
         last = chunk["entityId"][chunk.num_rows - 1]
-        held = pc.equal(chunk["entityId"], last)
+        # Nulls sort last: rows without entityId are held until the end
+        held = (
+            pc.is_null(chunk["entityId"])
+            if not last.is_valid
+            else pc.fill_null(pc.equal(chunk["entityId"], last), False)
+        )
         carry = chunk.filter(held)
         yield chunk.filter(pc.invert(held))
     if carry is not None:

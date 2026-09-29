@@ -652,7 +652,7 @@ class TestTripStopEventsService(unittest.TestCase):
         self.storage.save_bytes(manifest, "be/static/v1/manifest.json")
         self.storage.save_bytes(manifest, "be/static/latest.json")
         # One hourly TripUpdate file of D
-        feed = _Feed(tmp.name)
+        feed = self.feed = _Feed(tmp.name)
         feed.fetch(
             _local(D, "07:50"),
             [
@@ -692,6 +692,18 @@ class TestTripStopEventsService(unittest.TestCase):
         self.assertEqual(table.schema.field("trip_id").type, "string")
         # Built once
         self.assertEqual(service.run_once("be", now=_local(end, "03:00")), [])
+        # Built again when its TripUpdate files change (a late file)
+        self.storage.save_file(
+            self.feed.files[0],
+            self.config.output.path_template.format(
+                provider="be",
+                service="TripUpdate",
+                start=_local(D, "09:00"),
+                end=_local(D, "10:00"),
+            ),
+        )
+        self.assertEqual(service.run_once("be", now=_local(end, "03:30")), [D])
+        self.assertEqual(service.run_once("be", now=_local(end, "04:00")), [])
 
         sink = IcebergSink(self.config, {"global": self.storage})
         self.assertEqual(sink.sync(days_back=None), 1)

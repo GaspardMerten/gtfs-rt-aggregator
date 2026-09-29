@@ -28,7 +28,7 @@ _ADDED = {
 
 class EntityFilter:
     """
-    Decides which GTFS-RT entities to keep, before they are converted to dicts.
+    Decides which GTFS-RT entities to keep, before their rows are built.
 
     Route ids and route types are resolved through a static version: routes
     gives the type of each route, trips the route of each trip (realtime

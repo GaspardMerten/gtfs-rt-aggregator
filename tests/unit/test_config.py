@@ -181,5 +181,59 @@ class TestValidators(unittest.TestCase):
         self.assertEqual(StorageConfig(type="FileSystem").type, "filesystem")
 
 
+class TestProviderChecks(unittest.TestCase):
+    def test_reserved_or_unsafe_names(self):
+        for name in ("global", "__global__", "a/b", "..", ""):
+            with self.assertRaises(ValidationError, msg=name):
+                ProviderConfig(
+                    name=name, realtime=[ApiConfig(url="u", services=["Alert"])]
+                )
+
+    def test_same_feed_twice(self):
+        with self.assertRaisesRegex(ValidationError, "twice"):
+            ProviderConfig(
+                name="p",
+                realtime=[
+                    ApiConfig(url="u", services=["Alert"]),
+                    ApiConfig(url="u", services=["TripUpdate"]),
+                ],
+            )
+
+    def test_feeds_of_a_service_share_its_settings(self):
+        with self.assertRaisesRegex(ValidationError, "frequency_minutes"):
+            ProviderConfig(
+                name="p",
+                realtime=[
+                    ApiConfig(url="a", services=["Alert"]),
+                    ApiConfig(url="b", services=["Alert"], frequency_minutes=15),
+                ],
+            )
+
+    def test_provider_defaults(self):
+        provider = ProviderConfig(
+            name="p",
+            frequency_minutes=15,
+            realtime=[
+                ApiConfig(url="a", services=["Alert"]),
+                ApiConfig(url="b", services=["TripUpdate"], frequency_minutes=30),
+            ],
+        )
+        self.assertEqual([a.frequency_minutes for a in provider.realtime], [15, 30])
+
+    def test_secrets_not_in_errors(self):
+        with self.assertRaises(ValidationError) as error:
+            ApiConfig(url="https://x.org/?key=s3cret", services=["Nope"])
+        self.assertNotIn("s3cret", str(error.exception))
+
+    def test_accumulate_concatenate_ignored(self):
+        with self.assertWarns(DeprecationWarning):
+            api = ApiConfig(url="u", services=["Alert"], accumulate_concatenate=False)
+        self.assertFalse(hasattr(api, "accumulate_concatenate"))
+
+    def test_unknown_storage_type(self):
+        with self.assertRaises(ValidationError):
+            StorageConfig(type="ftp")
+
+
 if __name__ == "__main__":
     unittest.main()

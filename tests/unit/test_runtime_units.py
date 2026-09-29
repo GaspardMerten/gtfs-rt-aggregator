@@ -6,7 +6,6 @@ import tempfile
 import threading
 import unittest
 from datetime import datetime, timezone
-from pathlib import Path
 from unittest.mock import MagicMock
 
 from src.gtfs_rt_aggregator.config.models import (
@@ -45,8 +44,31 @@ class TestSpoolRecovery(unittest.TestCase):
 
         counts = self.spool.recover(max_attempts=3)
         self.assertEqual(counts["requeued"], 1)
-        (back,) = self.spool.pending("f")
+        (back,) = self.spool.queued_items()["f"]
         self.assertEqual(self.spool.meta(back)["attempt"], 2)
+
+    def test_clean_shutdown_counts_no_attempt(self):
+        self.spool.claim(self._item())
+        self.spool.mark_clean_shutdown()
+        self.spool.recover(max_attempts=3)
+        (back,) = self.spool.queued_items()["f"]
+        meta = self.spool.meta(back)
+        self.assertEqual(meta["attempt"], 1)
+        self.assertNotIn("suspect", meta)
+        # The marker is used once
+        self.spool.claim(back)
+        self.spool.recover(max_attempts=3)
+        (back,) = self.spool.queued_items()["f"]
+        self.assertEqual(self.spool.meta(back)["attempt"], 2)
+
+    def test_failure_on_its_own_clears_suspect(self):
+        item = self.spool.claim(self._item())
+        self.spool.release(item, "worker died", 3, count_attempt=False)
+        (back,) = self.spool.queued_items()["f"]
+        self.assertTrue(self.spool.meta(back)["suspect"])
+        self.spool.release(self.spool.claim(back), "boom", 3)
+        (back,) = self.spool.queued_items()["f"]
+        self.assertNotIn("suspect", self.spool.meta(back))
 
     def test_orphan_sidecar_removed(self):
         item = self._item()
@@ -131,6 +153,58 @@ class TestBackpressure(unittest.TestCase):
         runtime.spool.size_bytes = lambda: int(0.5 * 1024**3)
         runtime._check_spool_size()
         self.assertEqual(runtime._paused, set())
+
+
+class TestHeavyTasks(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp)
+        config = GtfsRtConfig(
+            storage=StorageConfig(type="filesystem", params={"base_directory": tmp}),
+            providers=[
+                ProviderConfig(
+                    name="p",
+                    realtime=[
+                        # Two feeds of one service: one aggregation job
+                        ApiConfig(url="https://x.org/a", services=["TripUpdate"]),
+                        ApiConfig(url="https://x.org/b", services=["TripUpdate"]),
+                    ],
+                )
+            ],
+            runtime=RuntimeConfig(spool_dir=os.path.join(tmp, "spool"), heavy_slots=2),
+        )
+        self.runtime = Runtime(config, {"global": MagicMock()})
+
+    def test_one_job_per_service(self):
+        self.runtime._schedule_jobs()
+        names = [job.name for job in self.runtime._jobs]
+        self.assertEqual(
+            [n for n in names if n.startswith("Aggregator")],
+            ["Aggregator - p - TripUpdate"],
+        )
+
+    def test_same_lock_never_runs_at_once(self):
+        runtime = self.runtime
+        runtime._normal_pool = MagicMock()
+        submitted = []
+        runtime._submit = lambda task, *a, **k: (
+            submitted.append(task.key),
+            runtime._in_flight.__setitem__(object(), task),
+        )
+        runtime._queue_heavy("aggregate", "agg", {}, lock="p/TripUpdate")
+        runtime._queue_heavy("compact", "compact", {}, lock="p/TripUpdate")
+        runtime._queue_heavy("aggregate", "other", {}, lock="p/Alert")
+        runtime._dispatch()
+        # Two slots: the compaction waits for the aggregation of its service
+        self.assertEqual(submitted, ["agg", "other"])
+        self.assertEqual([t.key for t in runtime._heavy_queue], ["compact"])
+
+    def test_spool_used_by_one_pipeline_only(self):
+        self.runtime._lock_spool()
+        self.addCleanup(self.runtime._spool_lock.close)
+        other = Runtime(self.runtime.config, {"global": MagicMock()})
+        with self.assertRaisesRegex(RuntimeError, "Another pipeline"):
+            other._lock_spool()
 
 
 if __name__ == "__main__":

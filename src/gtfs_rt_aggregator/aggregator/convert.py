@@ -3,7 +3,6 @@
 import logging
 import os
 import tempfile
-from datetime import datetime
 from typing import Dict
 
 import pyarrow as pa
@@ -12,16 +11,11 @@ import pytz
 
 from ..config.models import GtfsRtConfig
 from ..schema.conform import conform
-from ..storage.base import StorageInterface
+from .paths import aggregated_root  # noqa: F401 (imported from here before 0.7.4)
+from .service import service_feeds
+from ..storage.base import StorageInterface, storage_for
 
 logger = logging.getLogger(__name__)
-
-
-def aggregated_root(config: GtfsRtConfig, provider: str, service: str) -> str:
-    """Folder holding every aggregated file of a provider's service."""
-    template = config.output.path_template
-    prefix = template[: template.index("{start")]
-    return prefix.format(provider=provider, service=service).rsplit("/", 1)[0]
 
 
 def convert_old_files(
@@ -37,10 +31,9 @@ def convert_old_files(
     with tempfile.TemporaryDirectory(prefix="gtfs_rt_aggregator-convert-") as tmp:
         local = os.path.join(tmp, "file.parquet")
         for provider in config.providers:
-            storage = storages.get(provider.name, storages["global"])
+            storage = storage_for(storages, provider.name)
             tz = pytz.timezone(provider.timezone)
-            services = sorted({s for api in provider.realtime for s in api.services})
-            for service in services:
+            for service in sorted(service_feeds(provider)):
                 root = aggregated_root(config, provider.name, service)
                 for path in storage.walk_files(root):
                     if not path.endswith(".parquet"):
@@ -65,16 +58,16 @@ def compact_old_days(
     (the last COMPACTION_DAYS_BACK days), e.g. days stored before compact_daily
     was on. Streams one day at a time, as compact_daily does.
     """
-    from .service import COMPACTION_DAYS_BACK, AggregatorService
+    from .service import COMPACTION_DAYS_BACK, AggregatorService, service_feeds
 
     aggregator = AggregatorService(config, storages)
     for provider in config.providers:
-        for api in provider.realtime:
+        for service, feeds in service_feeds(provider).items():
             aggregator.compact_once(
                 provider.name,
-                api.services,
+                [service],
                 provider.timezone,
-                api.deduplicate,
+                feeds[0].deduplicate,
                 days_back=None,
                 skip_days=COMPACTION_DAYS_BACK,
             )

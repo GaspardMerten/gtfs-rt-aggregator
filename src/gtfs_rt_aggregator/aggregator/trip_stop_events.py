@@ -22,7 +22,7 @@ D+1 (predictions made the evening before, trips running past midnight).
 import os
 from datetime import date, datetime, timedelta
 from datetime import timezone as dt_timezone
-from typing import Dict, Iterator, List, Optional
+from typing import Dict, Iterator, List
 
 import pyarrow as pa
 import pyarrow.compute as pc
@@ -213,13 +213,59 @@ def _with_keys(frame, wanted):
     )
 
 
-def parse_gtfs_time(value: Optional[str]) -> Optional[timedelta]:
-    """HH:MM:SS (hours may pass 24) as a duration, None if invalid."""
-    try:
-        hours, minutes, seconds = (int(x) for x in value.split(":"))
-    except (AttributeError, ValueError):
-        return None
-    return timedelta(hours=hours, minutes=minutes, seconds=seconds)
+def gtfs_time(column: str):
+    """
+    Polars expression: a column of GTFS times (HH:MM:SS, hours may pass 24)
+    as Duration("us"), null if invalid.
+    """
+    import polars as pl
+
+    parts = pl.col(column).str.strip_chars().str.split_exact(":", 2)
+    number = [
+        parts.struct.field(f"field_{i}").str.strip_chars().cast(pl.Int64, strict=False)
+        for i in range(3)
+    ]
+    valid = pl.all_horizontal([n.is_not_null() for n in number]) & (
+        pl.col(column).str.count_matches(":") == 2
+    )
+    return (
+        pl.when(valid)
+        .then(pl.duration(hours=number[0], minutes=number[1], seconds=number[2]))
+        .cast(pl.Duration("us"))
+    )
+
+
+class Folder:
+    """
+    Merges partial aggregates as they come, with fold. Folding the running
+    result with each new part would read it again for every part (quadratic):
+    parts wait until they hold as many rows as the running result.
+    """
+
+    def __init__(self, fold, how: str = "vertical"):
+        self.fold = fold
+        self.how = how
+        self.running = None
+        self.pending: list = []
+        self.pending_rows = 0
+
+    def add(self, part):
+        self.pending.append(part)
+        self.pending_rows += part.height
+        if self.running is None or self.pending_rows >= self.running.height:
+            self._merge()
+
+    def _merge(self):
+        import polars as pl
+
+        parts = ([self.running] if self.running is not None else []) + self.pending
+        self.running = self.fold(pl.concat(parts, how=self.how))
+        self.pending, self.pending_rows = [], 0
+
+    def result(self):
+        if self.pending:
+            self._merge()
+        return self.running
 
 
 class StaticTimetable:
@@ -363,13 +409,11 @@ def build_trip_stop_events(
         pl.col("trip_key").rank("dense").cast(pl.UInt32).alias("trip_index")
     )
     keys = trips.select("raw_key", "trip_index", "window_start", "window_end")
-    running = None
+    folder = Folder(_fold)
     for path in files:
         for updates in read_stop_updates(path, keys):
-            partial = _stop_updates(updates)
-            running = (
-                partial if running is None else _fold(pl.concat([running, partial]))
-            )
+            folder.add(_stop_updates(updates))
+    running = folder.result()
     if running is not None:
         running = running.join(
             trips.select("trip_index", "trip_key").unique("trip_index"),
@@ -423,15 +467,11 @@ def resolve_trips(files, service_date, tz, timetables):
             frame.sort("last_seen").group_by("raw_key", "hour").agg(*_trip_aggregates())
         )
 
-    seen = None
+    folder = Folder(summarise, how="diagonal_relaxed")
     for path in files:
         for frame in read_trips(path):
-            part = summarise(frame.with_columns(hour))
-            seen = (
-                part
-                if seen is None
-                else summarise(pl.concat([seen, part], how="diagonal_relaxed"))
-            )
+            folder.add(summarise(frame.with_columns(hour)))
+    seen = folder.result()
     if seen is None:
         return None
     versions = list(timetables)
@@ -525,24 +565,26 @@ def _trip_keys(trips, timetables):
         )
         if runs.is_empty():
             continue
-        starts = {
-            row["trip_id"]: row["start"]
-            for row in timetable.spans(runs["trip_id"].unique().to_list()).iter_rows(
-                named=True
+        templates = timetable.spans(runs["trip_id"].unique().to_list()).select(
+            "trip_id", pl.col("start").cast(pl.Duration("us")).alias("template")
+        )
+        shifts.append(
+            runs.join(templates, on="trip_id")
+            .select(
+                "raw_key",
+                (gtfs_time("trip_startTime") - pl.col("template"))
+                .dt.total_seconds()
+                .cast(pl.Int64)
+                .alias("time_shift"),
             )
-        }
-        for row in runs.iter_rows(named=True):
-            start = parse_gtfs_time(row["trip_startTime"])
-            template = starts.get(row["trip_id"])
-            if start is not None and template is not None:
-                shifts.append(
-                    {
-                        "raw_key": row["raw_key"],
-                        "time_shift": int((start - template).total_seconds()),
-                    }
-                )
+            .drop_nulls()
+        )
     trips = trips.join(
-        pl.DataFrame(shifts, schema={"raw_key": pl.Utf8, "time_shift": pl.Int64}),
+        (
+            pl.concat(shifts)
+            if shifts
+            else pl.DataFrame(schema={"raw_key": pl.Utf8, "time_shift": pl.Int64})
+        ),
         on="raw_key",
         how="left",
     )
@@ -555,15 +597,6 @@ def _trip_keys(trips, timetables):
     )
 
 
-def _run_window(base: datetime, start: timedelta, end: timedelta):
-    """Updates of a run starting at base + start: from WINDOW_BEFORE before its start to WINDOW_AFTER after its end, at most WINDOW_MAX from its start."""
-    departure = base + start
-    return (
-        departure - min(WINDOW_BEFORE, WINDOW_MAX),
-        min(base + end + WINDOW_AFTER, departure + WINDOW_MAX),
-    )
-
-
 def _undated_on(hours, service_date, tz, timetables):
     """
     Trips without startDate (summarised per hour) that ran on service_date:
@@ -572,63 +605,109 @@ def _undated_on(hours, service_date, tz, timetables):
     """
     import polars as pl
 
+    window_types = {
+        "window_start": pl.Datetime("us", "UTC"),
+        "window_end": pl.Datetime("us", "UTC"),
+    }
     if hours.is_empty():
-        return hours
-    spans: Dict[Optional[str], Dict[str, dict]] = {}
+        return hours.with_columns(
+            *[pl.lit(None, kind).alias(name) for name, kind in window_types.items()]
+        )
+    duration = pl.Duration("us")
+    spans = []
     for (version,), group in hours.group_by("static_version"):
         timetable = timetables.get(version)
         ids = group["trip_tripId"].drop_nulls().unique().to_list()
-        if timetable is not None and ids:
-            spans[version] = {
-                row["trip_id"]: row
-                for row in timetable.spans(ids).iter_rows(named=True)
-            }
+        if timetable is None or not ids:
+            continue
+        found = timetable.spans(ids)
+        if "service_id" not in found.columns:
+            found = found.with_columns(pl.lit(None, pl.Utf8).alias("service_id"))
+        active = list(timetable.active_services(service_date))
+        spans.append(
+            found.select(
+                pl.lit(version, pl.Utf8).alias("static_version"),
+                pl.col("trip_id").alias("trip_tripId"),
+                pl.col("start").cast(duration).alias("span_start"),
+                pl.col("end").cast(duration).alias("span_end"),
+                # A service that does not run that day
+                (
+                    pl.col("service_id").is_not_null()
+                    & ~pl.col("service_id").is_in(active)
+                ).alias("inactive"),
+                pl.col("trip_id")
+                .is_in(list(timetable.frequency_trips))
+                .alias("frequency"),
+            )
+        )
+    frame = hours.with_columns(gtfs_time("trip_startTime").alias("start_time"))
+    if spans:
+        frame = frame.join(
+            pl.concat(spans), on=["static_version", "trip_tripId"], how="left"
+        )
+    else:
+        frame = frame.with_columns(
+            pl.lit(None, duration).alias("span_start"),
+            pl.lit(None, duration).alias("span_end"),
+            pl.lit(None, pl.Boolean).alias("inactive"),
+            pl.lit(None, pl.Boolean).alias("frequency"),
+        )
 
-    base = service_day_base(service_date, tz)
-    next_base = service_day_base(service_date + timedelta(days=1), tz)
-    kept = []
-    for record in hours.iter_rows(named=True):
-        span = spans.get(record["static_version"], {}).get(record["trip_tripId"])
-        timetable = timetables.get(record["static_version"])
-        start_time = parse_gtfs_time(record["trip_startTime"])
-        frequency = (
-            timetable is not None and record["trip_tripId"] in timetable.frequency_trips
-        )
-        if span is not None and span["start"] is not None:
-            service = span.get("service_id")
-            if (
-                timetable is not None
-                and service is not None
-                and service not in timetable.active_services(service_date)
-            ):
-                continue
-            start, end = span["start"], span["end"] or span["start"]
-            if frequency and start_time is not None:
-                start, end = start_time, start_time + (end - start)
-            window = _run_window(base, start, end)
-        elif start_time is not None:
-            window = _run_window(base, start_time, start_time)
-        else:
-            window = (base, next_base)
-        # The hour's updates overlap the window
-        if record["hour"] <= window[1] and record["last_seen"] >= window[0]:
-            kept.append({**record, "window_start": window[0], "window_end": window[1]})
-    if not kept:
-        return hours.clear().with_columns(
-            pl.lit(None, pl.Datetime("us", "UTC")).alias("window_start"),
-            pl.lit(None, pl.Datetime("us", "UTC")).alias("window_end"),
-        )
-    frame = pl.DataFrame(
-        kept,
-        schema={
-            **hours.schema,
-            "window_start": pl.Datetime("us", "UTC"),
-            "window_end": pl.Datetime("us", "UTC"),
-        },
+    base = pl.lit(service_day_base(service_date, tz)).cast(pl.Datetime("us", "UTC"))
+    next_base = pl.lit(service_day_base(service_date + timedelta(days=1), tz)).cast(
+        pl.Datetime("us", "UTC")
     )
+    has_span = pl.col("span_start").is_not_null()
+    span_end = pl.coalesce("span_end", "span_start")
+    # Frequency-based trips: the template shifted to the run's start time
+    shifted = (
+        has_span
+        & pl.col("frequency").fill_null(False)
+        & pl.col("start_time").is_not_null()
+    )
+    start = (
+        pl.when(shifted)
+        .then(pl.col("start_time"))
+        .when(has_span)
+        .then(pl.col("span_start"))
+        .otherwise(pl.col("start_time"))
+    )
+    end = (
+        pl.when(shifted)
+        .then(pl.col("start_time") + (span_end - pl.col("span_start")))
+        .when(has_span)
+        .then(span_end)
+        .otherwise(pl.col("start_time"))
+    )
+    # Updates of a run: from WINDOW_BEFORE before its start to WINDOW_AFTER
+    # after its end, at most WINDOW_MAX from its start
+    departure = base + start
+    frame = frame.filter(
+        ~(has_span & pl.col("inactive").fill_null(False))
+    ).with_columns(
+        pl.when(start.is_not_null())
+        .then(departure - pl.lit(min(WINDOW_BEFORE, WINDOW_MAX)))
+        .otherwise(base)
+        .cast(window_types["window_start"])
+        .alias("window_start"),
+        pl.when(start.is_not_null())
+        .then(
+            pl.min_horizontal(
+                base + end + pl.lit(WINDOW_AFTER), departure + pl.lit(WINDOW_MAX)
+            )
+        )
+        .otherwise(next_base)
+        .cast(window_types["window_end"])
+        .alias("window_end"),
+    )
+    # The hour's updates overlap the window
+    kept = frame.filter(
+        (pl.col("hour") <= pl.col("window_end"))
+        & (pl.col("last_seen") >= pl.col("window_start"))
+    ).select(*hours.columns, "window_start", "window_end")
     # One row per trip again
     return (
-        frame.sort("last_seen")
+        kept.sort("last_seen")
         .group_by("raw_key")
         .agg(
             *_trip_aggregates(),
@@ -654,10 +733,7 @@ def _match_trips(records, service_date, timetable):
     wanted = records.select(
         "raw_key",
         pl.col("trip_routeId").alias("route_id"),
-        pl.col("trip_startTime")
-        .map_elements(parse_gtfs_time, return_dtype=pl.Duration("us"))
-        .cast(pl.Duration("ms"))
-        .alias("start"),
+        gtfs_time("trip_startTime").cast(pl.Duration("ms")).alias("start"),
     ).drop_nulls()
     if wanted.is_empty():
         return empty
@@ -687,14 +763,13 @@ def _stop_updates(updates):
         .then(pl.col("stop_id"))
         .alias("match_id")
     )
+    first = pl.col("first_seen").arg_min()
+    last = pl.col("last_seen").arg_max()
     return updates.group_by(STOP_KEY).agg(
         pl.col("stop_id").sort_by("last_seen").drop_nulls().last(),
-        *[
-            pl.col(c).sort_by("first_seen").first().alias(f"first_{c}")
-            for c in PREDICTED
-        ],
-        *[pl.col(c).sort_by("last_seen").last().alias(f"last_{c}") for c in PREDICTED],
-        pl.col("stop_schedule_relationship").sort_by("last_seen").last(),
+        *[pl.col(c).get(first).alias(f"first_{c}") for c in PREDICTED],
+        *[pl.col(c).get(last).alias(f"last_{c}") for c in PREDICTED],
+        pl.col("stop_schedule_relationship").get(last),
         pl.col("first_seen").min(),
         pl.col("last_seen").max(),
         pl.len().cast(pl.Int64).alias("prediction_count"),
@@ -705,11 +780,13 @@ def _fold(frame):
     """Merge partial aggregates of the same stops (from different files)."""
     import polars as pl
 
+    first = pl.col("first_seen").arg_min()
+    last = pl.col("last_seen").arg_max()
     return frame.group_by(STOP_KEY).agg(
         pl.col("stop_id").sort_by("last_seen").drop_nulls().last(),
-        *[pl.col(f"first_{c}").sort_by("first_seen").first() for c in PREDICTED],
-        *[pl.col(f"last_{c}").sort_by("last_seen").last() for c in PREDICTED],
-        pl.col("stop_schedule_relationship").sort_by("last_seen").last(),
+        *[pl.col(f"first_{c}").get(first) for c in PREDICTED],
+        *[pl.col(f"last_{c}").get(last) for c in PREDICTED],
+        pl.col("stop_schedule_relationship").get(last),
         pl.col("first_seen").min(),
         pl.col("last_seen").max(),
         pl.col("prediction_count").sum(),

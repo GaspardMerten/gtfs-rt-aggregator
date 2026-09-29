@@ -3,6 +3,8 @@ from typing import Dict, Optional, Union
 import pyarrow as pa
 import pyarrow.compute as pc
 
+from .fetch_times import split_by_feed
+
 # Fetch times of each feed (feedId, None for rows without one)
 FeedTimes = Dict[Optional[str], pa.Array]
 
@@ -16,19 +18,12 @@ def deduplicate(
     operator), with their own fetch times and entity ids. See
     _deduplicate_feed. Returns rows sorted by entityId and firstSeen.
     """
-    if "feedId" not in table.column_names:
-        return _deduplicate_feed(table, _feed_times(times, None))
-    feeds = pc.unique(table["feedId"]).to_pylist()
-    if len(feeds) == 1:
-        return _deduplicate_feed(table, _feed_times(times, feeds[0]))
-    parts = []
-    for feed in feeds:
-        mask = (
-            pc.is_null(table["feedId"])
-            if feed is None
-            else pc.fill_null(pc.equal(table["feedId"], feed), False)
-        )
-        parts.append(_deduplicate_feed(table.filter(mask), _feed_times(times, feed)))
+    parts = [
+        _deduplicate_feed(rows, _feed_times(times, feed))
+        for feed, rows in split_by_feed(table)
+    ]
+    if len(parts) == 1:
+        return parts[0]
     result = pa.concat_tables(parts)
     return result.take(
         pc.sort_indices(
@@ -57,8 +52,10 @@ def _deduplicate_feed(table: pa.Table, times: Optional[pa.Array] = None) -> pa.T
 
     Rows without contentHash (written before 0.5.0) are kept as they are.
 
-    times: every fetch time to consider for gaps, when the table is only part
-    of the data (streaming compaction); by default, those found in the table.
+    times: fetch times to consider for gaps besides those found in the rows:
+    the fetch times recorded in the files' metadata (see fetch_times.py), or
+    those of the whole day when the table is only part of it (streaming
+    compaction).
     """
     # New rows (no firstSeen / lastSeen yet, or null after being concatenated
     # with a deduplicated file) were seen once, at fetchTime
@@ -82,19 +79,17 @@ def _deduplicate_feed(table: pa.Table, times: Optional[pa.Array] = None) -> pa.T
     # All-null hashes have the null type, which cannot be compared
     content = table["contentHash"].chunk(0).cast(pa.string())
 
-    # Every fetch time present in the table, in order: an entity missing from
-    # a fetch between two of its rows ends its run there
-    if times is None:
-        times = pc.unique(
-            pa.chunked_array(
-                [
-                    table["fetchTime"].combine_chunks(),
-                    table["firstSeen"].combine_chunks(),
-                    table["lastSeen"].combine_chunks(),
-                ]
-            )
-        )
-    times = pc.take(times, pc.sort_indices(times))
+    # Every fetch time, in order: an entity missing from a fetch between two
+    # of its rows ends its run there
+    found = [
+        table["fetchTime"].combine_chunks(),
+        table["firstSeen"].combine_chunks(),
+        table["lastSeen"].combine_chunks(),
+    ]
+    if times is not None:
+        found.append(times.cast(table["firstSeen"].type))
+    times = pc.unique(pa.chunked_array(found))
+    times = pc.drop_null(pc.take(times, pc.sort_indices(times)))
     first_rank = pc.index_in(table["firstSeen"].chunk(0), value_set=times)
     last_rank = pc.index_in(table["lastSeen"].chunk(0), value_set=times)
     adjacent = pc.less_equal(
