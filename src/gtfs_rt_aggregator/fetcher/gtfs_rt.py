@@ -15,6 +15,7 @@ from ..schema.stop import stop_schema
 from ..schema.trip_modifications import trip_modifications_schema
 from ..schema.trip_update import trip_update_schema
 from ..schema.vehicle_position import vehicle_position_schema
+from ..fetcher.arrow_builder import TableBuilder
 from ..utils import setup_logger
 from ..utils.http import get_bytes
 
@@ -31,6 +32,25 @@ TRIP_MODIFICATIONS = (
 
 SERVICE_TYPES = [VEHICLE_POSITIONS, TRIP_UPDATE, ALERT, TRIP_MODIFICATIONS, SHAPE, STOP]
 SERVICE_TYPE_TO_SCHEMA = {x[0]: x[2] for x in SERVICE_TYPES}
+# FeedEntity field holding each service type
+ENTITY_FIELDS = {
+    "VehiclePosition": "vehicle",
+    "TripUpdate": "trip_update",
+    "Alert": "alert",
+    "TripModifications": "trip_modifications",
+    "Shape": "shape",
+    "Stop": "stop",
+}
+# Columns not read from the entity's message
+ROW_FIELDS = (
+    "entityId",
+    "contentHash",
+    "provider",
+    "date",
+    "fetchTime",
+    "feedTimestamp",
+    "staticVersion",
+)
 
 
 def row_metadata(
@@ -250,6 +270,63 @@ class GtfsRtFetcher:
         return result
 
     @classmethod
+    def build_tables(
+        cls,
+        entities: List,
+        hashes: List[str],
+        service_types: List[str],
+        fetch_time: datetime,
+        extra: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, pa.Table]:
+        """
+        Build one flattened table per requested service type, straight from
+        the protobuf entities (no dicts: see arrow_builder).
+
+        @param entities: FeedEntity messages
+        @param hashes: entity_hash() of each entity
+        @param service_types: Service types to keep
+        @param fetch_time: Fetch time, stored in every row
+        @param extra: Other values stored in every row (see row_metadata)
+        @return Tables by service type (service types absent from the feed are left out)
+        """
+        constants = {
+            "fetchTime": fetch_time.astimezone(dt_timezone.utc),
+            **(extra or {}),
+        }
+        builders = {}
+        for service_type in service_types:
+            field = ENTITY_FIELDS[service_type]
+            builders[field] = (
+                service_type,
+                TableBuilder(
+                    SERVICE_TYPE_TO_SCHEMA[service_type],
+                    gtfs_realtime_pb2.FeedEntity.DESCRIPTOR.fields_by_name[
+                        field
+                    ].message_type,
+                    ROW_FIELDS,
+                ),
+            )
+        seen = set()
+        for entity, content_hash in zip(entities, hashes):
+            for field, (service_type, builder) in builders.items():
+                if entity.HasField(field):
+                    builder.add(entity.id, content_hash, getattr(entity, field))
+                    seen.add(service_type)
+        result = {}
+        for service_type, builder in builders.values():
+            if service_type not in seen:
+                cls.logger.warning(f"Service type {service_type} not found in feed")
+                continue
+            table = builder.finish(constants).flatten()
+            result[service_type] = table.rename_columns(
+                [col.replace(".", "_") for col in table.column_names]
+            )
+            cls.logger.info(
+                f"Processed {table.num_rows} records for service type {service_type}"
+            )
+        return result
+
+    @classmethod
     def fetch_and_parse(
         cls,
         url: str,
@@ -271,12 +348,14 @@ class GtfsRtFetcher:
         fetch_time = datetime.now(pytz.timezone(timezone))
         try:
             data = cls.fetch_feed(url, headers, retries)
-            header_timestamp, parsed_data = cls.parse_feed_with_header(data)
-            return cls.to_tables(
-                parsed_data,
+            message = cls.parse_message(data)
+            entities = list(message.entity)
+            return cls.build_tables(
+                entities,
+                [cls.entity_hash(e) for e in entities],
                 service_types,
                 fetch_time,
-                row_metadata(None, fetch_time, header_timestamp, None),
+                row_metadata(None, fetch_time, message.header.timestamp or None, None),
             )
         except Exception as e:
             cls.logger.error(

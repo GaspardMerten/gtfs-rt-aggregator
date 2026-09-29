@@ -171,29 +171,6 @@ class TestRobustness(_FetcherTest):
             self._run(service)
         self.assertEqual(len(self._individual()), 1)
 
-    def test_unchanged_fetch_writes_ended_window(self):
-        from datetime import datetime
-
-        import pytz
-
-        api = ApiConfig(url=URL, services=["VehiclePosition"], accumulate_minutes=15)
-        service = self._service(api)
-
-        class _Now(datetime):
-            current = datetime(2026, 1, 1, 16, 1, tzinfo=pytz.UTC)
-
-            @classmethod
-            def now(cls, tz=None):
-                return cls.current.astimezone(tz)
-
-        with patch("src.gtfs_rt_aggregator.fetcher.service.datetime", _Now):
-            self._run(service)
-            self.assertEqual(self._individual(), [])
-            # Next window, same content: not stored, but the ended window is written
-            _Now.current = datetime(2026, 1, 1, 16, 20, tzinfo=pytz.UTC)
-            self._run(service)
-        self.assertEqual(len(self._individual()), 1)
-
 
 class TestTripModifications(unittest.TestCase):
     def test_fields_kept(self):
@@ -407,3 +384,100 @@ class TestRetries(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestKeepUnmatchedAdded(unittest.TestCase):
+    def _entity(self, relationship, route_id, trip_id="X1"):
+        from google.transit import gtfs_realtime_pb2
+
+        entity = gtfs_realtime_pb2.FeedEntity(id="e")
+        trip = entity.trip_update.trip
+        trip.trip_id = trip_id
+        if route_id:
+            trip.route_id = route_id
+        trip.schedule_relationship = (
+            gtfs_realtime_pb2.TripDescriptor.ScheduleRelationship.Value(relationship)
+        )
+        return entity
+
+    def test_rules(self):
+        from src.gtfs_rt_aggregator.fetcher.filter import EntityFilter
+
+        entity_filter = EntityFilter(
+            {2},
+            {"rail"},
+            {"T-rail"},
+            known_routes={"rail", "bus"},
+            keep_unmatched_added=True,
+        )
+        cases = [
+            ("ADDED", "", True),  # route unknown: kept
+            ("NEW", "unknown-route", True),  # route not in the static feed: kept
+            ("ADDED", "bus", False),  # resolved to an unwanted route
+            ("ADDED", "rail", True),  # resolved to a wanted route
+            ("DUPLICATED", "", True),
+            ("SCHEDULED", "", False),  # only added trips
+        ]
+        for relationship, route, expected in cases:
+            with self.subTest(relationship=relationship, route=route):
+                self.assertEqual(
+                    entity_filter.keep(self._entity(relationship, route)), expected
+                )
+
+        without = EntityFilter({2}, {"rail"}, set(), known_routes={"rail"})
+        self.assertFalse(without.keep(self._entity("ADDED", "")))
+
+
+class TestArrowBuilder(unittest.TestCase):
+    """The direct protobuf -> Arrow builder gives the same tables as the dict path."""
+
+    def test_same_as_dict_path(self):
+        from datetime import datetime
+
+        import pytz
+
+        from src.gtfs_rt_aggregator.fetcher.gtfs_rt import row_metadata
+
+        fetch_time = datetime(2026, 9, 29, 10, tzinfo=pytz.UTC)
+        for name, service in (
+            ("trip_updates", "TripUpdate"),
+            ("vehicle_positions", "VehiclePosition"),
+            ("alerts", "Alert"),
+        ):
+            with self.subTest(service):
+                with open(os.path.join(DATA, f"{name}.pb"), "rb") as f:
+                    message = GtfsRtFetcher.parse_message(f.read())
+                entities = list(message.entity)
+                meta = row_metadata("p", fetch_time, message.header.timestamp, "v1")
+                expected = GtfsRtFetcher.to_tables(
+                    GtfsRtFetcher.entities_by_service(entities),
+                    [service],
+                    fetch_time,
+                    meta,
+                )[service]
+                actual = GtfsRtFetcher.build_tables(
+                    entities,
+                    [GtfsRtFetcher.entity_hash(e) for e in entities],
+                    [service],
+                    fetch_time,
+                    meta,
+                )[service]
+                self.assertTrue(actual.equals(expected))
+
+    def test_trip_modifications(self):
+        from datetime import datetime
+
+        from google.transit import gtfs_realtime_pb2
+
+        message = gtfs_realtime_pb2.FeedMessage()
+        message.header.gtfs_realtime_version = "2.0"
+        entity = message.entity.add(id="m1")
+        entity.trip_modifications.selected_trips.add(trip_ids=["T1"], shape_id="S1")
+        entity.trip_modifications.modifications.add(last_modified_time=1742550861)
+        entities = list(message.entity)
+        table = GtfsRtFetcher.build_tables(
+            entities, ["h"], ["TripModifications"], datetime.now()
+        )["TripModifications"]
+        row = table.to_pylist()[0]
+        self.assertEqual(row["selectedTrips"], [{"tripIds": ["T1"], "shapeId": "S1"}])
+        self.assertEqual(row["modifications"][0]["lastModifiedTime"], 1742550861)

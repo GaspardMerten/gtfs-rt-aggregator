@@ -11,6 +11,8 @@ from ..config.models import (
     ApiConfig,
     OutputConfig,
     StaticConfig,
+    RuntimeConfig,
+    RawConfig,
 )
 from ..utils.log_helper import setup_logger
 
@@ -275,6 +277,13 @@ def _convert_toml_to_config(config_dict: Dict[str, Any]) -> GtfsRtConfig:
 
     # Create the config
     logger.info(f"Successfully created configuration with {len(providers)} providers")
+    unknown = set(config_dict) - {"storage", "providers", "output", "runtime", "raw"}
+    if unknown:
+        raise ValueError(f"Unknown sections: {', '.join(sorted(unknown))}")
     return GtfsRtConfig(
-        storage=storage_config, providers=providers, output=output_config
+        storage=storage_config,
+        providers=providers,
+        output=output_config,
+        runtime=RuntimeConfig(**config_dict.get("runtime", {})),
+        raw=RawConfig(**config_dict.get("raw", {})),
     )

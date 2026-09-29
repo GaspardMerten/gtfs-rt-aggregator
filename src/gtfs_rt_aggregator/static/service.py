@@ -178,105 +178,178 @@ class StaticService:
         """
         logger = setup_logger(f"{__name__}.StaticService.job.{provider_name}")
         base = static_base(provider_name, feed_name)
-
         try:
-            storage = self.storages.get(provider_name, self.storages["global"])
-            latest = read_latest(storage, base, logger)
-            fetch_time = datetime.now(pytz.timezone(timezone))
-            if index_url:
-                url = self._resolve_url(
-                    index_url, url_pattern, headers, retries, logger
-                )
-
-            # Only reuse the cache validators if they belong to the same URL
-            request_headers = dict(headers or {})
-            # Saved without its query string, which may hold an API key
-            saved_url = strip_query(url)
-            if latest and strip_query(latest.get("url")) == saved_url:
-                if latest.get("etag"):
-                    request_headers["If-None-Match"] = latest["etag"]
-                if latest.get("last_modified"):
-                    request_headers["If-Modified-Since"] = latest["last_modified"]
-
             # Named, so that folders left by a killed job can be cleaned up
             with tempfile.TemporaryDirectory(prefix=STATIC_WORK_PREFIX) as tmp:
-                zip_path = os.path.join(tmp, "feed.zip")
-                validators = with_retries(
-                    lambda: self._download(url, request_headers, zip_path),
+                meta = self.download(
+                    provider_name,
+                    feed_name,
+                    url,
+                    timezone,
+                    tmp,
+                    headers,
+                    index_url,
+                    url_pattern,
                     retries,
                     logger,
-                    f"Downloading {url}",
                 )
-                if validators is None:
-                    logger.info(f"{base}: not modified since the last check")
-                    return
-                etag, last_modified = validators
-
-                files = self._zip_fingerprint(zip_path)
-                if not files:
-                    raise ValueError(f"No GTFS .txt file found in {url}")
-
-                if latest and latest.get("files") == files:
-                    logger.info(f"{base}: unchanged since {latest.get('version')}")
-                    # Keep the validators fresh so the next check can get a 304
-                    if (etag, last_modified, saved_url) != (
-                        latest.get("etag"),
-                        latest.get("last_modified"),
-                        latest.get("url"),
-                    ):
-                        latest.update(
-                            url=saved_url, etag=etag, last_modified=last_modified
-                        )
-                        self._save_json(storage, f"{base}/latest.json", latest)
-                    return
-
-                converted = self._convert(zip_path, os.path.join(tmp, "parquet"))
-                if not converted:
-                    raise ValueError(f"No GTFS table could be parsed from {url}")
-
-                version = format_file_time(fetch_time)
-                tables = {}
-                for table_name, local_path in converted.items():
-                    source = f"{table_name}.txt"
-                    if (
-                        reuse_unchanged_tables
-                        and latest
-                        and source in files
-                        and latest.get("files", {}).get(source) == files[source]
-                        and table_name in manifest_tables(latest, base)
-                    ):
-                        tables[table_name] = manifest_tables(latest, base)[table_name]
-                        continue
-                    path = f"{base}/{version}/{table_name}.parquet"
-                    storage.save_file(str(local_path), path)
-                    tables[table_name] = path
-
-            manifest = {
-                "version": version,
-                "fetched_at": fetch_time.isoformat(),
-                "url": saved_url,
-                "etag": etag,
-                "last_modified": last_modified,
-                "files": files,
-                # Storage path of each table; with reuse_unchanged_tables, some
-                # point to an earlier version's folder
-                "tables": tables,
-            }
-            self._save_json(storage, f"{base}/{version}/manifest.json", manifest)
-            # Written last, so a run that fails halfway is retried at the next
-            # check (the incomplete version folder stays behind)
-            self._save_json(storage, f"{base}/latest.json", manifest)
-
-            reused = sum(
-                not p.startswith(f"{base}/{version}/") for p in tables.values()
-            )
-            logger.info(
-                f"{base}: stored new version {version} ({len(tables)} tables, {reused} reused)"
-            )
+                if meta is not None:
+                    self.process(
+                        provider_name,
+                        feed_name,
+                        os.path.join(tmp, "feed.zip"),
+                        meta,
+                        reuse_unchanged_tables,
+                        logger,
+                    )
         except Exception as e:
             logger.error(
                 f"Error in static feed job for {base}: {str(e)}", exc_info=True
             )
+
+    def download(
+        self,
+        provider_name: str,
+        feed_name: str,
+        url: Optional[str],
+        timezone: str,
+        dest_dir: str,
+        headers: Optional[Dict[str, str]] = None,
+        index_url: Optional[str] = None,
+        url_pattern: Optional[str] = None,
+        retries: int = 3,
+        logger=None,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Download a static feed to dest_dir/feed.zip, unless the server says it
+        did not change since the latest stored version.
+
+        @return What process() needs besides the zip (URL without query string,
+            ETag, Last-Modified, fetch time), or None if not modified
+        @raises Exception: If the download fails after retries
+        """
+        logger = logger or self.logger
+        base = static_base(provider_name, feed_name)
+        storage = self.storages.get(provider_name, self.storages["global"])
+        latest = read_latest(storage, base, logger)
+        fetch_time = datetime.now(pytz.timezone(timezone))
+        if index_url:
+            url = self._resolve_url(index_url, url_pattern, headers, retries, logger)
+
+        # Only reuse the cache validators if they belong to the same URL
+        request_headers = dict(headers or {})
+        # Saved without its query string, which may hold an API key
+        saved_url = strip_query(url)
+        if latest and strip_query(latest.get("url")) == saved_url:
+            if latest.get("etag"):
+                request_headers["If-None-Match"] = latest["etag"]
+            if latest.get("last_modified"):
+                request_headers["If-Modified-Since"] = latest["last_modified"]
+
+        zip_path = os.path.join(dest_dir, "feed.zip")
+        validators = with_retries(
+            lambda: self._download(url, request_headers, zip_path),
+            retries,
+            logger,
+            f"Downloading {url}",
+        )
+        if validators is None:
+            logger.info(f"{base}: not modified since the last check")
+            return None
+        etag, last_modified = validators
+        return {
+            "url": saved_url,
+            "etag": etag,
+            "last_modified": last_modified,
+            "fetch_time": fetch_time.isoformat(),
+        }
+
+    def process(
+        self,
+        provider_name: str,
+        feed_name: str,
+        zip_path: str,
+        meta: Dict[str, Any],
+        reuse_unchanged_tables: bool = False,
+        logger=None,
+    ):
+        """
+        Store a downloaded static feed as a new version, if a file in the zip
+        changed since the latest stored version.
+
+        @param zip_path: The downloaded zip (its folder is used for temporary files)
+        @param meta: What download() returned
+        @raises Exception: If the feed cannot be read or stored
+        """
+        logger = logger or self.logger
+        base = static_base(provider_name, feed_name)
+        storage = self.storages.get(provider_name, self.storages["global"])
+        latest = read_latest(storage, base, logger)
+        saved_url, etag, last_modified = (
+            meta["url"],
+            meta["etag"],
+            meta["last_modified"],
+        )
+        fetch_time = datetime.fromisoformat(meta["fetch_time"])
+
+        files = self._zip_fingerprint(zip_path)
+        if not files:
+            raise ValueError(f"No GTFS .txt file found in {saved_url}")
+
+        if latest and latest.get("files") == files:
+            logger.info(f"{base}: unchanged since {latest.get('version')}")
+            # Keep the validators fresh so the next check can get a 304
+            if (etag, last_modified, saved_url) != (
+                latest.get("etag"),
+                latest.get("last_modified"),
+                latest.get("url"),
+            ):
+                latest.update(url=saved_url, etag=etag, last_modified=last_modified)
+                self._save_json(storage, f"{base}/latest.json", latest)
+            return
+
+        work_dir = os.path.join(os.path.dirname(zip_path), "parquet")
+        converted = self._convert(zip_path, work_dir)
+        if not converted:
+            raise ValueError(f"No GTFS table could be parsed from {saved_url}")
+
+        version = format_file_time(fetch_time)
+        tables = {}
+        for table_name, local_path in converted.items():
+            source = f"{table_name}.txt"
+            if (
+                reuse_unchanged_tables
+                and latest
+                and source in files
+                and latest.get("files", {}).get(source) == files[source]
+                and table_name in manifest_tables(latest, base)
+            ):
+                tables[table_name] = manifest_tables(latest, base)[table_name]
+                continue
+            path = f"{base}/{version}/{table_name}.parquet"
+            storage.save_file(str(local_path), path)
+            tables[table_name] = path
+
+        manifest = {
+            "version": version,
+            "fetched_at": fetch_time.isoformat(),
+            "url": saved_url,
+            "etag": etag,
+            "last_modified": last_modified,
+            "files": files,
+            # Storage path of each table; with reuse_unchanged_tables, some
+            # point to an earlier version's folder
+            "tables": tables,
+        }
+        self._save_json(storage, f"{base}/{version}/manifest.json", manifest)
+        # Written last, so a run that fails halfway is retried at the next
+        # check (the incomplete version folder stays behind)
+        self._save_json(storage, f"{base}/latest.json", manifest)
+
+        reused = sum(not p.startswith(f"{base}/{version}/") for p in tables.values())
+        logger.info(
+            f"{base}: stored new version {version} ({len(tables)} tables, {reused} reused)"
+        )
 
     @staticmethod
     def _download(

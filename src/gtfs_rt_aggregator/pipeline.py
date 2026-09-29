@@ -9,6 +9,7 @@ from .static.service import StaticService
 from .storage import create_storage
 from .storage.base import StorageInterface
 from .utils.log_helper import setup_logger
+from .runtime.runtime import Runtime
 from .utils.cleanup import clean_stale_temp_files
 from .utils.redact import install_redaction
 from .utils.scheduler import SchedulerClass
@@ -41,86 +42,69 @@ class GtfsRtPipeline:
         self.aggregator_service = AggregatorService(config, self.storages)
         self.static_service = StaticService(config, self.storages)
 
-        # Create scheduler
-        self.scheduler = scheduler or SchedulerClass()
-        self.logger.debug("Pipeline initialization complete")
+        # A SchedulerClass selects the pre-0.6.0 way of running (deprecated)
+        self.scheduler = scheduler
+        self.runtime = None
 
     def _create_storages(self) -> Dict[str, StorageInterface]:
-        """
-        Create storage interfaces for each provider and global.
-
-        @return Dictionary with provider names as keys and storage interfaces as values,
-                with a special key 'global' for the global storage.
-        """
-        self.logger.debug("Creating storage interfaces")
-        storages = {}
-
-        # Create global storage
-        self.logger.debug("Creating global storage")
-        global_storage = create_storage(
-            storage_type=self.config.storage.type, **self.config.storage.params
-        )
-        storages["global"] = global_storage
-
-        # Create provider-specific storages if defined
-        for provider in self.config.providers:
-            if provider.storage:
-                self.logger.debug(f"Creating storage for provider: {provider.name}")
-                provider_storage = create_storage(
-                    storage_type=provider.storage.type, **provider.storage.params
-                )
-                storages[provider.name] = provider_storage
-
-        self.logger.debug(f"Created {len(storages)} storage interfaces")
-        return storages
+        return create_storages(self.config)
 
     def start(self):
-        """Start the pipeline."""
-        self.logger.info("Starting GTFS-RT Pipeline")
+        """Run the pipeline until stopped (Ctrl+C, SIGTERM or stop())."""
+        if self.scheduler is None:
+            self.runtime = Runtime(self.config, self.storages)
+            self.runtime.run()
+            return
+        self._start_legacy()
+
+    def stop(self):
+        """Stop the pipeline."""
+        if self.scheduler is None:
+            if self.runtime is not None:
+                self.runtime.stop()
+            return
+        try:
+            self.scheduler.stop()
+        except Exception as e:
+            self.logger.error(f"Error stopping pipeline: {str(e)}", exc_info=True)
+
+    def _start_legacy(self):
+        """Before 0.6.0: one process per job, started by a SchedulerClass."""
+        self.logger.warning(
+            "Running with a SchedulerClass (one process per job) is deprecated; "
+            "without one, the pipeline uses the disk-spool runtime"
+        )
         removed = clean_stale_temp_files()
         if removed:
             self.logger.info(f"Removed {removed} stale temporary files or folders")
-
         try:
-            # Get schedules from services
-            self.logger.debug("Getting fetcher schedules")
-            fetcher_schedules = self.fetcher_service.get_scheduling()
-
-            self.logger.debug("Getting aggregator schedules")
-            aggregator_schedules = self.aggregator_service.get_scheduling()
-
-            self.logger.debug("Getting static feed schedules")
-            static_schedules = self.static_service.get_scheduling()
-
-            # Add schedules to the scheduler
-            self.logger.debug("Adding schedules to scheduler")
-            self.scheduler.add_schedules(fetcher_schedules)
-            self.scheduler.add_schedules(aggregator_schedules)
-            self.scheduler.add_schedules(static_schedules)
-
-            self.logger.info("Pipeline started. Press Ctrl+C to stop.")
+            self.scheduler.add_schedules(self.fetcher_service.get_scheduling())
+            self.scheduler.add_schedules(self.aggregator_service.get_scheduling())
+            self.scheduler.add_schedules(self.static_service.get_scheduling())
             self.scheduler.start()
         except KeyboardInterrupt:
-            self.logger.info("Received keyboard interrupt")
             self.stop()
         except Exception as e:
             self.logger.error(f"Error starting pipeline: {str(e)}", exc_info=True)
             self.stop()
-        finally:
-            # The scheduler returns once stopped (it handles Ctrl+C itself):
-            # write whatever the fetch jobs still had buffered
-            self.fetcher_service.flush_all()
 
-    def stop(self):
-        """Stop the pipeline."""
-        self.logger.info("Stopping pipeline...")
 
-        try:
-            # Stop the scheduler
-            self.scheduler.stop()
-            self.logger.info("Pipeline stopped successfully")
-        except Exception as e:
-            self.logger.error(f"Error stopping pipeline: {str(e)}", exc_info=True)
+def create_storages(config: GtfsRtConfig) -> Dict[str, StorageInterface]:
+    """
+    Storage interface of each provider that has its own, and the global one
+    under "global".
+    """
+    storages = {
+        "global": create_storage(
+            storage_type=config.storage.type, **config.storage.params
+        )
+    }
+    for provider in config.providers:
+        if provider.storage:
+            storages[provider.name] = create_storage(
+                storage_type=provider.storage.type, **provider.storage.params
+            )
+    return storages
 
 
 def scrub_static_urls(config: GtfsRtConfig) -> int:

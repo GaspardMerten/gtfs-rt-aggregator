@@ -9,12 +9,21 @@ import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
+from google.transit import gtfs_realtime_pb2
+
 from ..config.models import FilterConfig
 from ..storage.base import StorageInterface
 
 # Changed when the resolution changes (2: route_type no longer truncated by
 # gtfs-parquet < 0.6.1), so earlier cached results are not reused
-CACHE_FORMAT = 2
+CACHE_FORMAT = 3
+
+# Trips that are not in the static timetable by nature
+_ADDED = {
+    gtfs_realtime_pb2.TripDescriptor.ScheduleRelationship.Value(name)
+    for name in ("ADDED", "NEW", "DUPLICATED")
+    if name in gtfs_realtime_pb2.TripDescriptor.ScheduleRelationship.keys()
+}
 
 
 class EntityFilter:
@@ -26,10 +35,20 @@ class EntityFilter:
     entities often carry only a trip id).
     """
 
-    def __init__(self, route_types: Set[int], routes: Set[str], trips: Set[str]):
+    def __init__(
+        self,
+        route_types: Set[int],
+        routes: Set[str],
+        trips: Set[str],
+        known_routes: Optional[Set[str]] = None,
+        keep_unmatched_added: bool = False,
+    ):
         self.route_types = route_types
         self.routes = routes - {""}
         self.trips = trips - {""}
+        # Every route of the static feed, to tell unknown routes from unwanted ones
+        self.known_routes = (known_routes or set()) - {""}
+        self.keep_unmatched_added = keep_unmatched_added
 
     def keep(self, entity) -> bool:
         if entity.HasField("trip_update"):
@@ -54,7 +73,15 @@ class EntityFilter:
         return True
 
     def _keep_trip(self, trip) -> bool:
-        return trip.trip_id in self.trips or trip.route_id in self.routes
+        if trip.trip_id in self.trips or trip.route_id in self.routes:
+            return True
+        # An added trip is not in the static timetable: keep it when its route
+        # cannot be resolved either (missing, or unknown to the static feed)
+        return (
+            self.keep_unmatched_added
+            and trip.schedule_relationship in _ADDED
+            and trip.route_id not in self.known_routes
+        )
 
 
 def build_filter(
@@ -75,7 +102,12 @@ def build_filter(
     """
     route_types = config.route_type_set()
     if not config.needs_static:
-        return EntityFilter(route_types, set(), set(config.trip_ids))
+        return EntityFilter(
+            route_types,
+            set(),
+            set(config.trip_ids),
+            keep_unmatched_added=config.keep_unmatched_added,
+        )
     if not tables or "routes" not in tables or "trips" not in tables:
         return None
 
@@ -92,21 +124,36 @@ def build_filter(
     try:
         with open(cache) as f:
             cached = json.load(f)
-        return EntityFilter(route_types, set(cached["routes"]), set(cached["trips"]))
+        return EntityFilter(
+            route_types,
+            set(cached["routes"]),
+            set(cached["trips"]),
+            set(cached["known_routes"]),
+            config.keep_unmatched_added,
+        )
     except (OSError, ValueError, KeyError):
         pass
 
-    routes, trips = _resolve(config, route_types, storage, tables)
+    routes, trips, known_routes = _resolve(config, route_types, storage, tables)
     try:
         os.makedirs(os.path.dirname(cache), mode=0o700, exist_ok=True)
         tmp = f"{cache}.tmp-{os.getpid()}"
         with open(tmp, "w") as f:
-            json.dump({"routes": sorted(routes), "trips": sorted(trips)}, f)
+            json.dump(
+                {
+                    "routes": sorted(routes),
+                    "trips": sorted(trips),
+                    "known_routes": sorted(known_routes),
+                },
+                f,
+            )
         os.replace(tmp, cache)
     except OSError:
         # Only a cache (e.g. the folder belongs to another user)
         pass
-    return EntityFilter(route_types, routes, trips)
+    return EntityFilter(
+        route_types, routes, trips, known_routes, config.keep_unmatched_added
+    )
 
 
 def _user() -> str:
@@ -123,8 +170,9 @@ def _resolve(
     route_types: Set[int],
     storage: StorageInterface,
     tables: Dict[str, str],
-) -> Tuple[Set[str], Set[str]]:
-    """Route ids and trip ids to keep, from the static routes and trips tables."""
+) -> Tuple[Set[str], Set[str], Set[str]]:
+    """Route ids and trip ids to keep, and all route ids, from the static
+    routes and trips tables."""
     routes_table = pq.read_table(
         BytesIO(storage.read_bytes(tables["routes"])),
         columns=["route_id", "route_type"],
@@ -147,4 +195,5 @@ def _resolve(
     )
     trips = set(config.trip_ids)
     trips.update(trips_table.filter(mask)["trip_id"].to_pylist())
-    return routes, trips
+    known_routes = set(routes_table["route_id"].cast(pa.string()).to_pylist())
+    return routes, trips, known_routes

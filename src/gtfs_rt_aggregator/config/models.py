@@ -1,3 +1,4 @@
+import os
 from typing import List, Optional, Dict, Any, Union
 
 from pydantic import (
@@ -53,6 +54,10 @@ class FilterConfig(BaseModel):
     )
     route_ids: List[str] = Field(default_factory=list, description="Route ids to keep")
     trip_ids: List[str] = Field(default_factory=list, description="Trip ids to keep")
+    keep_unmatched_added: bool = Field(
+        False,
+        description="Keep ADDED, NEW and DUPLICATED trips whose route cannot be resolved through the static feed",
+    )
 
     @field_validator("route_types", mode="before")
     @classmethod
@@ -140,6 +145,10 @@ class ApiConfig(BaseModel):
     )
     filter: Optional[FilterConfig] = Field(
         None, description="Rows to keep; all rows are kept if not set"
+    )
+    priority: int = Field(
+        0,
+        description="When the spool is full, feeds with the lowest priority stop being fetched first",
     )
 
     @model_validator(mode="after")
@@ -382,11 +391,83 @@ class OutputConfig(BaseModel):
         return self
 
 
+class RuntimeConfig(BaseModel):
+    """How the pipeline runs: spool on disk, threads and worker processes."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    spool_dir: Optional[str] = Field(
+        None,
+        description="Folder of downloads and results waiting to be processed or uploaded (default: <TMPDIR>/gtfs_rt_aggregator-spool)",
+    )
+    spool_max_gb: float = Field(
+        10,
+        gt=0,
+        description="Past this size, the lowest-priority feeds stop being fetched",
+    )
+    fetch_threads: int = Field(
+        16, ge=1, description="Downloads running at the same time"
+    )
+    workers: Union[int, str] = Field(
+        "auto", description='Worker processes; "auto": number of CPUs - 1, at least 1'
+    )
+    heavy_slots: int = Field(
+        1,
+        ge=1,
+        description="Worker processes for memory-heavy work (large fetches, static feeds, aggregation, compaction)",
+    )
+    heavy_threshold_mb: float = Field(
+        8, gt=0, description="Fetches larger than this go to the heavy workers"
+    )
+    max_attempts: int = Field(
+        3, ge=1, description="Tries per fetch before it is moved to quarantine/"
+    )
+    startup_jitter_seconds: float = Field(
+        60,
+        ge=0,
+        description="Jobs start at a random time within this delay (or their interval), not all at once",
+    )
+    max_tasks_per_worker: int = Field(
+        200, ge=1, description="A worker process is replaced after this many tasks"
+    )
+
+    @field_validator("workers")
+    @classmethod
+    def validate_workers(cls, v):
+        if v == "auto" or (isinstance(v, int) and not isinstance(v, bool) and v >= 1):
+            return v
+        raise ValueError(f'workers must be "auto" or a positive number, got {v!r}')
+
+    def worker_count(self) -> int:
+        if self.workers == "auto":
+            return max(1, (os.cpu_count() or 2) - 1)
+        return self.workers
+
+
+class RawConfig(BaseModel):
+    """Optional archive of the raw GTFS-RT fetches."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = Field(
+        False, description="Keep every fetch, bundled per feed and hour"
+    )
+    prefix: str = Field(
+        "raw",
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._/-]*$",
+        description="Folder of the archive under each provider's storage root",
+    )
+
+
 class GtfsRtConfig(BaseModel):
     """Main configuration for the GTFS-RT fetcher and aggregator."""
 
     storage: StorageConfig = Field(..., description="Global storage configuration")
     providers: List[ProviderConfig] = Field(..., description="List of providers")
+    runtime: RuntimeConfig = Field(
+        default_factory=RuntimeConfig, description="How the pipeline runs"
+    )
+    raw: RawConfig = Field(default_factory=RawConfig, description="Raw archive")
     output: OutputConfig = Field(
         default_factory=OutputConfig, description="Output configuration"
     )
