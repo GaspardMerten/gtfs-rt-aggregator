@@ -11,8 +11,14 @@ class TestAvailableCpus(unittest.TestCase):
                 return mock_open(read_data=cpu_max)()
             raise OSError(path)
 
-        with patch("builtins.open", fake_open), patch.object(
-            cpu.os, "sched_getaffinity", return_value=set(range(affinity)), create=True
+        with (
+            patch("builtins.open", fake_open),
+            patch.object(
+                cpu.os,
+                "sched_getaffinity",
+                return_value=set(range(affinity)),
+                create=True,
+            ),
         ):
             return cpu.available_cpus()
 

@@ -195,7 +195,13 @@ def close_window(folder: str) -> Dict:
     while closing (a slow fetch) stay for the next close.
     """
     ctx = _ctx()
-    folder = Path(folder)
+    original = Path(folder)
+    # Take the window: a fetch arriving now creates a new folder for itself
+    folder = original.with_name(original.name + f".closing-{os.getpid()}")
+    try:
+        os.replace(original, folder)
+    except FileNotFoundError:
+        return {"parts": 0}
     window = read_json(folder / "window.json")
     parts = sorted(folder.glob("part-*.parquet"))
     if window is None or not parts:
@@ -214,10 +220,7 @@ def close_window(folder: str) -> Dict:
         path,
         ParquetSerializer.pyarrow_table_to_bytes(table, compression="snappy"),
     )
-    for part in parts:
-        part.unlink(missing_ok=True)
-    if not any(folder.glob("part-*.parquet")):
-        shutil.rmtree(folder, ignore_errors=True)
+    shutil.rmtree(folder, ignore_errors=True)
     return {"parts": len(parts), "rows": table.num_rows, "path": path}
 
 
@@ -276,5 +279,11 @@ def bundle_raw(folder: str, provider_name: str, storage_path: str) -> Dict:
             for path in files:
                 tar.add(str(path), arcname=path.name)
     os.replace(tmp, target)
-    shutil.rmtree(folder, ignore_errors=True)
+    # Only what was bundled: a late fetch moved in meanwhile waits for the next bundle
+    for path in files:
+        path.unlink(missing_ok=True)
+    try:
+        folder.rmdir()
+    except OSError:
+        pass
     return {"files": len(files), "path": storage_path}

@@ -9,10 +9,13 @@ The pipeline's runtime:
 - A fixed pool of long-lived worker processes processes fetches, one at a time
   per feed and in fetch order. Memory-heavy work (large fetches, static feeds,
   aggregation, compaction) goes to a separate heavy pool (1 process by default).
-- A failed or killed item is retried, then quarantined after max_attempts.
+- A failed item is retried later (backoff), then quarantined after
+  max_attempts. When a worker dies (e.g. out of memory), the fetches that ran
+  beside it are not blamed: they next run alone, one at a time.
 - The upload thread moves results to storage; during an outage they wait on disk.
 """
 
+import bisect
 import logging
 import multiprocessing
 import os
@@ -51,10 +54,25 @@ RAW_EVERY_SECONDS = 60
 SPOOL_SIZE_EVERY_SECONDS = 10
 # A raw hour is bundled this long after it ended (late fetches)
 RAW_GRACE_SECONDS = 120
+# Waits before retrying a failed item: 10 s, 20 s, 40 s... at most 5 min
+RETRY_BASE_SECONDS = 10
+RETRY_MAX_SECONDS = 300
+# How long shutdown waits for downloads and running tasks
+SHUTDOWN_WAIT_SECONDS = 30
 
 
 def default_spool_dir() -> str:
     return os.path.join(tempfile.gettempdir(), "gtfs_rt_aggregator-spool")
+
+
+def _retry_delay(attempt: int) -> float:
+    return min(RETRY_MAX_SECONDS, RETRY_BASE_SECONDS * 2 ** max(0, attempt - 2))
+
+
+def _item_time(item: Path) -> datetime:
+    return datetime.strptime(item.stem, "%Y%m%dT%H%M%S.%fZ").replace(
+        tzinfo=timezone.utc
+    )
 
 
 @dataclass
@@ -75,6 +93,7 @@ class Task:
     key: str
     lane: str
     info: Dict = field(default_factory=dict)
+    pool: Optional[ProcessPoolExecutor] = None
 
 
 def _pool_context():
@@ -116,7 +135,13 @@ class Runtime:
         self._lock = threading.Lock()
         self._jobs: List[Job] = []
         self._fetching: set = set()  # feeds (realtime and static) being downloaded
-        self._busy_feeds: set = set()  # realtime feeds with an item in a worker
+        # Fetches waiting, per feed, oldest first (kept in memory: no directory
+        # scan per tick); fetch threads add to it under _lock
+        self._queues: Dict[str, List[Path]] = {}
+        self._retry_at: Dict[str, float] = {}  # item or static folder -> time
+        self._suspects: set = set()  # items to run alone (their worker died)
+        self._busy_feeds: Dict[str, Path] = {}  # feed -> item in a worker
+        self._probing: set = set()  # lanes running a suspect item alone
         self._heavy_queue: List[Task] = []  # timed heavy tasks waiting for a slot
         self._in_flight: Dict[Future, Task] = {}
         self._keys_in_flight: set = set()
@@ -124,8 +149,11 @@ class Runtime:
         self._status: Dict[str, Dict] = {}
         self._status_dirty: set = set()
         self._paused: set = set()
+        self._pause_level = -1
         self._spool_size = 0
         self._log_level = logging.getLogger().getEffectiveLevel()
+        self._fetch_pool = self._normal_pool = self._heavy_pool = None
+        self._uploader = None
 
     # Lifecycle ---------------------------------------------------------------
 
@@ -171,6 +199,11 @@ class Runtime:
         recovered = self.spool.recover(self.runtime.max_attempts)
         if any(recovered.values()):
             logger.info(f"Spool recovered after restart: {recovered}")
+        self._queues = self.spool.queued_items()
+        for items in self._queues.values():
+            for item in items:
+                if self.spool.meta(item).get("suspect"):
+                    self._suspects.add(str(item))
 
         self._fetch_pool = ThreadPoolExecutor(
             self.runtime.fetch_threads, thread_name_prefix="fetch"
@@ -193,18 +226,25 @@ class Runtime:
     def _shutdown(self):
         logger.info("Shutting down: waiting for running downloads and tasks")
         self._stop.set()
-        self._fetch_pool.shutdown(wait=True, cancel_futures=True)
+        deadline = time.monotonic() + SHUTDOWN_WAIT_SECONDS
+        if self._fetch_pool is not None:
+            # Downloads cannot be interrupted: wait a while, then leave them
+            self._fetch_pool.shutdown(wait=False, cancel_futures=True)
+            while self._fetching and time.monotonic() < deadline:
+                time.sleep(0.2)
         # Running tasks finish; queued ones stay on disk for the next start
-        deadline = time.monotonic() + 30
         while self._in_flight and time.monotonic() < deadline:
-            self._collect()
+            self._collect(stopping=True)
             time.sleep(0.2)
         for pool in (self._normal_pool, self._heavy_pool):
-            pool.shutdown(wait=False, cancel_futures=True)
-        self._uploader.drain(timeout=30)
-        self._write_statuses(force=True)
-        self._write_index()
-        self._uploader.drain(timeout=10)
+            if pool is not None:
+                pool.shutdown(wait=False, cancel_futures=True)
+        if self._uploader is not None:
+            self._uploader.join(timeout=SHUTDOWN_WAIT_SECONDS)
+            self._uploader.drain(timeout=30)
+            self._write_statuses(force=True)
+            self._write_index()
+            self._uploader.drain(timeout=10)
         logger.info("Stopped")
 
     # Scheduling --------------------------------------------------------------
@@ -278,15 +318,11 @@ class Runtime:
     # Fetch lane ----------------------------------------------------------------
 
     def _submit_fetch(self, feed: str):
-        provider, api = self.feeds[feed]
         with self._lock:
+            status = self._status.get(feed, {})
             if feed in self._paused:
                 self._update_status(
-                    feed,
-                    skipped_spool_full=self._status.get(feed, {}).get(
-                        "skipped_spool_full", 0
-                    )
-                    + 1,
+                    feed, skipped_spool_full=status.get("skipped_spool_full", 0) + 1
                 )
                 return
             if feed in self._fetching:
@@ -294,9 +330,7 @@ class Runtime:
                     f"{feed}: previous download still running, fetch skipped"
                 )
                 self._update_status(
-                    feed,
-                    skipped_overlap=self._status.get(feed, {}).get("skipped_overlap", 0)
-                    + 1,
+                    feed, skipped_overlap=status.get("skipped_overlap", 0) + 1
                 )
                 return
             self._fetching.add(feed)
@@ -318,7 +352,6 @@ class Runtime:
                 tmp.unlink(missing_ok=True)
                 status["unchanged"] = True
                 return
-            self._last_sha[feed] = sha256
             self.spool.commit_item(
                 item,
                 tmp,
@@ -333,6 +366,10 @@ class Runtime:
                     "attempt": 1,
                 },
             )
+            # Only once on disk: after a failed commit, the same bytes are kept next time
+            self._last_sha[feed] = sha256
+            with self._lock:
+                self._queues.setdefault(feed, []).append(item)
         except Exception as e:
             tmp.unlink(missing_ok=True)
             status.update(
@@ -351,10 +388,9 @@ class Runtime:
                 feed in self._fetching
                 or waiting
                 or f"static {feed}" in self._keys_in_flight
+                or self._paused  # spool full: no large downloads
             ):
                 return
-            if self._paused:
-                return  # spool full: no large downloads
             self._fetching.add(feed)
         self._fetch_pool.submit(self._download_static, feed)
 
@@ -391,38 +427,54 @@ class Runtime:
 
     def _dispatch(self):
         """Give waiting work to free worker slots, one item per feed at a time."""
-        normal_free = self.runtime.worker_count() * 2 - self._count("normal")
-        heavy_free = self.runtime.heavy_slots - self._count("heavy")
+        if self._normal_pool is None:
+            return
+        now = time.monotonic()
+        free = {
+            "normal": self.runtime.worker_count() * 2 - self._count("normal"),
+            "heavy": self.runtime.heavy_slots - self._count("heavy"),
+        }
         threshold = self.runtime.heavy_threshold_mb * 1024 * 1024
 
+        with self._lock:
+            candidates = [
+                (items[0].name, feed, items[0])
+                for feed, items in self._queues.items()
+                if items and feed not in self._busy_feeds and feed in self.feeds
+            ]
         # Realtime fetches, the oldest waiting feed first
-        candidates = []
-        for feed in self.spool.feeds_with_pending():
-            if feed in self._busy_feeds or feed not in self.feeds:
-                continue
-            items = self.spool.pending(feed)
-            if items:
-                candidates.append((items[0].name, feed, items[0]))
         for _, feed, item in sorted(candidates):
-            heavy = item.stat().st_size > threshold
-            if heavy and heavy_free <= 0 or not heavy and normal_free <= 0:
+            if self._retry_at.get(str(item), 0) > now:
                 continue
+            try:
+                lane = "heavy" if item.stat().st_size > threshold else "normal"
+            except FileNotFoundError:
+                with self._lock:
+                    self._queues[feed].remove(item)
+                continue
+            suspect = str(item) in self._suspects
+            if lane in self._probing or free[lane] <= 0:
+                continue
+            if suspect and self._count(lane) > 0:
+                continue  # runs alone: wait until its lane is empty
+            with self._lock:
+                self._queues[feed].pop(0)
             claimed = self.spool.claim(item)
-            lane = "heavy" if heavy else "normal"
             self._submit(
-                Task("item", feed, lane, {"item": str(claimed)}),
+                Task("item", feed, lane, {"item": str(claimed), "suspect": suspect}),
                 worker.process_item,
                 str(claimed),
             )
-            self._busy_feeds.add(feed)
-            if heavy:
-                heavy_free -= 1
-            else:
-                normal_free -= 1
+            self._busy_feeds[feed] = claimed
+            free[lane] -= 1
+            if suspect:
+                self._probing.add(lane)
 
         # Static feeds downloaded, then timed heavy tasks
+        if "heavy" in self._probing:
+            return
         for feed in self.statics:
-            if heavy_free <= 0:
+            if free["heavy"] <= 0:
                 break
             key = f"static {feed}"
             if key in self._keys_in_flight:
@@ -430,22 +482,25 @@ class Runtime:
             for meta_path in sorted(
                 self.spool.path("static", feed).glob("*/meta.json")
             ):
+                folder = meta_path.parent
+                if self._retry_at.get(str(folder), 0) > now:
+                    break
                 provider, static = self.statics[feed]
                 self._submit(
-                    Task("static", key, "heavy", {"folder": str(meta_path.parent)}),
+                    Task("static", key, "heavy", {"folder": str(folder)}),
                     worker.process_static,
                     provider.name,
                     static.name,
-                    str(meta_path.parent),
+                    str(folder),
                     static.reuse_unchanged_tables,
                 )
-                heavy_free -= 1
+                free["heavy"] -= 1
                 break
-        while heavy_free > 0 and self._heavy_queue:
+        while free["heavy"] > 0 and self._heavy_queue:
             task = self._heavy_queue.pop(0)
             function = worker.compact if task.kind == "compact" else worker.aggregate
             self._submit(task, function, **task.info)
-            heavy_free -= 1
+            free["heavy"] -= 1
 
     def _queue_heavy(self, kind: str, name: str, args: Dict):
         if name in self._keys_in_flight or any(
@@ -454,46 +509,85 @@ class Runtime:
             return
         self._heavy_queue.append(Task(kind, name, "heavy", dict(args)))
 
+    def _pool(self, lane: str) -> ProcessPoolExecutor:
+        return self._heavy_pool if lane == "heavy" else self._normal_pool
+
     def _submit(self, task: Task, function, *args, **kwargs):
-        pool = self._heavy_pool if task.lane == "heavy" else self._normal_pool
         try:
-            future = pool.submit(function, *args, **kwargs)
+            future = self._pool(task.lane).submit(function, *args, **kwargs)
         except BrokenProcessPool:
             self._replace_pool(task.lane)
-            pool = self._heavy_pool if task.lane == "heavy" else self._normal_pool
-            future = pool.submit(function, *args, **kwargs)
+            future = self._pool(task.lane).submit(function, *args, **kwargs)
+        task.pool = self._pool(task.lane)
         self._in_flight[future] = task
         self._keys_in_flight.add(task.key)
-        logger.debug(
-            f"Submitted {task.kind} {task.key} to the {task.lane} pool {task.info}"
-        )
+        logger.debug(f"Submitted {task.kind} {task.key} to the {task.lane} pool")
 
     def _count(self, lane: str) -> int:
         return sum(1 for task in self._in_flight.values() if task.lane == lane)
 
-    def _collect(self):
+    def _collect(self, stopping: bool = False):
         """Handle finished tasks."""
-        broken = set()
-        for future in [f for f in self._in_flight if f.done()]:
-            task = self._in_flight.pop(future)
-            self._keys_in_flight.discard(task.key)
-            try:
-                result = future.result()
-                error = None
-            except BrokenProcessPool as e:
-                broken.add(task.lane)
-                result, error = None, f"worker process died ({e.__class__.__name__})"
-            except Exception as e:
-                result, error = None, f"{e.__class__.__name__}: {redact(str(e))}"
-            self._finish(task, result, error)
-        for lane in broken:
-            self._replace_pool(lane)
+        finished = [(f, self._in_flight[f]) for f in self._in_flight if f.done()]
+        # A dead worker fails every task of its pool: only a task that ran alone
+        # is known to be the cause
+        in_pool = {}
+        for task in self._in_flight.values():
+            in_pool[id(task.pool)] = in_pool.get(id(task.pool), 0) + 1
 
-    def _finish(self, task: Task, result: Optional[Dict], error: Optional[str]):
+        replace = set()
+        for future, task in finished:
+            del self._in_flight[future]
+            self._keys_in_flight.discard(task.key)
+            if future.cancelled():
+                # Queued in a pool that was replaced: never ran
+                self._finish(task, None, "cancelled", cancelled=True)
+                continue
+            error = future.exception()
+            if isinstance(error, BrokenProcessPool):
+                alone = in_pool.get(id(task.pool)) == 1
+                if task.pool is self._pool(task.lane):
+                    replace.add(task.lane)
+                self._finish(
+                    task,
+                    None,
+                    "worker process died (out of memory?)",
+                    crashed=True,
+                    alone=alone,
+                )
+            elif error is not None:
+                self._finish(
+                    task, None, f"{error.__class__.__name__}: {redact(str(error))}"
+                )
+            else:
+                self._finish(task, future.result(), None)
+        if not stopping:
+            for lane in replace:
+                self._replace_pool(lane)
+
+    def _finish(
+        self,
+        task: Task,
+        result: Optional[Dict],
+        error: Optional[str],
+        crashed: bool = False,
+        alone: bool = False,
+        cancelled: bool = False,
+    ):
         logger.debug(f"Finished {task.kind} {task.key}: {error or 'ok'}")
+        if task.info.get("suspect"):
+            self._probing.discard(task.lane)
         if task.kind == "item":
-            self._busy_feeds.discard(task.key)
+            self._busy_feeds.pop(task.key, None)
             item = Path(task.info["item"])
+            self._suspects.discard(
+                str(
+                    item.parent.parent.parent
+                    / "incoming"
+                    / item.parent.name
+                    / item.name
+                )
+            )
             if error is None:
                 self.spool.done(item, archive=self.config.raw.enabled)
                 with self._lock:
@@ -503,22 +597,42 @@ class Runtime:
                         last_processed_seconds=result.get("seconds"),
                         worker_peak_memory_mb=result.get("peak_memory_mb"),
                     )
-            else:
-                quarantined = self.spool.release(item, error, self.runtime.max_attempts)
-                logger.error(
-                    f"{task.key}: processing {item.name} failed ({error})"
-                    + ("; moved to quarantine/" if quarantined else "; will retry")
+                return
+            # Blamed if it failed by itself, or its worker died while it ran alone
+            count = not cancelled and (
+                not crashed or alone or bool(task.info.get("suspect"))
+            )
+            quarantined = self.spool.release(
+                item, error, self.runtime.max_attempts, count_attempt=count
+            )
+            back = self.spool.path("incoming", item.parent.name, item.name)
+            if not quarantined:
+                attempt = self.spool.meta(back).get("attempt", 1)
+                self._retry_at[str(back)] = time.monotonic() + (
+                    _retry_delay(attempt) if count else 0
                 )
+                if not count and not cancelled:
+                    self._suspects.add(str(back))
                 with self._lock:
-                    self._update_status(
-                        task.key,
-                        last_processing_error=error,
-                        quarantined=self.spool.quarantined(),
-                    )
+                    bisect.insort(self._queues.setdefault(task.key, []), back)
+            logger.error(
+                f"{task.key}: processing {item.name} failed ({error})"
+                + ("; moved to quarantine/" if quarantined else "; will retry")
+            )
+            with self._lock:
+                self._update_status(
+                    task.key,
+                    last_processing_error=error,
+                    quarantined=self.spool.quarantined(),
+                )
+        elif task.kind == "static" and cancelled:
+            pass  # still waiting in spool/static, dispatched again
         elif task.kind == "static" and error is not None:
             folder = Path(task.info["folder"])
             meta = read_json(folder / "meta.json") or {}
-            meta["attempt"] = meta.get("attempt", 1) + 1
+            meta["attempt"] = meta.get("attempt", 1) + (
+                0 if crashed and not alone else 1
+            )
             meta["last_error"] = error
             if meta["attempt"] > self.runtime.max_attempts:
                 target = self.spool.path(
@@ -528,10 +642,13 @@ class Runtime:
                 write_json(folder / "meta.json", meta)
                 os.replace(folder, target)
                 logger.error(
-                    f"Static feed {task.key} failed {error}; moved to quarantine/"
+                    f"Static feed {task.key} failed ({error}); moved to quarantine/"
                 )
             else:
                 write_json(folder / "meta.json", meta)
+                self._retry_at[str(folder)] = time.monotonic() + _retry_delay(
+                    meta["attempt"]
+                )
                 logger.error(f"Static feed {task.key} failed ({error}); will retry")
         elif error is not None:
             logger.error(f"{task.key} failed: {error}")
@@ -545,7 +662,7 @@ class Runtime:
         logger.error(
             f"A {lane} worker process died (out of memory?): replacing the pool"
         )
-        old = self._heavy_pool if lane == "heavy" else self._normal_pool
+        old = self._pool(lane)
         old.shutdown(wait=False, cancel_futures=True)
         new = self._new_pool(
             self.runtime.heavy_slots if lane == "heavy" else self.runtime.worker_count()
@@ -565,13 +682,25 @@ class Runtime:
             if key in self._keys_in_flight:
                 continue
             window = read_json(window_json)
-            if window is None or datetime.fromisoformat(window["end"]) > now:
+            if window is None:
+                continue
+            end = datetime.fromisoformat(window["end"])
+            if end > now or self._has_older(window["feed"], end):
                 continue
             if self._count("normal") >= self.runtime.worker_count() * 2:
                 return
             self._submit(
                 Task("window", key, "normal"), worker.close_window, str(folder)
             )
+
+    def _has_older(self, feed: str, end: datetime) -> bool:
+        """Whether the feed still has a fetch from before end to process."""
+        busy = self._busy_feeds.get(feed)
+        if busy is not None and _item_time(busy) < end:
+            return True
+        with self._lock:
+            queue = self._queues.get(feed)
+            return bool(queue) and _item_time(queue[0]) < end
 
     def _bundle_raw(self):
         if not self.config.raw.enabled:
@@ -584,9 +713,8 @@ class Runtime:
             if (
                 key in self._keys_in_flight
                 or (now - end).total_seconds() < 3600 + RAW_GRACE_SECONDS
+                or feed not in self.feeds
             ):
-                continue
-            if feed not in self.feeds:
                 continue
             provider, api = self.feeds[feed]
             path = (
@@ -607,23 +735,26 @@ class Runtime:
         self._spool_size = self.spool.size_bytes()
         limit = self.runtime.spool_max_gb * 1024**3
         ratio = self._spool_size / limit
+        priorities = sorted({api.priority for _, api in self.feeds.values()})
         with self._lock:
             if ratio >= 1:
-                priorities = sorted({api.priority for _, api in self.feeds.values()})
-                # The lowest priority stops first; with a single priority, all do
-                cutoff = priorities[0] if len(priorities) == 1 else priorities[-2]
+                # One more priority level stops at each check while still full,
+                # lowest first
+                self._pause_level = min(self._pause_level + 1, len(priorities) - 1)
+                cutoff = priorities[self._pause_level] if priorities else 0
                 paused = {
                     f for f, (_, api) in self.feeds.items() if api.priority <= cutoff
                 }
                 if paused != self._paused:
                     logger.error(
-                        f"Spool full ({self._spool_size / 1024**3:.1f} GB): "
-                        f"stopped fetching {len(paused)} feeds"
+                        f"Spool full ({self._spool_size / 1024**3:.2f} GB): "
+                        f"stopped fetching {len(paused)} feeds (priority <= {cutoff})"
                     )
                 self._paused = paused
             elif ratio < 0.9 and self._paused:
                 logger.warning("Spool below 90 %: fetching all feeds again")
                 self._paused = set()
+                self._pause_level = -1
             if 0.8 <= ratio < 1:
                 logger.warning(f"Spool at {ratio:.0%} of spool_max_gb")
 
@@ -648,24 +779,28 @@ class Runtime:
             )
 
     def _write_index(self):
-        backlog = self.spool.backlog()
         with self._lock:
-            feeds = {
-                feed: {
+            now = datetime.now(timezone.utc)
+            feeds = {}
+            for feed, (provider, api) in self.feeds.items():
+                queue = self._queues.get(feed) or []
+                status = self._status.get(feed, {})
+                feeds[feed] = {
                     "provider": provider.name,
                     "services": api.services,
-                    "last_success": self._status.get(feed, {}).get("last_success"),
-                    "last_error": self._status.get(feed, {}).get("last_error"),
-                    "feed_age_seconds": self._status.get(feed, {}).get(
-                        "feed_age_seconds"
-                    ),
+                    "last_success": status.get("last_success"),
+                    "last_error": status.get("last_error"),
+                    "feed_age_seconds": status.get("feed_age_seconds"),
                     "paused": feed in self._paused,
-                    **backlog.get(feed, {"waiting": 0, "oldest_age_seconds": 0}),
+                    "waiting": len(queue),
+                    "oldest_age_seconds": (
+                        round((now - _item_time(queue[0])).total_seconds())
+                        if queue
+                        else 0
+                    ),
                 }
-                for feed, (provider, api) in self.feeds.items()
-            }
         index = {
-            "updated": datetime.now(timezone.utc).isoformat(),
+            "updated": now.isoformat(),
             "spool_gb": round(self._spool_size / 1024**3, 3),
             "spool_max_gb": self.runtime.spool_max_gb,
             "quarantined": self.spool.quarantined(),
@@ -693,13 +828,23 @@ class Uploader(threading.Thread):
 
     def run(self):
         while not self.stop_event.is_set():
-            if not self.upload_some():
+            try:
+                uploaded = self.upload_some()
+            except Exception as e:
+                logger.error(f"Upload thread error: {redact(str(e))}", exc_info=True)
+                uploaded = 0
+            if not uploaded:
                 self.stop_event.wait(1)
 
     def drain(self, timeout: float):
         deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline and self.upload_some(ignore_backoff=True):
-            pass
+        while time.monotonic() < deadline:
+            try:
+                if not self.upload_some(ignore_backoff=True):
+                    break
+            except Exception as e:
+                logger.error(f"Upload error: {redact(str(e))}")
+                break
         left = sum(1 for _ in self.spool.ready_files())
         if left:
             logger.warning(
@@ -718,14 +863,23 @@ class Uploader(threading.Thread):
             provider, storage_path = relative[0], "/".join(relative[1:])
             storage = self.storages.get(provider, self.storages["global"])
             try:
+                before = os.stat(path)
                 storage.save_file(str(path), storage_path)
                 if not storage.file_exists(storage_path):
                     raise IOError(f"{storage_path} missing after upload")
-                path.unlink(missing_ok=True)
+                # Rewritten while uploading (e.g. a status): keep the new version
+                after = os.stat(path)
+                if (after.st_ino, after.st_mtime_ns) == (
+                    before.st_ino,
+                    before.st_mtime_ns,
+                ):
+                    path.unlink(missing_ok=True)
+                    _remove_empty_parents(path.parent, ready)
                 self._retry_at.pop(path, None)
                 self._failures.pop(path, None)
-                _remove_empty_parents(path.parent, ready)
                 uploaded += 1
+            except FileNotFoundError:
+                continue  # uploaded by the other thread meanwhile
             except Exception as e:
                 failures = self._failures.get(path, 0) + 1
                 self._failures[path] = failures

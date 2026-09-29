@@ -168,7 +168,11 @@ class TestRuntime(unittest.TestCase):
         self.assertEqual(len(names), len(set(names)))
 
     def test_quarantine_after_max_attempts(self):
-        self._run(self._config("/garbage", max_attempts=2), 4)
+        from unittest.mock import patch
+
+        # Retries wait 10 s, 20 s... in production
+        with patch("src.gtfs_rt_aggregator.runtime.runtime.RETRY_BASE_SECONDS", 0.2):
+            self._run(self._config("/garbage", max_attempts=2), 4)
         quarantined = self._spool_items("quarantine")
         self.assertGreaterEqual(len(quarantined), 1)
         meta = json.loads(quarantined[0].with_suffix(".json").read_text())

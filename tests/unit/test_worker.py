@@ -83,30 +83,19 @@ class TestWorkerTasks(unittest.TestCase):
         self.assertEqual(ready.name, "2026-09-29_08-01-00Z.parquet")
         self.assertEqual(pq.read_table(ready).num_rows, 2 * 3549)
 
-    def test_late_part_kept_for_next_close(self):
-        item = self._item(datetime(2026, 9, 29, 8, 1, tzinfo=timezone.utc))
-        worker.process_item(str(item))
+    def test_fetch_after_close_gets_its_own_window(self):
+        first = datetime(2026, 9, 29, 8, 1, tzinfo=timezone.utc)
+        worker.process_item(str(self._item(first)))
         (window,) = self.spool.path("windows").glob("*/*/*")
-        parts = list(window.glob("part-*.parquet"))
-        # A part arriving while the window closes stays for the next close
-        original_glob = Path.glob
+        worker.close_window(str(window))
+        self.assertFalse(window.exists())
 
-        def glob_then_add(path, pattern):
-            found = list(original_glob(path, pattern))
-            if (
-                path == window
-                and pattern == "part-*.parquet"
-                and not (window / "part-late.parquet").exists()
-            ):
-                shutil.copy(parts[0], window / "part-late.parquet")
-            return iter(found)
-
-        from unittest.mock import patch
-
-        with patch.object(Path, "glob", glob_then_add):
-            worker.close_window(str(window))
-        self.assertTrue((window / "part-late.parquet").exists())
+        # A slow fetch of the same window, processed after the close
+        worker.process_item(str(self._item(first.replace(minute=2))))
         self.assertTrue((window / "window.json").exists())
+        self.assertEqual(len(list(window.glob("part-*.parquet"))), 1)
+        worker.close_window(str(window))
+        self.assertEqual(len(list(self.spool.path("ready").rglob("*.parquet"))), 2)
 
     def test_raw_bundle(self):
         item = self._item(datetime(2026, 9, 29, 8, 1, tzinfo=timezone.utc))

@@ -96,25 +96,37 @@ class Spool:
         )
 
     def claim(self, item: Path) -> Path:
-        """Move a fetch to processing/. Returns its new path."""
+        """
+        Move a fetch to processing/. Returns its new path. The .pb moves
+        first: if the process dies in between, recover() finds it in
+        processing/ and fetches its sidecar from incoming/.
+        """
         target = self.path("processing", item.parent.name, item.name)
         target.parent.mkdir(parents=True, exist_ok=True)
-        os.replace(item.with_suffix(".json"), target.with_suffix(".json"))
         os.replace(item, target)
+        os.replace(item.with_suffix(".json"), target.with_suffix(".json"))
         return target
 
     def meta(self, item: Path) -> dict:
         return read_json(item.with_suffix(".json")) or {}
 
-    def release(self, item: Path, error: str, max_attempts: int) -> bool:
+    def release(
+        self, item: Path, error: str, max_attempts: int, count_attempt: bool = True
+    ) -> bool:
         """
         A fetch failed: back to incoming/ for another try, or to quarantine/
-        after max_attempts. Returns True if quarantined.
+        after max_attempts. With count_attempt False (its worker died while
+        other fetches ran beside it, so it may not be the cause), the fetch is
+        marked "suspect" instead: it will next run alone. Returns True if
+        quarantined.
         """
         meta = self.meta(item)
-        meta["attempt"] = meta.get("attempt", 1) + 1
+        if count_attempt:
+            meta["attempt"] = meta.get("attempt", 1) + 1
+        elif error != "cancelled":
+            meta["suspect"] = True
         meta["last_error"] = error
-        quarantined = meta["attempt"] > max_attempts
+        quarantined = meta.get("attempt", 1) > max_attempts
         target = self.path(
             "quarantine" if quarantined else "incoming", item.parent.name, item.name
         )
@@ -155,13 +167,25 @@ class Spool:
         write_atomic(self.ready_path(provider, storage_path), data)
 
     def ready_files(self) -> Iterator[Path]:
-        """Files waiting to be uploaded, oldest first."""
-        files = [
-            p
-            for p in self.path("ready").rglob("*")
-            if p.is_file() and ".tmp-" not in p.name
-        ]
-        return iter(sorted(files, key=lambda p: (p.stat().st_mtime, str(p))))
+        """Files waiting to be uploaded (names hold their time: sorted by name)."""
+        found = []
+        for dirpath, _, filenames in os.walk(self.path("ready")):
+            found.extend(
+                os.path.join(dirpath, name) for name in filenames if ".tmp-" not in name
+            )
+        return iter(Path(p) for p in sorted(found))
+
+    def queued_items(self) -> Dict[str, List[Path]]:
+        """Fetches waiting in incoming/, per feed, oldest first (scanned once at start)."""
+        result: Dict[str, List[Path]] = {}
+        for folder in self.path("incoming").iterdir():
+            if folder.is_dir():
+                items = sorted(
+                    p for p in folder.glob("*.pb") if p.with_suffix(".json").exists()
+                )
+                if items:
+                    result[folder.name] = items
+        return result
 
     # Recovery and size ------------------------------------------------------
 
@@ -171,6 +195,15 @@ class Spool:
         incoming/ (counting an attempt), temporary files are deleted.
         """
         counts = {"requeued": 0, "quarantined": 0, "tmp_removed": 0}
+        # A claim interrupted between its two renames: sidecar still in incoming/
+        for item in self.path("processing").glob("*/*.pb"):
+            sidecar = self.path("incoming", item.parent.name, item.stem + ".json")
+            if not item.with_suffix(".json").exists() and sidecar.exists():
+                os.replace(sidecar, item.with_suffix(".json"))
+        # Sidecars whose fetch is gone
+        for sidecar in self.path("incoming").glob("*/*.json"):
+            if not sidecar.with_suffix(".pb").exists():
+                sidecar.unlink(missing_ok=True)
         for item in sorted(self.path("processing").glob("*/*.pb")):
             if self.release(item, "interrupted (restart)", max_attempts):
                 counts["quarantined"] += 1
@@ -189,8 +222,11 @@ class Spool:
         return counts
 
     def size_bytes(self) -> int:
+        """Size of the spool, quarantine excepted (it never drains by itself)."""
         total = 0
-        for dirpath, _, filenames in os.walk(self.root):
+        for dirpath, dirnames, filenames in os.walk(self.root):
+            if Path(dirpath) == self.root and "quarantine" in dirnames:
+                dirnames.remove("quarantine")
             for name in filenames:
                 try:
                     total += os.stat(os.path.join(dirpath, name)).st_size
