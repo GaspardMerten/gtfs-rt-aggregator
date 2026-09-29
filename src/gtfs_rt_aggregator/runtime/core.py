@@ -1,4 +1,4 @@
-"""Processing of one realtime fetch, shared by the worker processes and FetcherService."""
+"""Processing of one realtime fetch, shared by the worker processes and FetcherService (a helper to fetch from your own code)."""
 
 import hashlib
 import logging

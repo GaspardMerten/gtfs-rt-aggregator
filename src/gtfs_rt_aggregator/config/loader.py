@@ -252,7 +252,7 @@ def _convert_toml_to_config(config_dict: Dict[str, Any]) -> GtfsRtConfig:
         static_feeds = []
         for static_dict in provider_dict.get("static", []):
             logger.debug(
-                f"Static feed for {name}: {static_dict.get('url') or static_dict.get('index_url')}"
+                f"Static feed for {name}: {strip_query(static_dict.get('url') or static_dict.get('index_url'))}"
             )
             static_feeds.append(StaticConfig(**static_dict))
 

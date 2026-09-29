@@ -25,7 +25,7 @@ import signal
 import tempfile
 import threading
 import time
-from concurrent.futures import Future, ProcessPoolExecutor, ThreadPoolExecutor
+from concurrent.futures import Future, ProcessPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -177,6 +177,7 @@ class Runtime:
         self._status_dirty: set = set()
         self._written: Dict[str, bytes] = {}  # status files as last written
         self._window_failures: Dict[str, int] = {}
+        self._rerun: Dict[str, Task] = {}  # heavy tasks to run again once done
         self._spool_lock = None
         self._paused: set = set()
         self._pause_level = -1
@@ -191,6 +192,8 @@ class Runtime:
 
     def run(self):
         """Run until stop() is called, or SIGTERM / Ctrl+C."""
+        # Before the try: a pipeline refused here must not shut the other down
+        self._lock_spool()
         previous = self._handle_sigterm()
         try:
             self._start()
@@ -219,7 +222,6 @@ class Runtime:
             return None
 
     def _start(self):
-        self._lock_spool()
         if _filesystem_type(str(self.spool.root)) == "tmpfs":
             logger.warning(
                 f"The spool ({self.spool.root}) is in memory (tmpfs): fetches "
@@ -244,9 +246,7 @@ class Runtime:
                 if self.spool.meta(item).get("suspect"):
                     self._suspects.add(str(item))
 
-        self._fetch_pool = ThreadPoolExecutor(
-            self.runtime.fetch_threads, thread_name_prefix="fetch"
-        )
+        self._fetch_pool = _DaemonThreadPool(self.runtime.fetch_threads, "fetch")
         self._normal_pool = self._new_pool(self.runtime.worker_count())
         self._heavy_pool = self._new_pool(self.runtime.heavy_slots)
         self._static_pool = self._new_pool(self.runtime.heavy_slots, tasks_per_worker=1)
@@ -261,7 +261,7 @@ class Runtime:
             max_workers=workers,
             mp_context=_pool_context(),
             initializer=worker.init_worker,
-            initargs=(self.config, str(self.spool.root), self._log_level),
+            initargs=(self.config, str(self.spool.root), self._log_level, os.getpid()),
             max_tasks_per_child=tasks_per_worker or self.runtime.max_tasks_per_worker,
         )
 
@@ -271,7 +271,8 @@ class Runtime:
         deadline = time.monotonic() + SHUTDOWN_WAIT_SECONDS
         if self._fetch_pool is not None:
             # Downloads cannot be interrupted: wait a while, then leave them
-            self._fetch_pool.shutdown(wait=False, cancel_futures=True)
+            # (daemon threads: they do not keep the process alive)
+            self._fetch_pool.shutdown()
             while self._fetching and time.monotonic() < deadline:
                 time.sleep(0.2)
         # Running tasks finish; queued ones stay on disk for the next start
@@ -293,9 +294,9 @@ class Runtime:
             self._write_statuses(force=True)
             self._write_index()
             self._uploader.drain(timeout=10)
-        # Fetches interrupted now were not at fault: no attempt counted
-        self.spool.mark_clean_shutdown()
         if self._spool_lock is not None:
+            # Fetches interrupted now were not at fault: no attempt counted
+            self.spool.mark_clean_shutdown()
             self._spool_lock.close()
             self._spool_lock = None
         logger.info("Stopped")
@@ -581,11 +582,22 @@ class Runtime:
             with self._lock:
                 self._queues[feed].pop(0)
             claimed = self.spool.claim(item)
-            self._submit(
-                Task("item", feed, lane, {"item": str(claimed), "suspect": suspect}),
-                worker.process_item,
-                str(claimed),
-            )
+            try:
+                self._submit(
+                    Task(
+                        "item", feed, lane, {"item": str(claimed), "suspect": suspect}
+                    ),
+                    worker.process_item,
+                    str(claimed),
+                )
+            except Exception:
+                # Back to the head of its queue, as if never taken
+                self.spool.release(
+                    claimed, "cancelled", self.runtime.max_attempts, count_attempt=False
+                )
+                with self._lock:
+                    self._queues[feed].insert(0, item)
+                raise
             self._busy_feeds[feed] = claimed
             free[lane] -= 1
             if suspect:
@@ -644,10 +656,18 @@ class Runtime:
         args: Dict,
         lane: str = "heavy",
         lock: Optional[str] = None,
+        rerun: bool = False,
     ):
-        if name in self._keys_in_flight or any(
-            t.key == name for t in self._heavy_queue
-        ):
+        """
+        Queue a timed heavy task, unless it is queued or running already.
+        With rerun, a task running now is queued again once it ends (it may
+        have started before what it must see).
+        """
+        if any(t.key == name for t in self._heavy_queue):
+            return
+        if name in self._keys_in_flight:
+            if rerun:
+                self._rerun[name] = Task(kind, name, lane, dict(args), lock=lock)
             return
         self._heavy_queue.append(Task(kind, name, lane, dict(args), lock=lock))
 
@@ -719,6 +739,9 @@ class Runtime:
         cancelled: bool = False,
     ):
         logger.debug(f"Finished {task.kind} {task.key}: {error or 'ok'}")
+        again = self._rerun.pop(task.key, None)
+        if again is not None:
+            self._heavy_queue.append(again)
         if task.info.get("suspect"):
             self._probing.discard(task.lane)
         if task.kind == "item":
@@ -774,7 +797,11 @@ class Runtime:
         elif task.kind == "static" and error is None:
             self._retry_at.pop(task.info["folder"], None)
         elif task.kind == "window" and error is not None:
-            self._window_failed(task, error)
+            # Blamed as fetches are: not when another task killed its worker
+            if cancelled or (crashed and not alone):
+                self._retry_at.pop(task.key, None)
+            else:
+                self._window_failed(task, error)
         elif task.kind == "static" and error is not None:
             folder = Path(task.info["folder"])
             meta = read_json(folder / "meta.json") or {}
@@ -813,10 +840,14 @@ class Runtime:
             if task.kind == "window":
                 self._window_failures.pop(task.info["base"], None)
                 self._retry_at.pop(task.key, None)
-            if task.kind == "compact" and self.config.iceberg is not None:
+            if (
+                task.kind == "compact"
+                and result.get("days")
+                and self.config.iceberg is not None
+            ):
                 # The compaction rewrote day files in place: the tables must
                 # point to the new ones before readers see a size mismatch
-                self._queue_heavy("iceberg_sync", "Iceberg sync", {})
+                self._queue_heavy("iceberg_sync", "Iceberg sync", {}, rerun=True)
             logger.info(
                 f"{task.kind} {task.key} done in {result.get('seconds')}s, "
                 f"worker peak memory {result.get('peak_memory_mb')} MB"
@@ -878,7 +909,10 @@ class Runtime:
             end = datetime.fromisoformat(window["end"])
             if end > now or self._has_older(window["feed"], end):
                 continue
-            if self._count("normal") >= self.runtime.worker_count() * 2:
+            if (
+                "normal" in self._probing
+                or self._count("normal") >= self.runtime.worker_count() * 2
+            ):
                 return
             self._submit(
                 Task("window", key, "normal", {"base": base}),
@@ -903,6 +937,8 @@ class Runtime:
             feed, day, hour = folder.parent.parent.name, folder.parent.name, folder.name
             key = f"raw {folder}"
             end = datetime.strptime(day + hour, "%Y%m%d%H").replace(tzinfo=timezone.utc)
+            if "normal" in self._probing:
+                return  # a suspect fetch runs alone
             if (
                 key in self._keys_in_flight
                 or (now - end).total_seconds() < 3600 + RAW_GRACE_SECONDS
@@ -1015,6 +1051,50 @@ def _json(document: Dict) -> bytes:
     return json.dumps(document, indent=2, default=str).encode("utf-8")
 
 
+class _DaemonThreadPool:
+    """
+    Fixed threads running submitted calls. Unlike ThreadPoolExecutor, whose
+    threads the interpreter waits for at exit, a download still running
+    after shutdown does not keep the process alive.
+    """
+
+    def __init__(self, threads: int, name: str):
+        import queue
+
+        self._queue = queue.Queue()
+        self._threads = threads
+        for index in range(threads):
+            threading.Thread(
+                target=self._work, name=f"{name}_{index}", daemon=True
+            ).start()
+
+    def _work(self):
+        while True:
+            call = self._queue.get()
+            if call is None:
+                return
+            function, args = call
+            try:
+                function(*args)
+            except Exception as e:
+                logger.error(f"{function.__name__} failed: {redact(str(e))}")
+
+    def submit(self, function, *args):
+        self._queue.put((function, args))
+
+    def shutdown(self):
+        """Drop calls not started yet; running ones end on their own."""
+        import queue
+
+        try:
+            while True:
+                self._queue.get_nowait()
+        except queue.Empty:
+            pass
+        for _ in range(self._threads):
+            self._queue.put(None)
+
+
 class Uploader(threading.Thread):
     """Uploads spool/ready/<provider>/<path> to the provider's storage at <path>."""
 
@@ -1034,8 +1114,8 @@ class Uploader(threading.Thread):
                 logger.error(f"Upload thread error: {redact(str(e))}", exc_info=True)
                 uploaded = 0
             if not uploaded:
-                # During an outage, the next retry may be minutes away: no
-                # walk of the whole ready/ folder every second meanwhile
+                # During an outage, the next retry may be minutes away: wait
+                # for it (up to 30 s) instead of walking ready/ every second
                 now = time.monotonic()
                 self._retry_at = {
                     p: t for p, t in self._retry_at.items() if t > now - 3600

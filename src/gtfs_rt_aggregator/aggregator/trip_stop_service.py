@@ -6,7 +6,8 @@ downloaded, and build_trip_stop_events writes
     <folder of path_template(service="TripStopEvent", start=D)>/<compacted_name>
 
 A day is built when D+1 is over and aggregated (trips of D run up to about
-33:00, updates come up to WINDOW_MAX after a run's start), and built again
+33:00, updates come up to WINDOW_MAX after a run's start) and, with
+compact_daily, compacted (or COMPACTION_WAIT later), and built again
 when its TripUpdate files change (late files, the compaction of D+1): the
 names and sizes of the files each day was built from are kept in
 <provider>/_state/trip_stop_events.json.
@@ -36,6 +37,8 @@ SERVICE = "TripStopEvent"
 # After the end of D+1, the time for its last files to be aggregated (plus
 # the feed's aggregation period)
 READY_GRACE = timedelta(minutes=15)
+# With compact_daily, how long a ready day waits for D+1 to be compacted
+COMPACTION_WAIT = timedelta(hours=3)
 STATIC_TABLES = ("trips", "calendar", "calendar_dates", "stop_times")
 
 
@@ -116,6 +119,12 @@ class TripStopEventsService:
                 continue
             try:
                 inputs = self._signature(storage, provider_name, day, tz, listings)
+                if self.config.output.compact_daily and now < ready + COMPACTION_WAIT:
+                    # Wait for D+1's compaction: it renames the files, and so
+                    # would make D be built again
+                    names = {e.split(":")[0] for e in listings[day + timedelta(days=1)]}
+                    if names - {self.config.output.compacted_name}:
+                        continue
                 if storage.file_exists(self.output_path(provider_name, day, tz)):
                     known = state.get(day.isoformat())
                     if known is None:

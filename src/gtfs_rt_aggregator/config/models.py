@@ -171,14 +171,13 @@ class ApiConfig(_Model):
     @classmethod
     def drop_removed_options(cls, values):
         if isinstance(values, dict) and "accumulate_concatenate" in values:
-            import warnings
+            import logging
 
             values = dict(values)
             values.pop("accumulate_concatenate")
-            warnings.warn(
-                "accumulate_concatenate is ignored since 0.7.4 (a window is always one file): remove it",
-                DeprecationWarning,
-                stacklevel=2,
+            # Logged: a DeprecationWarning raised here is hidden by default
+            logging.getLogger(__name__).warning(
+                "accumulate_concatenate is ignored since 0.7.4 (a window is always one file): remove it"
             )
         return values
 
@@ -312,6 +311,8 @@ class ProviderConfig(_Model):
                 value = getattr(self, option)
                 if value is not None and option not in api.model_fields_set:
                     setattr(api, option, value)
+            # Checked again with the provider's frequency_minutes
+            api.validate_accumulate_minutes()
         if not self.realtime and not self.static:
             raise ValueError(
                 f"Provider {self.name} has no realtime or static feed defined"

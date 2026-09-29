@@ -709,5 +709,50 @@ class TestTripStopEventsService(unittest.TestCase):
         self.assertEqual(sink.sync(days_back=None), 1)
 
 
+class TestFolding(unittest.TestCase):
+    def test_parts_fold_like_one_aggregate(self):
+        # Stop updates split over files: folding the parts gives the same
+        # result as aggregating all rows at once, whatever the split
+        import random
+
+        import polars as pl
+
+        from src.gtfs_rt_aggregator.aggregator import trip_stop_events as tse
+
+        base = datetime(2026, 9, 29, tzinfo=pytz.utc)
+        for seed in range(100):
+            rng = random.Random(seed)
+            rows = []
+            for n in range(rng.randint(1, 40)):
+                # Distinct times: ties may pick either row
+                seen = base + timedelta(seconds=10 * n + rng.random())
+                rows.append(
+                    {
+                        "trip_index": rng.randint(0, 2),
+                        "stop_sequence": rng.randint(1, 2),
+                        "stop_id": rng.choice([None, "A", "B"]),
+                        **{c: rng.choice([None, 1, 2]) for c in tse.PREDICTED},
+                        "stop_schedule_relationship": rng.choice([None, "SKIPPED"]),
+                        "first_seen": seen,
+                        "last_seen": seen + timedelta(seconds=rng.randint(0, 5)),
+                    }
+                )
+            rng.shuffle(rows)
+            frame = pl.DataFrame(rows).with_columns(
+                pl.col("trip_index").cast(pl.UInt32)
+            )
+            order = ["trip_index", "stop_sequence"]
+            expected = tse._stop_updates(frame).sort(order)
+            folder = tse.Folder(tse._fold)
+            cuts = sorted(rng.sample(range(1, len(rows) + 1), min(len(rows), 4)))
+            start = 0
+            for cut in cuts + [len(rows)]:
+                if cut > start:
+                    folder.add(tse._stop_updates(frame[start:cut]))
+                start = cut
+            actual = folder.result().select(expected.columns).sort(order)
+            self.assertTrue(actual.equals(expected), f"seed {seed}")
+
+
 if __name__ == "__main__":
     unittest.main()

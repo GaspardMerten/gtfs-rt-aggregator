@@ -19,13 +19,17 @@ from ..utils.log_helper import setup_logger
 from ..utils.file_time import parse_file_time
 
 # Parquet metadata key listing the files merged into an aggregated or
-# compacted file ("name:size"): if the process stops after writing it but
+# compacted file ("name:size:write id"): if the process stops after writing it but
 # before deleting them, they are recognised and not merged twice
 SOURCES_METADATA = b"gtfs_rt_aggregator.sources"
 
 
 def _source_key(path: str, local_path: str) -> str:
-    return f"{posixpath.basename(path)}:{os.path.getsize(local_path)}"
+    """name:size, and the file's write id when it has one (since 0.7.5)."""
+    key = f"{posixpath.basename(path)}:{os.path.getsize(local_path)}"
+    metadata = pq.read_schema(local_path).metadata or {}
+    write_id = metadata.get(fetch_times.WRITE_ID_METADATA)
+    return f"{key}:{write_id.decode()}" if write_id else key
 
 
 def _sources(local_path: str) -> set:
@@ -50,6 +54,10 @@ PERIOD_GRACE_SECONDS = 300
 MAX_DAYS_BACK = 20 * 366
 # Finished days the pipeline compacts (again if files were added)
 COMPACTION_DAYS_BACK = 7
+# How often the pipeline looks for days to compact: soon after a day is over
+COMPACTION_EVERY_SECONDS = 3600
+# After the end of a day's last period, the time for it to be aggregated
+COMPACTION_GRACE = timedelta(minutes=15)
 
 
 class AggregatorService:
@@ -69,7 +77,7 @@ class AggregatorService:
         self.storages = storages
         self.logger.debug("Aggregator service initialized")
 
-    def get_scheduling(self) -> List[Tuple[Any, callable, str, Dict[str, Any]]]:
+    def get_scheduling(self) -> List[Tuple[int, callable, str, Dict[str, Any], str]]:
         """
         Jobs of the aggregator: one aggregation (and one compaction, with
         compact_daily) per provider and service type. Several feeds of a
@@ -101,10 +109,11 @@ class AggregatorService:
                         "service_types": [service],
                         "timezone": provider.timezone,
                         "deduplicate": api.deduplicate,
+                        "frequency_minutes": api.frequency_minutes,
                     }
                     schedules.append(
                         (
-                            24 * 3600,
+                            COMPACTION_EVERY_SECONDS,
                             self.compact_once,
                             f"Compaction - {provider.name} - {service}",
                             compact_args,
@@ -374,12 +383,16 @@ class AggregatorService:
         deduplicate: bool = False,
         days_back: Optional[int] = COMPACTION_DAYS_BACK,
         skip_days: int = 0,
-    ):
+        frequency_minutes: Optional[int] = None,
+    ) -> int:
         """
         Merge the aggregated files of each finished day into one file, sorted by
         output.sort_by. Looks at the last days_back days before today (every
         day stored if None), except the skip_days most recent ones; a day
         compacted earlier is compacted again if files were added to it since.
+        With frequency_minutes (the pipeline's hourly job), yesterday waits
+        until its last period is aggregated: frequency_minutes plus
+        COMPACTION_GRACE after midnight. Returns how many days were compacted.
 
         Args:
             provider_name: Name of the provider
@@ -388,12 +401,23 @@ class AggregatorService:
             deduplicate: Merge consecutive identical rows (firstSeen / lastSeen)
             days_back: How many finished days to look at (None: all)
             skip_days: How many of the most recent finished days to leave
+            frequency_minutes: Aggregation period of the service (None: no wait)
         """
         logger = setup_logger(f"{__name__}.AggregatorService.compact.{provider_name}")
         tz = pytz.timezone(timezone)
         storage = self._get_storage_for_provider(provider_name)
-        today = datetime.now(tz).date()
+        now = datetime.now(tz)
+        today = now.date()
         name = self.config.output.compacted_name
+        # Before this, yesterday's last period may not be aggregated yet
+        yesterday_ready = (
+            tz.localize(datetime(today.year, today.month, today.day))
+            + timedelta(minutes=frequency_minutes)
+            + COMPACTION_GRACE
+            if frequency_minutes
+            else now
+        )
+        compacted_days = 0
 
         for service_type in service_types:
             last = days_back
@@ -402,6 +426,8 @@ class AggregatorService:
                     storage, provider_name, service_type, tz, today
                 )
             for back in range(skip_days + 1, last + 1):
+                if back == 1 and now < yesterday_ready:
+                    continue
                 day = today - timedelta(days=back)
                 folder = day_folder(self.config, provider_name, service_type, day, tz)
                 try:
@@ -429,8 +455,11 @@ class AggregatorService:
                     logger.info(
                         f"Compacted {len(merged['merged'])} files into {compacted} ({merged['rows']} rows)"
                     )
+                    if merged["merged"]:
+                        compacted_days += 1
                 except Exception as e:
                     logger.error(f"Error compacting {folder}: {e}", exc_info=True)
+        return compacted_days
 
     def _oldest_day_back(self, storage, provider_name, service_type, tz, today) -> int:
         """How many days before today the oldest stored day folder is (0 if none)."""
@@ -512,29 +541,36 @@ class AggregatorService:
                     c for c in self.config.output.sort_by if all(c in n for n in names)
                 ]
 
-            merged, sorted_paths, times = [], [], {}
+            # Every fetch time first: a file deduplicated on its own must know
+            # the fetches of the other files (an entity missing from them)
+            file_times = {path: fetch_times.of_file(local) for path, local in inputs}
+            every_time = {}
+            for found in file_times.values():
+                fetch_times.merge(every_time, found)
+            every_time = fetch_times.to_arrays(every_time)
+
+            merged, sorted_paths = [], []
             for index, (path, local) in enumerate(inputs):
                 if sorted_by(local) == keys:
                     # Written since 0.6.0 with the same settings: already sorted
-                    fetch_times.of_file(local, times)
                     sorted_paths.append(local)
                 else:
                     try:
                         # One file in memory at a time
-                        table = pq.read_table(local)
-                        fetch_times.merge(
-                            times, fetch_times.decode(table.schema.metadata)
+                        table = conform(
+                            pq.read_table(local), service_type, provider_name, tz
                         )
-                        table = conform(table, service_type, provider_name, tz)
                     except Exception as e:
                         if path == output:
                             raise
                         logger.error(f"Could not read {path}: {e}")
                         failed.append(path)
+                        del file_times[path]
                         continue
-                    fetch_times.from_table(table, times)
+                    # Times of files written before 0.6.0 (Unix seconds)
+                    fetch_times.from_table(table, file_times[path])
                     if deduplicate:
-                        table = deduplicate_rows(table, fetch_times.to_arrays(times))
+                        table = deduplicate_rows(table, every_time)
                     prepared = os.path.join(tmp, f"sorted-{index}.parquet")
                     write_sorted(table, keys, prepared)
                     del table
@@ -545,6 +581,9 @@ class AggregatorService:
             if not merged:
                 return {"rows": 0, "merged": [], "skipped": skipped, "failed": failed}
 
+            times = {}
+            for found in file_times.values():
+                fetch_times.merge(times, found)
             # Skipped files are listed again: their deletion may fail again
             sources = sorted(keys_of[p] for p in merged + skipped)
             result = os.path.join(tmp, "out.parquet")
@@ -556,6 +595,7 @@ class AggregatorService:
                 times=fetch_times.to_arrays(times) if deduplicate else None,
                 metadata={
                     **fetch_times.encode(times),
+                    **fetch_times.write_id(),
                     SOURCES_METADATA: json.dumps(sources).encode(),
                 },
             )

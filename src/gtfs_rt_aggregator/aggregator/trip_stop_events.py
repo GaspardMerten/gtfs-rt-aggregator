@@ -418,7 +418,7 @@ def build_trip_stop_events(
         running = running.join(
             trips.select("trip_index", "trip_key").unique("trip_index"),
             on="trip_index",
-        ).drop("trip_index", "match_id")
+        ).drop("trip_index", "match_id", "stop_id_seen")
     return _events(
         trips,
         running,
@@ -429,17 +429,42 @@ def build_trip_stop_events(
     )
 
 
+# Trip columns aggregated as "the last value that is not null"
+TRIP_LAST_NON_NULL = ("trip_routeId", "trip_startTime", "staticVersion")
+
+
+def with_seen(frame, columns):
+    """
+    Add <column>_seen: when the column's value was seen (null if null). A
+    "last value that is not null" then folds correctly: a partial aggregate
+    keeps the time of that value, not the time of its last row.
+    """
+    import polars as pl
+
+    return frame.with_columns(
+        pl.when(pl.col(c).is_not_null()).then(pl.col("last_seen")).alias(f"{c}_seen")
+        for c in columns
+        if f"{c}_seen" not in frame.columns
+    )
+
+
+def _last_non_null(column: str):
+    import polars as pl
+
+    seen = f"{column}_seen"
+    # Nulls sort first: the last value is the latest one that is not null
+    return [pl.col(column).sort_by(seen).last(), pl.col(seen).max()]
+
+
 def _trip_aggregates():
     import polars as pl
 
-    # Rows sorted by last_seen
+    # Rows sorted by last_seen; see with_seen
     return [
         pl.col("trip_tripId").first(),
         pl.col("trip_startDate").first(),
-        pl.col("trip_routeId").drop_nulls().last(),
-        pl.col("trip_startTime").drop_nulls().last(),
+        *[e for c in TRIP_LAST_NON_NULL for e in _last_non_null(c)],
         pl.col("trip_scheduleRelationship").last(),
-        pl.col("staticVersion").drop_nulls().last(),
         pl.col("first_seen").min(),
         pl.col("last_seen").max(),
     ]
@@ -464,7 +489,10 @@ def resolve_trips(files, service_date, tz, timetables):
 
     def summarise(frame):
         return (
-            frame.sort("last_seen").group_by("raw_key", "hour").agg(*_trip_aggregates())
+            with_seen(frame, TRIP_LAST_NON_NULL)
+            .sort("last_seen")
+            .group_by("raw_key", "hour")
+            .agg(*_trip_aggregates())
         )
 
     folder = Folder(summarise, how="diagonal_relaxed")
@@ -765,14 +793,18 @@ def _stop_updates(updates):
     )
     first = pl.col("first_seen").arg_min()
     last = pl.col("last_seen").arg_max()
-    return updates.group_by(STOP_KEY).agg(
-        pl.col("stop_id").sort_by("last_seen").drop_nulls().last(),
-        *[pl.col(c).get(first).alias(f"first_{c}") for c in PREDICTED],
-        *[pl.col(c).get(last).alias(f"last_{c}") for c in PREDICTED],
-        pl.col("stop_schedule_relationship").get(last),
-        pl.col("first_seen").min(),
-        pl.col("last_seen").max(),
-        pl.len().cast(pl.Int64).alias("prediction_count"),
+    return (
+        with_seen(updates, ["stop_id"])
+        .group_by(STOP_KEY)
+        .agg(
+            *_last_non_null("stop_id"),
+            *[pl.col(c).get(first).alias(f"first_{c}") for c in PREDICTED],
+            *[pl.col(c).get(last).alias(f"last_{c}") for c in PREDICTED],
+            pl.col("stop_schedule_relationship").get(last),
+            pl.col("first_seen").min(),
+            pl.col("last_seen").max(),
+            pl.len().cast(pl.Int64).alias("prediction_count"),
+        )
     )
 
 
@@ -783,7 +815,7 @@ def _fold(frame):
     first = pl.col("first_seen").arg_min()
     last = pl.col("last_seen").arg_max()
     return frame.group_by(STOP_KEY).agg(
-        pl.col("stop_id").sort_by("last_seen").drop_nulls().last(),
+        *_last_non_null("stop_id"),
         *[pl.col(f"first_{c}").get(first) for c in PREDICTED],
         *[pl.col(f"last_{c}").get(last) for c in PREDICTED],
         pl.col("stop_schedule_relationship").get(last),

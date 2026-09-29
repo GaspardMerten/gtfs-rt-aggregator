@@ -209,6 +209,16 @@ class TestProviderChecks(unittest.TestCase):
                 ],
             )
 
+    def test_provider_frequency_checked_with_accumulate_minutes(self):
+        with self.assertRaisesRegex(ValidationError, "accumulate_minutes"):
+            ProviderConfig(
+                name="p",
+                frequency_minutes=45,
+                realtime=[
+                    ApiConfig(url="a", services=["Alert"], accumulate_minutes=30)
+                ],
+            )
+
     def test_provider_defaults(self):
         provider = ProviderConfig(
             name="p",
@@ -226,7 +236,7 @@ class TestProviderChecks(unittest.TestCase):
         self.assertNotIn("s3cret", str(error.exception))
 
     def test_accumulate_concatenate_ignored(self):
-        with self.assertWarns(DeprecationWarning):
+        with self.assertLogs("src.gtfs_rt_aggregator.config.models", "WARNING"):
             api = ApiConfig(url="u", services=["Alert"], accumulate_concatenate=False)
         self.assertFalse(hasattr(api, "accumulate_concatenate"))
 

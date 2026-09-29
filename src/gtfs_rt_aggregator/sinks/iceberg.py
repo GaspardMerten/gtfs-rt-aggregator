@@ -148,9 +148,14 @@ class IcebergSink:
                         )
                     if known is not None and known.get(uri) == size:
                         continue
-                    table, done = self._register(
-                        service, provider.name, path, uri, table
-                    )
+                    try:
+                        table, done = self._register(
+                            service, provider.name, path, uri, table
+                        )
+                    except Exception as e:
+                        # The other days are registered all the same
+                        logger.error(f"Iceberg: could not register {path}: {e}")
+                        continue
                     if done:
                         if known is not None:
                             known[uri] = size
@@ -210,6 +215,9 @@ class IcebergSink:
                 f"Iceberg: {path} was written before 0.6.0, not registered: "
                 "run --iceberg-backfill"
             )
+            return table, False
+        if len(dates) == 0:
+            # A day with no rows (e.g. no alert all day): nothing to query
             return table, False
         if len(dates) != 1:
             raise ValueError(f"{path} holds {len(dates)} dates, expected one")

@@ -87,7 +87,9 @@ class FetcherService:
                     f"{url}: unchanged since the previous fetch, not stored"
                 )
                 return
-            for service_type, table in result.tables.items():
+            for service_type, table in fetch_times.worth_storing(
+                result.tables, state
+            ).items():
                 if service_type not in service_types:
                     continue
                 name = format_file_time(fetch_time, feed_hash(api))

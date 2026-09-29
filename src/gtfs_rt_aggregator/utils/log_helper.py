@@ -21,3 +21,28 @@ def setup_logger(name: str, level: Optional[int] = None) -> logging.Logger:
     if level is not None:
         logger.setLevel(level)
     return logger
+
+
+def configure_root_logger(
+    level: int = logging.INFO, log_file: Optional[str] = None, console: bool = True
+) -> None:
+    """Deprecated since 0.7.4: configure logging with the logging module."""
+    import warnings
+
+    warnings.warn(
+        "configure_root_logger is deprecated: use logging.basicConfig",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    handlers = [logging.StreamHandler()] if console else []
+    if log_file:
+        handlers.append(logging.FileHandler(log_file))
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+        handlers=handlers or None,
+        force=True,
+    )
+    from ..utils.redact import install_redaction
+
+    install_redaction(logging.getLogger())

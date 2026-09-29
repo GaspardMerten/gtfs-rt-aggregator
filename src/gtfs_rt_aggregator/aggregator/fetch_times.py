@@ -17,6 +17,9 @@ import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
 FETCH_TIMES_METADATA = b"gtfs_rt_aggregator.fetch_times"
+# Random id of each written file: tells apart two files with the same name
+# and size (see service.SOURCES_METADATA)
+WRITE_ID_METADATA = b"gtfs_rt_aggregator.write_id"
 TIMESTAMP = pa.timestamp("us", tz="UTC")
 
 # Epoch microseconds by feedId (None: rows written before 0.7.3, no feedId)
@@ -96,9 +99,16 @@ def of_file(path: str, times: Optional[TimeSets] = None) -> TimeSets:
     times = {} if times is None else times
     schema = pq.read_schema(path)
     merge(times, decode(schema.metadata))
+    # Times stored as Unix seconds (before 0.6.0) are read after conform
     columns = [
-        c for c in ("fetchTime", "firstSeen", "lastSeen", "feedId") if c in schema.names
+        c
+        for c in ("fetchTime", "firstSeen", "lastSeen")
+        if c in schema.names and pa.types.is_timestamp(schema.field(c).type)
     ]
+    if not columns:
+        return times
+    if "feedId" in schema.names:
+        columns.append("feedId")
     for batch in pq.ParquetFile(path).iter_batches(columns=columns, batch_size=262_144):
         from_table(pa.Table.from_batches([batch]), times)
     return times
@@ -117,10 +127,34 @@ def to_arrays(times: TimeSets) -> Dict[Optional[str], pa.Array]:
     }
 
 
+def write_id() -> Dict[bytes, bytes]:
+    import uuid
+
+    return {WRITE_ID_METADATA: uuid.uuid4().hex.encode()}
+
+
 def with_times(table: pa.Table, times: Optional[TimeSets]) -> pa.Table:
-    """table with times added to its schema metadata."""
-    if not times:
-        return table
+    """table with times (and a new write id) added to its schema metadata."""
     metadata = dict(table.schema.metadata or {})
-    metadata.update(encode(times))
+    metadata.update(encode(times or {}))
+    metadata.update(write_id())
     return table.replace_schema_metadata(metadata)
+
+
+def worth_storing(tables: Dict[str, pa.Table], state: dict) -> Dict[str, pa.Table]:
+    """
+    The tables of a fetch to store. A service with no rows is stored (as a
+    file with no rows, holding the fetch time) only when the previous stored
+    fetch had rows of it: that one fetch time is enough to end the runs of
+    its entities; the following empty fetches would only add files. state
+    (the feed's, saved by the caller) remembers the empty services.
+    """
+    empty_before = set(state.get("empty_services", []))
+    state["empty_services"] = sorted(
+        service for service, table in tables.items() if table.num_rows == 0
+    )
+    return {
+        service: table
+        for service, table in tables.items()
+        if table.num_rows or service not in empty_before
+    }

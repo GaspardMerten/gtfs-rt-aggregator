@@ -65,7 +65,12 @@ _CTX: Optional[_Context] = None
 _INIT: Optional[tuple] = None
 
 
-def init_worker(config: GtfsRtConfig, spool_root: str, log_level: int):
+def init_worker(
+    config: GtfsRtConfig,
+    spool_root: str,
+    log_level: int,
+    main_pid: Optional[int] = None,
+):
     """Initializer of a worker process."""
     global _CTX, _INIT
     # "kill -USR1 <worker pid>" prints what a worker is doing
@@ -79,6 +84,8 @@ def init_worker(config: GtfsRtConfig, spool_root: str, log_level: int):
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     if hasattr(signal, "SIGTERM"):
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    if main_pid is not None:
+        _exit_with(main_pid)
     root = logging.getLogger()
     if not root.handlers:
         # Workers started by a fork server do not inherit the logging setup
@@ -93,6 +100,26 @@ def init_worker(config: GtfsRtConfig, spool_root: str, log_level: int):
     # Polars' memory grows with its thread count: see StaticService._convert
     os.environ.setdefault("POLARS_MAX_THREADS", "4")
     _CTX, _INIT = None, (config, spool_root)
+
+
+def _exit_with(main_pid: int, every_seconds: float = 2.0):
+    """
+    End this worker when the main process is gone (killed, out of memory):
+    it ignores SIGTERM, so it would otherwise outlive it, beside the
+    pipeline started next.
+    """
+    import threading
+
+    def watch():
+        while True:
+            time.sleep(every_seconds)
+            try:
+                os.kill(main_pid, 0)
+            except (ProcessLookupError, PermissionError):
+                # PermissionError: the pid now belongs to another user
+                os._exit(1)
+
+    threading.Thread(target=watch, name="main-watch", daemon=True).start()
 
 
 def _ctx() -> _Context:
@@ -175,7 +202,8 @@ def process_item(item_path: str) -> Dict:
     written = []
     if result.tables is not None:
         times = fetch_times.of_fetch(feed_hash(api), fetch_time)
-        for service_type, table in result.tables.items():
+        tables = fetch_times.worth_storing(result.tables, state)
+        for service_type, table in tables.items():
             data = ParquetSerializer.pyarrow_table_to_bytes(
                 fetch_times.with_times(table, times), compression="snappy"
             )
@@ -306,8 +334,7 @@ def aggregate(**kwargs) -> Dict:
 
 @_timed
 def compact(**kwargs) -> Dict:
-    _ctx().aggregator.compact_once(**kwargs)
-    return {}
+    return {"days": _ctx().aggregator.compact_once(**kwargs)}
 
 
 @_timed

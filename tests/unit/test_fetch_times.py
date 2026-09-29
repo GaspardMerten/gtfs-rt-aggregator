@@ -31,17 +31,25 @@ SERVICE = "VehiclePosition"
 FEED = "abcd0123"
 
 
-def _fetch(entities, fetch_time):
-    """An individual file as the worker writes it: rows and fetch time."""
+def _fetch(entities, fetch_time, *more):
+    """
+    An individual file as the worker writes it: rows and fetch time. With
+    more (entities, fetch_time) pairs: a window file holding several fetches.
+    """
+    fetches = [(entities, fetch_time)] + list(zip(more[::2], more[1::2]))
+    rows = [(e, t) for entities, t in fetches for e in entities]
     table = pa.table(
         {
-            "entityId": pa.array(entities, pa.string()),
-            "contentHash": pa.array(["h"] * len(entities), pa.string()),
-            "fetchTime": pa.array([fetch_time] * len(entities), TIMESTAMP),
-            "feedId": pa.array([FEED] * len(entities), pa.string()),
+            "entityId": pa.array([e for e, _ in rows], pa.string()),
+            "contentHash": pa.array(["h"] * len(rows), pa.string()),
+            "fetchTime": pa.array([t for _, t in rows], TIMESTAMP),
+            "feedId": pa.array([FEED] * len(rows), pa.string()),
         }
     )
-    table = fetch_times.with_times(table, fetch_times.of_fetch(FEED, fetch_time))
+    times = {}
+    for _, t in fetches:
+        fetch_times.merge(times, fetch_times.of_fetch(FEED, t))
+    table = fetch_times.with_times(table, times)
     buffer = io.BytesIO()
     pq.write_table(table, buffer)
     return buffer.getvalue()
@@ -121,6 +129,18 @@ class TestAggregation(unittest.TestCase):
         day = pq.read_table(io.BytesIO(self.storage.get_bytes(f"{folder}/day.parquet")))
         self.assertEqual(self._runs(day), [("a", 0, 0), ("a", 2, 3)])
 
+    def test_gap_from_a_later_file(self):
+        # A window file holds the fetches of minutes 0 and 2; a slow fetch of
+        # minute 1, without "a", arrived later in its own file
+        self._put(
+            None,
+            0,
+            _fetch(["a"], self.hour, ["a"], self.hour + timedelta(minutes=2)),
+        )
+        self._put([], 1)
+        self._run()
+        self.assertEqual(self._runs(self._output()), [("a", 0, 0), ("a", 2, 2)])
+
     def test_stopped_before_deleting(self):
         # The process stopped after writing the aggregated file, before
         # deleting the individual files: they are not added twice
@@ -149,6 +169,26 @@ class TestAggregation(unittest.TestCase):
         table = self._output()
         self.assertEqual(table.num_rows, 0)
         self.assertEqual(len(fetch_times.decode(table.schema.metadata)[FEED]), 1)
+
+
+class TestWorthStoring(unittest.TestCase):
+    def test_empty_service_stored_once(self):
+        state = {}
+        rows = pa.table({"entityId": ["a"]})
+        empty = rows.slice(0, 0)
+        stored = []
+        for tables in (
+            {"Alert": rows, "TripUpdate": empty},
+            {"Alert": empty, "TripUpdate": empty},
+            {"Alert": empty, "TripUpdate": empty},
+            {"Alert": rows, "TripUpdate": empty},
+        ):
+            stored.append(sorted(fetch_times.worth_storing(tables, state)))
+        # The first empty fetch after rows ends the runs; the next ones add nothing
+        self.assertEqual(
+            stored,
+            [["Alert", "TripUpdate"], ["Alert"], [], ["Alert"]],
+        )
 
 
 class TestCompactionCarry(unittest.TestCase):

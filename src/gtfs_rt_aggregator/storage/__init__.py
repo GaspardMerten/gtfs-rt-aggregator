@@ -1,4 +1,7 @@
 from ..storage.base import StorageInterface
+
+# Deprecated names, kept for code written before 0.7.4
+from ..storage.factory import StorageFactory, create_storage_from_config  # noqa: F401
 from ..storage.filesystem import FileSystemStorage
 from ..storage.gcs import GoogleCloudStorage
 from ..storage.minio import MinioStorage

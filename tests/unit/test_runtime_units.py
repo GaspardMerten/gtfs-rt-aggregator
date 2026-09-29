@@ -4,6 +4,7 @@ import os
 import shutil
 import tempfile
 import threading
+import time
 import unittest
 from datetime import datetime, timezone
 from unittest.mock import MagicMock
@@ -205,6 +206,88 @@ class TestHeavyTasks(unittest.TestCase):
         other = Runtime(self.runtime.config, {"global": MagicMock()})
         with self.assertRaisesRegex(RuntimeError, "Another pipeline"):
             other._lock_spool()
+
+    def test_refused_pipeline_leaves_the_spool_alone(self):
+        self.runtime._lock_spool()
+        self.addCleanup(self.runtime._spool_lock.close)
+        other = Runtime(self.runtime.config, {"global": MagicMock()})
+        with self.assertRaises(RuntimeError):
+            other.run()
+        # No clean-shutdown marker for the running pipeline's next recovery
+        self.assertFalse(other.spool.path("clean-shutdown").exists())
+
+    def test_window_not_blamed_for_another_crash(self):
+        from src.gtfs_rt_aggregator.runtime.runtime import Task
+
+        task = Task("window", "window /w", "normal", {"base": "/w"})
+        for _ in range(5):
+            self.runtime._finish(task, None, "worker died", crashed=True, alone=False)
+            self.runtime._finish(task, None, "cancelled", cancelled=True)
+        self.assertEqual(self.runtime._window_failures, {})
+        self.runtime._finish(task, None, "boom")
+        self.assertEqual(self.runtime._window_failures, {"/w": 1})
+
+
+class TestWorkerWatch(unittest.TestCase):
+    def test_worker_ends_with_the_main_process(self):
+        import subprocess
+        import sys
+
+        # A pid that no longer runs
+        gone = subprocess.Popen([sys.executable, "-c", "pass"])
+        gone.wait()
+        code = (
+            "import time\n"
+            "from src.gtfs_rt_aggregator.runtime.worker import _exit_with\n"
+            f"_exit_with({gone.pid}, every_seconds=0.1)\n"
+            "time.sleep(10)\n"
+        )
+        start = time.monotonic()
+        result = subprocess.run([sys.executable, "-c", code], timeout=20)
+        self.assertEqual(result.returncode, 1)
+        self.assertLess(time.monotonic() - start, 8)
+
+
+class TestDownload(unittest.TestCase):
+    def test_trickling_download_stopped(self):
+        import http.server
+        import logging
+
+        from src.gtfs_rt_aggregator.utils.http import DownloadTooLong, download_to
+
+        class Trickle(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200)
+                self.send_header("Content-Length", "20")
+                self.end_headers()
+                try:
+                    for _ in range(20):
+                        self.wfile.write(b"x")
+                        self.wfile.flush()
+                        time.sleep(0.25)
+                except OSError:
+                    pass  # the client gave up, as expected
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Trickle)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.shutdown)
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp)
+        start = time.monotonic()
+        with self.assertRaises(DownloadTooLong):
+            download_to(
+                f"http://127.0.0.1:{server.server_port}/",
+                None,
+                os.path.join(tmp, "f"),
+                retries=0,
+                logger=logging.getLogger(__name__),
+                max_seconds=1,
+            )
+        # Stopped mid-body (sent in 5 s), not after it
+        self.assertLess(time.monotonic() - start, 3)
 
 
 if __name__ == "__main__":

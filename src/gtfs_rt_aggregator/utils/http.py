@@ -1,5 +1,6 @@
 import hashlib
 import logging
+import threading
 import time
 from typing import Callable, Dict, Optional, Tuple, TypeVar
 
@@ -89,21 +90,62 @@ def download_to(
     def attempt() -> Tuple[int, str]:
         digest = hashlib.sha256()
         size = 0
-        deadline = time.monotonic() + max_seconds
         with requests.get(
             url, headers=headers, timeout=timeout, stream=True
         ) as response:
             raise_for_status(response)
-            with open(path, "wb") as f:
-                for chunk in response.iter_content(chunk_size=1 << 20):
-                    if time.monotonic() > deadline:
-                        raise DownloadTooLong(f"GET {url} took over {max_seconds:.0f}s")
-                    f.write(chunk)
-                    digest.update(chunk)
-                    size += len(chunk)
+            # Reads block until data arrives: a timer closes the connection
+            # when the attempt takes too long, which ends the read
+            state = {"reading": True, "timed_out": False}
+
+            def expire():
+                if state["reading"]:
+                    state["timed_out"] = True
+                    _abort(response)
+
+            timer = threading.Timer(max_seconds, expire)
+            timer.daemon = True
+            timer.start()
+            try:
+                with open(path, "wb") as f:
+                    for chunk in response.iter_content(chunk_size=1 << 20):
+                        f.write(chunk)
+                        digest.update(chunk)
+                        size += len(chunk)
+                state["reading"] = False
+            except Exception:
+                if state["timed_out"]:
+                    raise DownloadTooLong(f"GET {url} took over {max_seconds:.0f}s")
+                raise
+            finally:
+                state["reading"] = False
+                timer.cancel()
         return size, digest.hexdigest()
 
     return with_retries(attempt, retries, logger, f"GET {url}")
+
+
+def _abort(response: requests.Response):
+    """
+    Stop a read blocked in another thread: closing the response is not
+    enough, its socket must be shut down (then the read fails at once).
+    """
+    import socket
+
+    candidates = []
+    # The socket under http.client's response (urllib3 detaches it from the
+    # connection once the response started)
+    raw = getattr(getattr(getattr(response.raw, "_fp", None), "fp", None), "raw", None)
+    candidates.append(getattr(raw, "_sock", None))
+    connection = getattr(response.raw, "connection", None)
+    candidates.append(getattr(connection, "sock", None))
+    for sock in candidates:
+        if sock is not None:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+    response.close()
 
 
 def raise_for_status(response: requests.Response):

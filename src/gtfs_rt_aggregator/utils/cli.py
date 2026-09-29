@@ -4,7 +4,7 @@ import sys
 
 from ..config.loader import load_config_from_toml
 from ..pipeline import run_pipeline_from_toml, scrub_static_urls
-from ..utils.redact import install_redaction
+from ..utils.redact import install_redaction, redact
 
 
 def main():
@@ -109,7 +109,7 @@ def main():
             return
         run_pipeline_from_toml(args.toml_path)
     except Exception as e:
-        print(f"Error: {e}", file=sys.stderr)
+        print(f"Error: {redact(str(e))}", file=sys.stderr)
         sys.exit(1)
 
 

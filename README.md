@@ -187,7 +187,7 @@ to a folder on disk.
 | Key | Default | Meaning |
 |---|---|---|
 | `path_template` | `"provider={provider}/service={service}/date={start:%Y-%m-%d}/{start:%H-%M-%S}_to_{end:%H-%M-%S}.parquet"` | Path of each aggregated file. Fields: `provider`, `service`, `start`, `end` (period bounds in the provider's timezone, with `strftime` formats). |
-| `compact_daily` | `false` | Merge the aggregated files of each finished day into one sorted file. Runs at startup and every 24 hours, over the last 7 days. |
+| `compact_daily` | `false` | Merge the aggregated files of each finished day into one sorted file. Checks every hour over the last 7 days: a day is compacted once its last period is aggregated, and again when files are added to it. |
 | `compacted_name` | `"day.parquet"` | Name of that file in the day's folder. |
 | `sort_by` | `["entityId", "fetchTime"]` | Sort order of the aggregated and compacted files. |
 | `trip_stop_events` | `false` | Build a daily `TripStopEvent` file. Needs the `static` extra. See below. |
@@ -351,7 +351,8 @@ With `trip_stop_events = true`, each provider with trip updates and a static fee
 | `trip_schedule_relationship`, `stop_schedule_relationship` | e.g. `CANCELED`, `ADDED`, `SKIPPED`, `NO_DATA` |
 | `static_version` | Static version the updates were fetched with |
 
-A service date D is built once D+1 is over and aggregated, from the trip updates of D-1, D and D+1. Feeds that give
+A service date D is built once D+1 is over and aggregated (and compacted, with `compact_daily`), from the trip updates
+of D-1, D and D+1. It is built again when those trip updates change, e.g. late files. Feeds that give
 only delays or only times both work; the missing value is computed from the schedule. Canceled trips keep their
 scheduled stops without times. Added trips that are not in the timetable keep their updates without a schedule.
 

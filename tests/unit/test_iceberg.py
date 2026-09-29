@@ -273,6 +273,13 @@ class TestIcebergSink(unittest.TestCase):
         self.assertEqual(pq.read_table(os.path.join(out, found[0])).num_rows, old)
         self.assertEqual(self.sink.sync(days_back=None), 1)
 
+    def test_day_without_rows_skipped(self):
+        # e.g. no alert all day: nothing to register, the other days are
+        self.assertEqual(self._day("be", 1, entities=0), 0)
+        expected = self._day("nl", 1)
+        self.assertEqual(self.sink.sync(), 1)
+        self.assertEqual(self._rows().num_rows, expected)
+
     def test_old_file_skipped(self):
         path = "provider=be/service=VehiclePosition/date=2000-01-01/day.parquet"
         os.makedirs(os.path.dirname(os.path.join(self.tmp, "out", path)))
