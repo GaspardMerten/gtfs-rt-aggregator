@@ -1,6 +1,6 @@
 import hashlib
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, timezone as dt_timezone
 from typing import Dict, Iterable, List, Any, Optional, Tuple
 
 import pyarrow as pa
@@ -31,6 +31,32 @@ TRIP_MODIFICATIONS = (
 
 SERVICE_TYPES = [VEHICLE_POSITIONS, TRIP_UPDATE, ALERT, TRIP_MODIFICATIONS, SHAPE, STOP]
 SERVICE_TYPE_TO_SCHEMA = {x[0]: x[2] for x in SERVICE_TYPES}
+
+
+def row_metadata(
+    provider: Optional[str],
+    fetch_time: datetime,
+    header_timestamp: Optional[int],
+    static_version: Optional[str],
+) -> Dict[str, Any]:
+    """
+    Columns added to every realtime row besides fetchTime.
+
+    @param provider: Provider name
+    @param fetch_time: Fetch time, aware, in the provider timezone (gives the date)
+    @param header_timestamp: Timestamp of the feed header (Unix time), if any
+    @param static_version: Static version current at fetch time, if any
+    """
+    return {
+        "provider": provider,
+        "date": fetch_time.date(),
+        "feedTimestamp": (
+            datetime.fromtimestamp(header_timestamp, dt_timezone.utc)
+            if header_timestamp
+            else None
+        ),
+        "staticVersion": static_version,
+    }
 
 
 class GtfsRtFetcher:
@@ -186,7 +212,7 @@ class GtfsRtFetcher:
         @param extra: Other values to add to every entity (e.g. feedTimestamp)
         @return List of entities with fetch time added
         """
-        added = {"fetchTime": int(fetch_time.timestamp()), **(extra or {})}
+        added = {"fetchTime": fetch_time.astimezone(dt_timezone.utc), **(extra or {})}
         return [{**entity, **added} for entity in entities]
 
     @classmethod
@@ -250,7 +276,7 @@ class GtfsRtFetcher:
                 parsed_data,
                 service_types,
                 fetch_time,
-                {"feedTimestamp": header_timestamp},
+                row_metadata(None, fetch_time, header_timestamp, None),
             )
         except Exception as e:
             cls.logger.error(

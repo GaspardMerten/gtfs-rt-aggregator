@@ -122,7 +122,16 @@ class TestSkipUnchanged(_FetcherTest):
         service = self._service(ApiConfig(url=URL, services=["VehiclePosition"]))
         self._run(service)
         table = pq.read_table(io.BytesIO(self.storage.get_bytes(self._individual()[0])))
-        self.assertEqual(set(table["feedTimestamp"].to_pylist()), {1742550861})
+        self.assertEqual(
+            {t.timestamp() for t in table["feedTimestamp"].to_pylist()}, {1742550861}
+        )
+        self.assertEqual(
+            table.schema.field("fetchTime").type, pa.timestamp("us", tz="UTC")
+        )
+        self.assertEqual(set(table["provider"].to_pylist()), {"p"})
+        self.assertEqual(len(set(table["date"].to_pylist())), 1)
+        # No unsigned types anywhere (Iceberg has none)
+        self.assertNotIn("uint", str(table.schema))
         self.assertEqual(set(table["staticVersion"].to_pylist()), {None})
         self.assertEqual(table["contentHash"].null_count, 0)
         self.assertEqual(len(set(table["contentHash"].to_pylist())), 3549)

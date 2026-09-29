@@ -14,7 +14,7 @@ import pytz
 from ..aggregator.service import AggregatorService
 from ..config.models import ApiConfig, GtfsRtConfig, ProviderConfig
 from ..fetcher.filter import build_filter
-from ..fetcher.gtfs_rt import GtfsRtFetcher
+from ..fetcher.gtfs_rt import GtfsRtFetcher, row_metadata
 from ..static.service import manifest_tables, read_latest, static_base
 from ..storage.base import StorageInterface
 from ..utils.log_helper import setup_logger
@@ -223,7 +223,9 @@ class FetcherService:
                 GtfsRtFetcher.entities_by_service(entities),
                 service_types,
                 fetch_time,
-                {"feedTimestamp": header_timestamp, "staticVersion": static_version},
+                row_metadata(
+                    provider_name, fetch_time, header_timestamp, static_version
+                ),
             )
             self._store(provider_name, url, result, fetch_time, storage, job_logger)
             # Only once stored: after a failed save, the same content is tried again

@@ -5,8 +5,8 @@ from ..schema.trip_update import trip_descriptor_type
 # TimeRange
 time_range_type = pa.struct(
     [
-        pa.field("start", pa.uint64(), nullable=True),
-        pa.field("end", pa.uint64(), nullable=True),
+        pa.field("start", pa.int64(), nullable=True),
+        pa.field("end", pa.int64(), nullable=True),
     ]
 )
 
@@ -18,7 +18,7 @@ entity_selector_type = pa.struct(
         pa.field("routeType", pa.int32(), nullable=True),
         pa.field("trip", trip_descriptor_type, nullable=True),
         pa.field("stopId", pa.string(), nullable=True),
-        pa.field("directionId", pa.uint32(), nullable=True),
+        pa.field("directionId", pa.int64(), nullable=True),
     ]
 )
 
@@ -54,9 +54,12 @@ translated_image_type = pa.struct(
 alert_schema = pa.schema(
     [
         pa.field("entityId", pa.string(), nullable=False),
-        pa.field("fetchTime", pa.uint64(), nullable=False),
+        pa.field("provider", pa.string(), nullable=True),
+        # Local date of fetchTime, in the provider timezone
+        pa.field("date", pa.date32(), nullable=True),
+        pa.field("fetchTime", pa.timestamp("us", tz="UTC"), nullable=False),
         # Timestamp from the feed header, and static version current at fetch time
-        pa.field("feedTimestamp", pa.uint64(), nullable=True),
+        pa.field("feedTimestamp", pa.timestamp("us", tz="UTC"), nullable=True),
         pa.field("staticVersion", pa.string(), nullable=True),
         # Hash of the entity, to skip unchanged fetches and deduplicate rows
         pa.field("contentHash", pa.string(), nullable=True),

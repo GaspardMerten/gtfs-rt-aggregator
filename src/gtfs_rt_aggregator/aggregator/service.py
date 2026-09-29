@@ -10,6 +10,7 @@ import pytz
 
 from ..aggregator.dedup import deduplicate as deduplicate_rows
 from ..config.models import GtfsRtConfig
+from ..schema.conform import conform
 from ..storage.base import StorageInterface
 from ..utils.log_helper import setup_logger
 from ..utils.file_time import parse_file_time
@@ -323,6 +324,15 @@ class AggregatorService:
 
         error_files = []
 
+        def read(data: bytes) -> pa.Table:
+            # Files from earlier versions get the current schema
+            return conform(
+                pq.read_table(BytesIO(data)),
+                service_type,
+                provider_name,
+                group_time.tzinfo,
+            )
+
         try:
             # Read all files
             table = None
@@ -333,7 +343,7 @@ class AggregatorService:
                 data = storage.read_bytes(file_path)
 
                 if table is None:
-                    table = pq.read_table(BytesIO(data))
+                    table = read(data)
                     if table.num_rows <= 0:
                         logger.warning(
                             f"Empty DataFrame for {provider_name}/{service_type} at {group_time}"
@@ -342,7 +352,7 @@ class AggregatorService:
                 else:
                     try:
                         table = pa.concat_tables(
-                            [table, pq.read_table(BytesIO(data))],
+                            [table, read(data)],
                             # Files from different versions may have different columns
                             promote_options="default",
                         )
@@ -366,7 +376,7 @@ class AggregatorService:
             if storage.file_exists(path):
                 logger.info(f"Adding {len(files)} files to existing {path}")
                 table = pa.concat_tables(
-                    [pq.read_table(BytesIO(storage.read_bytes(path))), table],
+                    [read(storage.read_bytes(path)), table],
                     promote_options="default",
                 )
 
@@ -455,7 +465,13 @@ class AggregatorService:
                     if not parts:
                         continue
                     tables = [
-                        pq.read_table(BytesIO(storage.read_bytes(f))) for f in files
+                        conform(
+                            pq.read_table(BytesIO(storage.read_bytes(f))),
+                            service_type,
+                            provider_name,
+                            tz,
+                        )
+                        for f in files
                     ]
                     table = pa.concat_tables(tables, promote_options="default")
                     if deduplicate:

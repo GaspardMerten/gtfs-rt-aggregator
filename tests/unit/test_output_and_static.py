@@ -222,7 +222,11 @@ class TestCompaction(unittest.TestCase):
         day = pq.read_table(io.BytesIO(storage.get_bytes(f"{folder}/day.parquet")))
         # Sorted by entityId, then fetchTime
         self.assertEqual(day["entityId"].to_pylist(), ["a", "a", "e10", "e9"])
-        self.assertEqual(day["fetchTime"].to_pylist(), [9, 10, 10, 9])
+        # Written as Unix seconds (before 0.6.0): read back as timestamps
+        self.assertEqual(
+            [t.timestamp() for t in day["fetchTime"].to_pylist()], [9, 10, 10, 9]
+        )
+        self.assertEqual(set(day["provider"].to_pylist()), {"nl"})
         # Today is not over: left alone
         self.assertEqual(
             len(

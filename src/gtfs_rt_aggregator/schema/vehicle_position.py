@@ -23,16 +23,19 @@ carriage_details_type = pa.struct(
         pa.field("label", pa.string(), nullable=True),
         pa.field("occupancyStatus", pa.string(), nullable=True),
         pa.field("occupancyPercentage", pa.int32(), nullable=True),
-        pa.field("carriageSequence", pa.uint32(), nullable=True),
+        pa.field("carriageSequence", pa.int64(), nullable=True),
     ]
 )
 
 vehicle_position_schema = pa.schema(
     [
         pa.field("entityId", pa.string(), nullable=False),
-        pa.field("fetchTime", pa.uint64(), nullable=False),
+        pa.field("provider", pa.string(), nullable=True),
+        # Local date of fetchTime, in the provider timezone
+        pa.field("date", pa.date32(), nullable=True),
+        pa.field("fetchTime", pa.timestamp("us", tz="UTC"), nullable=False),
         # Timestamp from the feed header, and static version current at fetch time
-        pa.field("feedTimestamp", pa.uint64(), nullable=True),
+        pa.field("feedTimestamp", pa.timestamp("us", tz="UTC"), nullable=True),
         pa.field("staticVersion", pa.string(), nullable=True),
         # Hash of the entity, to skip unchanged fetches and deduplicate rows
         pa.field("contentHash", pa.string(), nullable=True),
@@ -43,13 +46,13 @@ vehicle_position_schema = pa.schema(
             "vehicle", vehicle_descriptor_type, nullable=True
         ),  # same VehicleDescriptor from above
         pa.field("position", position_type, nullable=True),
-        pa.field("currentStopSequence", pa.uint32(), nullable=True),
+        pa.field("currentStopSequence", pa.int64(), nullable=True),
         pa.field("stopId", pa.string(), nullable=True),
         pa.field("currentStatus", pa.string(), nullable=True),
-        pa.field("timestamp", pa.uint64(), nullable=True),
+        pa.field("timestamp", pa.int64(), nullable=True),
         pa.field("congestionLevel", pa.string(), nullable=True),
         pa.field("occupancyStatus", pa.string(), nullable=True),
-        pa.field("occupancyPercentage", pa.uint32(), nullable=True),
+        pa.field("occupancyPercentage", pa.int64(), nullable=True),
         pa.field(
             "multiCarriageDetails", pa.list_(carriage_details_type), nullable=True
         ),
