@@ -9,6 +9,7 @@ from .static.service import StaticService
 from .storage import create_storage
 from .storage.base import StorageInterface
 from .utils.log_helper import setup_logger
+from .utils.cleanup import clean_stale_temp_files
 from .utils.redact import install_redaction
 from .utils.scheduler import SchedulerClass
 
@@ -76,6 +77,9 @@ class GtfsRtPipeline:
     def start(self):
         """Start the pipeline."""
         self.logger.info("Starting GTFS-RT Pipeline")
+        removed = clean_stale_temp_files()
+        if removed:
+            self.logger.info(f"Removed {removed} stale temporary files or folders")
 
         try:
             # Get schedules from services
@@ -117,6 +121,25 @@ class GtfsRtPipeline:
             self.logger.info("Pipeline stopped successfully")
         except Exception as e:
             self.logger.error(f"Error stopping pipeline: {str(e)}", exc_info=True)
+
+
+def scrub_static_urls(config: GtfsRtConfig) -> int:
+    """
+    Remove query strings (which may hold API keys) from the URLs saved in the
+    static feeds' manifests by versions before 0.5.1. Returns how many files
+    were rewritten.
+    """
+    from .static.service import scrub_urls, static_base
+
+    rewritten = 0
+    for provider in config.providers:
+        storage_config = provider.storage or config.storage
+        storage = create_storage(
+            storage_type=storage_config.type, **storage_config.params
+        )
+        for feed in provider.static:
+            rewritten += scrub_urls(storage, static_base(provider.name, feed.name))
+    return rewritten
 
 
 def run_pipeline(config: GtfsRtConfig):

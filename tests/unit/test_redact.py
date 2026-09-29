@@ -7,12 +7,16 @@ from src.gtfs_rt_aggregator.utils.redact import RedactingFilter, redact
 class TestRedact(unittest.TestCase):
     def test_redact(self):
         self.assertEqual(
-            redact("404 for url: https://x.org/feed?key=SECRET and 'headers': {'k': 'SECRET'}"),
+            redact(
+                "404 for url: https://x.org/feed?key=SECRET and 'headers': {'k': 'SECRET'}"
+            ),
             "404 for url: https://x.org/feed?*** and 'headers': {***}",
         )
 
     def test_filter_on_messages_and_tracebacks(self):
-        record = logging.LogRecord("x", logging.ERROR, "f", 1, "GET %s", ("https://x.org/a?t=SECRET",), None)
+        record = logging.LogRecord(
+            "x", logging.ERROR, "f", 1, "GET %s", ("https://x.org/a?t=SECRET",), None
+        )
         try:
             raise ValueError("https://x.org/b?t=SECRET")
         except ValueError:

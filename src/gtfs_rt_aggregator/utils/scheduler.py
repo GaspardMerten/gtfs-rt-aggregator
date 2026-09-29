@@ -1,11 +1,38 @@
 import logging
 import multiprocessing
+import os
+import signal
+import sys
 import time
 from typing import List, Tuple, Callable, Dict, Any, Optional
 
 import schedule
 
 from ..utils import setup_logger
+
+
+def _peak_memory_mb() -> float:
+    """Peak resident memory of this process, in MB."""
+    import resource
+
+    peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    # Kilobytes on Linux, bytes on macOS
+    return peak / (1024 * 1024 if sys.platform == "darwin" else 1024)
+
+
+def _run_job(func: Callable, label: str, kwargs: Dict[str, Any]):
+    """Job process body: run func, then log how long it took and its peak memory."""
+    start = time.monotonic()
+    try:
+        func(**kwargs)
+    finally:
+        try:
+            logging.getLogger(__name__).info(
+                f"Job done: {label} in {time.monotonic() - start:.1f}s, "
+                f"peak memory {_peak_memory_mb():.0f} MB"
+            )
+        except Exception:
+            pass
 
 
 class SchedulerClass:
@@ -38,12 +65,17 @@ class SchedulerClass:
                 self._run_job_in_process,
                 func=func,
                 job_name=name if exclusive else None,
+                job_label=name,
                 **args,
             )
             self.logger.info(f"Added schedule for {name} every {seconds} seconds")
 
     def _run_job_in_process(
-        self, func: Callable, job_name: Optional[str] = None, **kwargs
+        self,
+        func: Callable,
+        job_name: Optional[str] = None,
+        job_label: Optional[str] = None,
+        **kwargs,
     ):
         """
         Run a job in a separate process.
@@ -51,6 +83,7 @@ class SchedulerClass:
         Args:
             func: Function to run
             job_name: Set for exclusive jobs: skipped while their previous run is alive
+            job_label: Name of the job in logs (kind, provider, feed)
             **kwargs: Arguments to pass to the function
         """
         # Clean up completed processes before starting a new one
@@ -63,7 +96,10 @@ class SchedulerClass:
                 return
 
         # Create a new process for the job
-        process = multiprocessing.Process(target=func, kwargs=kwargs)
+        process = multiprocessing.Process(
+            target=_run_job,
+            args=(func, job_label or getattr(func, "__name__", "job"), kwargs),
+        )
         process.start()
 
         # Add to the list of processes
@@ -96,12 +132,13 @@ class SchedulerClass:
         self._cleanup_processes()
 
     def start(self):
-        """Start the scheduler."""
+        """Start the scheduler. Stops cleanly on Ctrl+C and on SIGTERM."""
         self.running = True
-        # Run every job once right away instead of waiting a full interval
-        # (a static feed checked daily would otherwise first run after a day)
-        self.scheduler.run_all()
+        previous_handler = self._handle_sigterm()
         try:
+            # Run every job once right away instead of waiting a full interval
+            # (a static feed checked daily would otherwise first run after a day)
+            self.scheduler.run_all()
             while self.running:
                 self.tick()
                 time.sleep(1)
@@ -115,6 +152,33 @@ class SchedulerClass:
         except KeyboardInterrupt:
             print("Shutting down scheduler...")
             self.stop()
+        finally:
+            if previous_handler is not None:
+                signal.signal(signal.SIGTERM, previous_handler)
+
+    @staticmethod
+    def _handle_sigterm():
+        """
+        Make SIGTERM (sent by systemd, Docker, Kubernetes...) stop the scheduler
+        like Ctrl+C, so buffered data is written. Job processes forked later
+        inherit the handler: in them, SIGTERM keeps its default effect (exit).
+
+        Returns the previous handler, or None if it could not be changed (not
+        the main thread).
+        """
+        main_pid = os.getpid()
+
+        def handler(signum, frame):
+            if os.getpid() != main_pid:
+                signal.signal(signal.SIGTERM, signal.SIG_DFL)
+                os.kill(os.getpid(), signal.SIGTERM)
+                return
+            raise KeyboardInterrupt
+
+        try:
+            return signal.signal(signal.SIGTERM, handler)
+        except ValueError:
+            return None
 
     def stop(self):
         """Stop the scheduler."""

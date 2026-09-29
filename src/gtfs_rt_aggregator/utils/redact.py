@@ -9,6 +9,11 @@ _URL_QUERY = re.compile(r"(\b[a-z][a-z0-9+.-]*://[^\s?#'\"<>]+)\?[^\s#'\"<>]*", 
 _HEADERS = re.compile(r"('headers':\s*)\{[^{}]*\}")
 
 
+def strip_query(url: str) -> str:
+    """URL without its query string (and fragment), which may hold an API key."""
+    return url.split("?", 1)[0].split("#", 1)[0] if url else url
+
+
 def redact(text: str) -> str:
     """Hide URL query strings and header values in text."""
     return _HEADERS.sub(r"\1{***}", _URL_QUERY.sub(r"\1?***", text))

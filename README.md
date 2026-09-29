@@ -246,6 +246,15 @@ Individual files and static versions are named after their fetch time in UTC (th
 
 A new static version is stored only when a file inside the zip changed. The pipeline first asks the server whether the feed changed since the last check (ETag / Last-Modified), then compares the checksum and size of each file in the zip. A zip rebuilt with the same files is not stored again. Each version is a full copy of the feed (unless `reuse_unchanged_tables` is set: `manifest.json` then gives the path of each table), converted table by table with gtfs-parquet's `convert_gtfs_zip`, so the feed is never fully in memory: the German national feed (a 298 MB zip, 40 million stop times) takes about a minute and 0.5 GB of RAM. Static jobs limit Polars to 4 threads, since its memory grows with the thread count; set `POLARS_MAX_THREADS` to change it. Rows keep the order of the source files. The zip and the converted tables are kept in a temporary folder until uploaded (about 1.5 GB for the German feed): if `/tmp` is in RAM (tmpfs, common in containers), point `TMPDIR` to a disk. If a check is still running when the next one is due, the next one is skipped.
 
+### Upgrading to 0.5.1
+
+- Static manifests (`manifest.json`, `latest.json`) no longer save the query string of the feed's URL, which may hold
+  an API key. To clean manifests written by earlier versions, run once:
+  `gtfs-rt-pipeline configuration.toml --scrub-urls`. If your storage is public, also rotate those keys.
+- SIGTERM (systemd, Docker, Kubernetes) now stops the pipeline like Ctrl+C: buffered data is written before exiting.
+- At startup, temporary folders left by killed jobs are deleted.
+- Each job logs its duration and peak memory when it ends.
+
 ### Upgrading to 0.5.0
 
 - Aggregated files now go to Hive-style folders (`provider=…/service=…/date=…/`). Set `path_template` to keep the old
@@ -282,6 +291,12 @@ Run the pipeline with a configuration file:
 
 ```bash
 gtfs-rt-pipeline configuration.toml
+```
+
+Remove API keys from the URLs saved in static manifests by versions before 0.5.1, then exit:
+
+```bash
+gtfs-rt-pipeline configuration.toml --scrub-urls
 ```
 
 You can adjust the logging level with the `--log-level` parameter:

@@ -19,6 +19,8 @@ from ..storage.base import StorageInterface
 from ..utils.file_time import format_file_time
 from ..utils.http import get_bytes, raise_for_status, with_retries
 from ..utils.log_helper import setup_logger
+from ..utils.cleanup import STATIC_WORK_PREFIX
+from ..utils.redact import strip_query
 
 
 def _version_tuple(version: str) -> Tuple[int, ...]:
@@ -49,6 +51,31 @@ def read_latest(storage: StorageInterface, base: str, logger=None) -> Optional[d
         if logger:
             logger.warning(f"Could not read {path}, ignoring it")
         return None
+
+
+def scrub_urls(storage: StorageInterface, base: str) -> int:
+    """
+    Remove query strings (which may hold API keys) from the URLs saved in the
+    manifests of a static feed, written before 0.5.1. Returns how many files
+    were rewritten.
+    """
+    paths = {
+        p
+        # Backends differ: some match the pattern on the name, others on the path
+        for pattern in ("manifest.json", "*/manifest.json")
+        for p in storage.list_files(base, pattern)
+        if p.endswith("/manifest.json")
+    }
+    if storage.file_exists(f"{base}/latest.json"):
+        paths.add(f"{base}/latest.json")
+    rewritten = 0
+    for path in sorted(paths):
+        manifest = json.loads(storage.read_bytes(path))
+        if manifest.get("url") and strip_query(manifest["url"]) != manifest["url"]:
+            manifest["url"] = strip_query(manifest["url"])
+            storage.save_bytes(json.dumps(manifest, indent=2).encode("utf-8"), path)
+            rewritten += 1
+    return rewritten
 
 
 def manifest_tables(manifest: dict, base: str) -> Dict[str, str]:
@@ -163,13 +190,16 @@ class StaticService:
 
             # Only reuse the cache validators if they belong to the same URL
             request_headers = dict(headers or {})
-            if latest and latest.get("url") == url:
+            # Saved without its query string, which may hold an API key
+            saved_url = strip_query(url)
+            if latest and strip_query(latest.get("url")) == saved_url:
                 if latest.get("etag"):
                     request_headers["If-None-Match"] = latest["etag"]
                 if latest.get("last_modified"):
                     request_headers["If-Modified-Since"] = latest["last_modified"]
 
-            with tempfile.TemporaryDirectory() as tmp:
+            # Named, so that folders left by a killed job can be cleaned up
+            with tempfile.TemporaryDirectory(prefix=STATIC_WORK_PREFIX) as tmp:
                 zip_path = os.path.join(tmp, "feed.zip")
                 validators = with_retries(
                     lambda: self._download(url, request_headers, zip_path),
@@ -189,12 +219,14 @@ class StaticService:
                 if latest and latest.get("files") == files:
                     logger.info(f"{base}: unchanged since {latest.get('version')}")
                     # Keep the validators fresh so the next check can get a 304
-                    if (etag, last_modified, url) != (
+                    if (etag, last_modified, saved_url) != (
                         latest.get("etag"),
                         latest.get("last_modified"),
                         latest.get("url"),
                     ):
-                        latest.update(url=url, etag=etag, last_modified=last_modified)
+                        latest.update(
+                            url=saved_url, etag=etag, last_modified=last_modified
+                        )
                         self._save_json(storage, f"{base}/latest.json", latest)
                     return
 
@@ -222,7 +254,7 @@ class StaticService:
             manifest = {
                 "version": version,
                 "fetched_at": fetch_time.isoformat(),
-                "url": url,
+                "url": saved_url,
                 "etag": etag,
                 "last_modified": last_modified,
                 "files": files,

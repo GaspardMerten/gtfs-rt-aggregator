@@ -3,7 +3,8 @@ import json
 import time
 from datetime import datetime, timezone as dt_timezone
 from io import BytesIO
-from multiprocessing import Manager
+import signal
+from multiprocessing.managers import SyncManager
 from typing import Dict, List, Any, Optional, Tuple
 
 import pyarrow as pa
@@ -23,6 +24,28 @@ from ..utils.serializer import ParquetSerializer
 
 # How long a job reuses the static version found by a previous job
 STATIC_VERSION_TTL_SECONDS = 60
+
+
+def _manager_init():
+    """
+    Runs in the Manager process. systemd sends SIGTERM to every process of the
+    service at once: the Manager must outlive the main process's final flush,
+    which shuts it down. It still ends if the main process dies (Linux).
+    """
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    try:
+        import ctypes
+
+        PR_SET_PDEATHSIG = 1
+        ctypes.CDLL("libc.so.6", use_errno=True).prctl(PR_SET_PDEATHSIG, signal.SIGKILL)
+    except (OSError, AttributeError):
+        pass
+
+
+def _start_manager() -> SyncManager:
+    manager = SyncManager()
+    manager.start(_manager_init)
+    return manager
 
 
 def feed_slug(api: ApiConfig) -> str:
@@ -55,7 +78,7 @@ class FetcherService:
         for provider in config.providers:
             for api in provider.realtime:
                 if self._manager is None:
-                    self._manager = Manager()
+                    self._manager = _start_manager()
                 self._feeds[self._feed_key(provider.name, api.url)] = {
                     "lock": self._manager.Lock(),
                     "state": self._manager.dict(),
