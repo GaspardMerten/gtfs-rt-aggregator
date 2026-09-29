@@ -323,6 +323,8 @@ services = ["TripUpdate", "VehiclePosition"]
 write_version_hint = true                           # lets readers without a catalog find the tables
 expire_snapshots_days = 7
 sync_minutes = 60                                   # how often new compacted days are registered
+# public_base_url = "https://data.example.org"      # optional, see below
+# public_warehouse = "iceberg-public"               # default: <warehouse>-public
 ```
 
 - The day files are registered as they are (no copy): a table adds no storage besides its metadata. A day compacted
@@ -331,8 +333,10 @@ sync_minutes = 60                                   # how often new compacted da
 - The storage settings (MinIO/S3, GCS or filesystem) are reused to read and write the tables. Providers with their own
   storage are not registered.
 - Every week, snapshots older than `expire_snapshots_days` are expired.
-- To register the days compacted before the tables existed (and convert files written before 0.6.0), run once:
-  `gtfs-rt-pipeline configuration.toml --iceberg-backfill`.
+- To register the days stored before the tables existed, run once:
+  `gtfs-rt-pipeline configuration.toml --iceberg-backfill`. It converts files written before 0.6.0, compacts the days
+  older than the 7 the pipeline compacts itself (e.g. days stored before `compact_daily` was on; streaming, one day at
+  a time), then registers every compacted day. It can run next to the pipeline: a day both register is kept once.
 
 Reading without a catalog, from the metadata the tables keep in storage:
 
@@ -345,6 +349,20 @@ SELECT provider, date, count(*) FROM iceberg_scan('s3://my-bucket/iceberg/TripUp
 import polars as pl
 pl.scan_iceberg("s3://my-bucket/iceberg/TripUpdate/metadata/<latest>.metadata.json")
 ```
+
+**Serving the tables over https.** Iceberg metadata holds absolute paths (`s3://bucket/…`). When readers get the files
+from a web host instead (a CDN, or a server checking tokens), set `public_base_url` to the URL under which that host
+serves the storage's objects by key. After each sync, a copy of each table's current metadata is written to
+`public_warehouse`, with every path as `<public_base_url>/<object key>`. The data files are not copied, and the catalog
+keeps the storage paths.
+
+```sql
+-- With a token, if the host needs one: CREATE SECRET (TYPE http, BEARER_TOKEN '...');
+SELECT count(*) FROM iceberg_scan('https://data.example.org/iceberg-public/TripUpdate') WHERE provider = 'be';
+```
+
+`gtfs-rt-pipeline configuration.toml --iceberg-publish` writes the public copy again for every table (e.g. after
+setting `public_base_url` on existing tables, or after changing it).
 
 ### Trip stop events
 
@@ -381,6 +399,13 @@ SELECT route_id, avg(last_arrival_delay) / 60 AS minutes
 FROM read_parquet('out/provider=be/service=TripStopEvent/date=2026-10-24/day.parquet')
 WHERE observed GROUP BY ALL ORDER BY minutes DESC;
 ```
+
+### Upgrading to 0.7.1
+
+- `iceberg.public_base_url`: the tables can also be read over https (see "Iceberg tables"). Installs `fastavro` with
+  the `iceberg` extra.
+- `--iceberg-backfill` also compacts the older days that only have hourly files, and no longer fails when the
+  pipeline registers the same day at the same time.
 
 ### Upgrading to 0.7.0
 
@@ -456,7 +481,8 @@ Run the pipeline with a configuration file:
 gtfs-rt-pipeline configuration.toml
 ```
 
-Register every compacted day in the Iceberg tables (converting files stored before 0.6.0 first), then exit:
+Register every stored day in the Iceberg tables (converting files stored before 0.6.0 and compacting old days first),
+then exit:
 
 ```bash
 gtfs-rt-pipeline configuration.toml --iceberg-backfill
@@ -466,6 +492,12 @@ Build the missing `TripStopEvent` days among the last 30 days, then exit:
 
 ```bash
 gtfs-rt-pipeline configuration.toml --trip-stop-events-backfill 30
+```
+
+Write again the public copy of the Iceberg metadata (`iceberg.public_base_url`), then exit:
+
+```bash
+gtfs-rt-pipeline configuration.toml --iceberg-publish
 ```
 
 Rewrite aggregated files stored before 0.6.0 with the current types, then exit:

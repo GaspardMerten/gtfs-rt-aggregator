@@ -40,6 +40,10 @@ def _fetch_times(path: str) -> set:
 # How long after its end a period is aggregated even without a file from the
 # next period
 PERIOD_GRACE_SECONDS = 300
+# Oldest day looked for when compacting every stored day (20 years)
+MAX_DAYS_BACK = 20 * 366
+# Finished days the pipeline compacts (again if files were added)
+COMPACTION_DAYS_BACK = 7
 
 
 class AggregatorService:
@@ -447,11 +451,13 @@ class AggregatorService:
         service_types: List[str],
         timezone: str,
         deduplicate: bool = False,
-        days_back: int = 7,
+        days_back: Optional[int] = COMPACTION_DAYS_BACK,
+        skip_days: int = 0,
     ):
         """
         Merge the aggregated files of each finished day into one file, sorted by
-        output.sort_by. Looks at the last days_back days before today; a day
+        output.sort_by. Looks at the last days_back days before today (every
+        day stored if None), except the skip_days most recent ones; a day
         compacted earlier is compacted again if files were added to it since.
 
         Args:
@@ -459,7 +465,8 @@ class AggregatorService:
             service_types: Service types to compact
             timezone: Timezone of the provider
             deduplicate: Merge consecutive identical rows (firstSeen / lastSeen)
-            days_back: How many finished days to look at
+            days_back: How many finished days to look at (None: all)
+            skip_days: How many of the most recent finished days to leave
         """
         logger = setup_logger(f"{__name__}.AggregatorService.compact.{provider_name}")
         tz = pytz.timezone(timezone)
@@ -468,7 +475,12 @@ class AggregatorService:
         name = self.config.output.compacted_name
 
         for service_type in service_types:
-            for back in range(1, days_back + 1):
+            last = days_back
+            if last is None:
+                last = self._oldest_day_back(
+                    storage, provider_name, service_type, tz, today
+                )
+            for back in range(skip_days + 1, last + 1):
                 day = today - timedelta(days=back)
                 start = tz.localize(datetime(day.year, day.month, day.day))
                 folder = posixpath.dirname(
@@ -504,6 +516,31 @@ class AggregatorService:
                     )
                 except Exception as e:
                     logger.error(f"Error compacting {folder}: {e}", exc_info=True)
+
+    def _oldest_day_back(self, storage, provider_name, service_type, tz, today) -> int:
+        """How many days before today the oldest stored day folder is (0 if none)."""
+        from .convert import aggregated_root
+
+        root = aggregated_root(self.config, provider_name, service_type)
+        folders = {
+            posixpath.dirname(p)
+            for p in storage.walk_files(root)
+            if p.endswith(".parquet")
+        }
+        oldest = 0
+        # Day folders are found by rendering path_template for each day back
+        for back in range(1, MAX_DAYS_BACK + 1):
+            if not folders:
+                break
+            day = today - timedelta(days=back)
+            start = tz.localize(datetime(day.year, day.month, day.day))
+            folder = posixpath.dirname(
+                self.output_path(provider_name, service_type, start, start)
+            )
+            if folder in folders:
+                folders.discard(folder)
+                oldest = back
+        return oldest
 
     def _compact_day(
         self,

@@ -25,6 +25,11 @@ def main():
         help="Convert files stored before 0.6.0, then register every compacted day in Iceberg, then exit",
     )
     parser.add_argument(
+        "--iceberg-publish",
+        action="store_true",
+        help="Write again the public copy of the Iceberg metadata (iceberg.public_base_url), then exit",
+    )
+    parser.add_argument(
         "--trip-stop-events-backfill",
         type=int,
         metavar="DAYS",
@@ -49,15 +54,24 @@ def main():
         logging.basicConfig(level=args.log_level)
         install_redaction()
         if args.iceberg_backfill:
-            from ..aggregator.convert import convert_old_files
+            from ..aggregator.convert import compact_old_days, convert_old_files
             from ..pipeline import create_storages
             from ..sinks.iceberg import IcebergSink
 
             config = load_config_from_toml(args.toml_path)
             storages = create_storages(config)
             converted = convert_old_files(config, storages)
+            compact_old_days(config, storages)
             registered = IcebergSink(config, storages).sync(days_back=None)
             print(f"Converted {converted} files, registered {registered} days")
+            return
+        if args.iceberg_publish:
+            from ..pipeline import create_storages
+            from ..sinks.iceberg import IcebergSink
+
+            config = load_config_from_toml(args.toml_path)
+            count = IcebergSink(config, create_storages(config)).publish(force=True)
+            print(f"Published {count} tables")
             return
         if args.trip_stop_events_backfill:
             from ..aggregator.trip_stop_service import (

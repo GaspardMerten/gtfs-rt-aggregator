@@ -55,3 +55,26 @@ def convert_old_files(
                     converted += 1
                     logger.info(f"Converted {path} ({table.num_rows} rows)")
     return converted
+
+
+def compact_old_days(
+    config: GtfsRtConfig, storages: Dict[str, StorageInterface]
+) -> None:
+    """
+    Compact the stored days older than the ones the pipeline compacts itself
+    (the last COMPACTION_DAYS_BACK days), e.g. days stored before compact_daily
+    was on. Streams one day at a time, as compact_daily does.
+    """
+    from .service import COMPACTION_DAYS_BACK, AggregatorService
+
+    aggregator = AggregatorService(config, storages)
+    for provider in config.providers:
+        for api in provider.realtime:
+            aggregator.compact_once(
+                provider.name,
+                api.services,
+                provider.timezone,
+                api.deduplicate,
+                days_back=None,
+                skip_days=COMPACTION_DAYS_BACK,
+            )

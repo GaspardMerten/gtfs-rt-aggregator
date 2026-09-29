@@ -513,6 +513,26 @@ class IcebergConfig(BaseModel):
     sync_minutes: int = Field(
         60, gt=0, description="How often new compacted days are registered"
     )
+    public_base_url: Optional[str] = Field(
+        None,
+        pattern=r"^https?://[^?#]+$",
+        description="URL serving the storage's files by path (e.g. https://data.example.org): a copy of the metadata whose paths all use it is kept in public_warehouse",
+    )
+    public_warehouse: Optional[str] = Field(
+        None,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._/-]*$",
+        description="Folder of that public copy (default: <warehouse>-public)",
+    )
+
+    @model_validator(mode="after")
+    def validate_public(self):
+        if self.public_base_url is not None:
+            self.public_base_url = self.public_base_url.rstrip("/")
+            if self.public_warehouse is None:
+                self.public_warehouse = f"{self.warehouse}-public"
+            if self.public_warehouse == self.warehouse:
+                raise ValueError("public_warehouse must differ from warehouse")
+        return self
 
     @field_validator("services")
     @classmethod

@@ -9,3 +9,4 @@ google-cloud-storage
 minio
 gtfs-parquet>=0.6.1
 pyiceberg[pyarrow,sql-sqlite]>=0.9
+fastavro>=1.8

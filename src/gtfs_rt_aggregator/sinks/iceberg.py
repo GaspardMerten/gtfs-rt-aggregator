@@ -7,8 +7,16 @@ they are (add_files: no copy, no rewrite), partitioned by provider and local
 date. A day compacted again (late files) replaces its earlier file in the same
 commit. version-hint.text lets readers without a catalog find the latest
 metadata, e.g. DuckDB: iceberg_scan('s3://bucket/iceberg/TripUpdate').
+
+With public_base_url, a copy of each table's current metadata (metadata.json,
+manifest lists, manifests) is kept in public_warehouse with every path
+rewritten to <public_base_url>/<object key>, so readers only ever see that
+host: iceberg_scan('https://data.example.org/iceberg-public/TripUpdate'). The
+catalog and PyIceberg keep using the storage paths.
 """
 
+import io
+import json
 import logging
 import posixpath
 import warnings
@@ -24,6 +32,9 @@ from ..config.models import GtfsRtConfig, StorageConfig
 from ..storage.base import StorageInterface
 
 logger = logging.getLogger(__name__)
+
+# Commits tried when another process commits to the same table meanwhile
+COMMIT_ATTEMPTS = 3
 
 
 def _io_properties(storage: StorageConfig) -> Dict[str, str]:
@@ -77,17 +88,21 @@ class IcebergSink:
 
     def _table(self, service: str, schema):
         """The service's table, created from the first file registered."""
-        from pyiceberg.exceptions import NoSuchTableError
+        from pyiceberg.exceptions import NoSuchTableError, TableAlreadyExistsError
 
         identifier = f"{self.settings.namespace}.{service}"
         try:
             return self.catalog.load_table(identifier)
         except NoSuchTableError:
-            table = self.catalog.create_table(
-                identifier,
-                schema=schema,
-                location=self.storage.uri(f"{self.settings.warehouse}/{service}"),
-            )
+            try:
+                table = self.catalog.create_table(
+                    identifier,
+                    schema=schema,
+                    location=self.storage.uri(f"{self.settings.warehouse}/{service}"),
+                )
+            except TableAlreadyExistsError:
+                # Created by another process meanwhile
+                return self.catalog.load_table(identifier)
             with table.update_spec() as spec:
                 spec.add_identity("provider")
                 spec.add_identity("date")
@@ -141,6 +156,10 @@ class IcebergSink:
                         registered += 1
             if table is not None and self.settings.write_version_hint:
                 self._write_version_hint(service, table)
+            if self.settings.public_base_url:
+                table = table or self._existing_table(service)
+                if table is not None:
+                    self._publish(service, table)
         return registered
 
     def _stores(self, provider, service: str) -> bool:
@@ -207,19 +226,50 @@ class IcebergSink:
             raise ValueError(f"{path} holds {len(dates)} dates, expected one")
         day = dates[0].as_py().isoformat()
 
+        from pyiceberg import exceptions
+
+        # ValidationException: "Added data files were found matching the
+        # filter" (PyIceberg 0.10+ checks concurrent commits itself)
+        conflicts = tuple(
+            getattr(exceptions, name)
+            for name in ("CommitFailedException", "ValidationException")
+            if hasattr(exceptions, name)
+        )
+
         if table is None:
             table = self._table(service, schema.remove_metadata())
-        with table.transaction() as transaction:
-            # A new column (newer version of this package): add it to the table
-            with transaction.update_schema() as update:
-                update.union_by_name(schema.remove_metadata())
-            with warnings.catch_warnings():
-                # "did not match any records": the day's first registration
-                warnings.simplefilter("ignore")
-                transaction.delete(
-                    And(EqualTo("provider", provider), EqualTo("date", day))
+        size = self.storage.file_size(path)
+        for attempt in range(COMMIT_ATTEMPTS):
+            try:
+                with table.transaction() as transaction:
+                    # A new column (newer version of this package): add it
+                    with transaction.update_schema() as update:
+                        update.union_by_name(schema.remove_metadata())
+                    with warnings.catch_warnings():
+                        # "did not match any records": the day's first registration
+                        warnings.simplefilter("ignore")
+                        transaction.delete(
+                            And(EqualTo("provider", provider), EqualTo("date", day))
+                        )
+                    transaction.add_files([uri])
+                break
+            except conflicts:
+                # Another process committed first (e.g. --iceberg-backfill next
+                # to the pipeline): done if it registered this very file
+                table.refresh()
+                files = (
+                    table.inspect.files()
+                    .select(["file_path", "file_size_in_bytes"])
+                    .to_pydict()
                 )
-            transaction.add_files([uri])
+                if (
+                    dict(zip(files["file_path"], files["file_size_in_bytes"])).get(uri)
+                    == size
+                ):
+                    return table, False
+                if attempt == COMMIT_ATTEMPTS - 1:
+                    raise
+                logger.info(f"Iceberg: concurrent commit on {service}, retrying")
         logger.info(f"Iceberg: registered {service} {provider} {day}")
         return table, True
 
@@ -248,6 +298,128 @@ class IcebergSink:
             table.maintenance.expire_snapshots().older_than(older_than).commit()
             if self.settings.write_version_hint:
                 self._write_version_hint(service, table)
+            if self.settings.public_base_url:
+                self._publish(service, table)
             logger.info(
                 f"Iceberg: expired snapshots of {service} older than {older_than}"
             )
+
+    # Public copy -------------------------------------------------------------------
+
+    def publish(self, force: bool = False) -> int:
+        """Write the public copy of every table's metadata. Returns the tables published."""
+        if not self.settings.public_base_url:
+            raise ValueError("Set iceberg.public_base_url to publish the tables")
+        published = 0
+        for service in self.settings.services:
+            table = self._existing_table(service)
+            if table is not None:
+                published += self._publish(service, table, force)
+        return published
+
+    def _publish(self, service: str, table, force: bool = False) -> bool:
+        """
+        Copy the table's current metadata to the public folder with public
+        paths. Manifests and manifest lists never change once written: only
+        the new ones are copied. Public metadata files no longer used are
+        deleted. Returns whether a new version was published.
+        """
+        import fastavro
+
+        table.refresh()
+        storage = self.storage
+        root = storage.uri("x")[:-1]  # storage URI of the empty path
+        location = table.metadata.location.rstrip("/")
+        public_folder = f"{self.settings.public_warehouse}/{service}"
+        public_location = f"{self.settings.public_base_url}/{public_folder}"
+
+        def key(uri: str) -> str:
+            if not uri.startswith(root):
+                raise ValueError(f"{uri} is not in the storage ({root})")
+            return uri[len(root) :]
+
+        def public_key(uri: str) -> str:
+            """Where the public copy of a metadata file goes."""
+            return public_folder + uri[len(location) :]
+
+        def rewrite(value):
+            if isinstance(value, str):
+                if value == location or value.startswith(location + "/"):
+                    return public_location + value[len(location) :]
+                if value.startswith(root):
+                    return f"{self.settings.public_base_url}/{value[len(root):]}"
+                return value
+            if isinstance(value, dict):
+                return {k: rewrite(v) for k, v in value.items()}
+            if isinstance(value, list):
+                return [rewrite(v) for v in value]
+            return value
+
+        def copy_avro(uri: str, change=None) -> int:
+            """Rewrite an Avro metadata file to its public copy; returns its size."""
+            reader = fastavro.reader(io.BytesIO(storage.read_bytes(key(uri))))
+            schema = json.loads(reader.metadata["avro.schema"])
+            records = [rewrite(record) for record in reader]
+            if change:
+                records = [change(record) for record in records]
+            out = io.BytesIO()
+            fastavro.writer(
+                out,
+                schema,
+                records,
+                codec=reader.codec,
+                metadata={
+                    k: v
+                    for k, v in reader.metadata.items()
+                    if not k.startswith("avro.")
+                },
+            )
+            storage.save_bytes(out.getvalue(), public_key(uri))
+            return len(out.getvalue())
+
+        metadata_uri = table.metadata_location
+        target = public_key(metadata_uri)
+        if storage.file_exists(target) and not force:
+            return False
+        metadata = json.loads(storage.read_bytes(key(metadata_uri)))
+        kept = {target}
+        for snapshot in metadata.get("snapshots", []):
+            manifest_list = snapshot["manifest-list"]
+            kept.add(public_key(manifest_list))
+            if storage.file_exists(public_key(manifest_list)) and not force:
+                reader = fastavro.reader(
+                    io.BytesIO(storage.read_bytes(public_key(manifest_list)))
+                )
+                kept.update(
+                    public_key(location + r["manifest_path"][len(public_location) :])
+                    for r in reader
+                )
+                continue
+            sizes = {}
+            reader = fastavro.reader(io.BytesIO(storage.read_bytes(key(manifest_list))))
+            for record in reader:
+                manifest = record["manifest_path"]
+                kept.add(public_key(manifest))
+                if storage.file_exists(public_key(manifest)) and not force:
+                    sizes[manifest] = storage.file_size(public_key(manifest))
+                else:
+                    sizes[manifest] = copy_avro(manifest)
+            lengths = {rewrite(path): size for path, size in sizes.items()}
+            copy_avro(
+                manifest_list,
+                lambda r: {**r, "manifest_length": lengths[r["manifest_path"]]},
+            )
+        public = rewrite(metadata)
+        # Earlier metadata files are not copied
+        public["metadata-log"] = []
+        storage.save_bytes(json.dumps(public).encode(), target)
+        name = posixpath.basename(target).removesuffix(".metadata.json")
+        storage.save_bytes(name.encode(), f"{public_folder}/metadata/version-hint.text")
+        kept.add(f"{public_folder}/metadata/version-hint.text")
+
+        folder = f"{public_folder}/metadata"
+        for path in storage.list_files(folder):
+            if posixpath.dirname(path) == folder and path not in kept:
+                storage.delete_file(path)
+        logger.info(f"Iceberg: published {service} to {public_location}")
+        return True
