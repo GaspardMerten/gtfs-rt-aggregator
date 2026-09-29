@@ -1,4 +1,6 @@
+import os
 import posixpath
+import tempfile
 from datetime import datetime, timedelta
 from io import BytesIO
 from typing import Dict, List, Any, Optional, Tuple
@@ -8,6 +10,7 @@ import pyarrow.compute as pc
 import pyarrow.parquet as pq
 import pytz
 
+from ..aggregator.compaction import compact_files
 from ..aggregator.dedup import deduplicate as deduplicate_rows
 from ..config.models import GtfsRtConfig
 from ..schema.conform import conform
@@ -15,6 +18,24 @@ from ..storage.base import StorageInterface
 from ..utils.log_helper import setup_logger
 from ..utils.file_time import parse_file_time
 from ..utils.serializer import ParquetSerializer
+
+TIMESTAMP = pa.timestamp("us", tz="UTC")
+
+
+def _fetch_times(path: str) -> set:
+    """Every fetch time found in a file (fetchTime, firstSeen, lastSeen)."""
+    times = set()
+    names = [
+        c
+        for c in ("fetchTime", "firstSeen", "lastSeen")
+        if c in pq.read_schema(path).names
+    ]
+    for batch in pq.ParquetFile(path).iter_batches(columns=names, batch_size=262_144):
+        for name in names:
+            times.update(pc.unique(batch.column(name)).to_pylist())
+    times.discard(None)
+    return times
+
 
 # How long after its end a period is aggregated even without a file from the
 # next period
@@ -464,37 +485,81 @@ class AggregatorService:
                     parts = [f for f in files if posixpath.basename(f) != name]
                     if not parts:
                         continue
-                    tables = [
-                        conform(
-                            pq.read_table(BytesIO(storage.read_bytes(f))),
-                            service_type,
-                            provider_name,
-                            tz,
-                        )
-                        for f in files
-                    ]
-                    table = pa.concat_tables(tables, promote_options="default")
-                    if deduplicate:
-                        table = deduplicate_rows(table)
-                    sort_keys = [
-                        (c, "ascending")
-                        for c in self.config.output.sort_by
-                        if c in table.column_names
-                    ]
-                    if sort_keys:
-                        table = table.take(pc.sort_indices(table, sort_keys=sort_keys))
-                    storage.save_bytes(
-                        ParquetSerializer.pyarrow_table_to_bytes(table), compacted
+                    rows = self._compact_day(
+                        storage,
+                        files,
+                        name,
+                        compacted,
+                        service_type,
+                        provider_name,
+                        tz,
+                        deduplicate,
                     )
                     for f in parts:
                         if storage.delete_file(f) is False:
                             # Left in place, it would be counted twice next time
                             logger.error(f"Could not delete compacted file {f}")
                     logger.info(
-                        f"Compacted {len(parts)} files into {compacted} ({table.num_rows} rows)"
+                        f"Compacted {len(parts)} files into {compacted} ({rows} rows)"
                     )
                 except Exception as e:
                     logger.error(f"Error compacting {folder}: {e}", exc_info=True)
+
+    def _compact_day(
+        self,
+        storage,
+        files,
+        name,
+        compacted,
+        service_type,
+        provider_name,
+        tz,
+        deduplicate,
+    ) -> int:
+        """
+        Merge a day's files into one sorted file, streaming (see compaction.py):
+        memory stays around one hourly file, whatever the size of the day.
+        """
+        with tempfile.TemporaryDirectory(prefix="gtfs_rt_aggregator-compact-") as tmp:
+            local_paths, presorted, times = [], [], set()
+            for index, path in enumerate(files):
+                local = os.path.join(tmp, f"in-{index}.parquet")
+                storage.read_to_file(path, local)
+                current = pq.read_schema(local).field("fetchTime").type == TIMESTAMP
+                if posixpath.basename(path) == name and current:
+                    # A day compacted since 0.6.0: already sorted and conformed
+                    presorted.append(True)
+                else:
+                    table = conform(
+                        pq.read_table(local), service_type, provider_name, tz
+                    )
+                    if deduplicate:
+                        table = deduplicate_rows(table)
+                    pq.write_table(table, local, compression="lz4")
+                    del table
+                    presorted.append(False)
+                local_paths.append(local)
+                if deduplicate:
+                    times.update(_fetch_times(local))
+
+            schema = pa.unify_schemas(
+                [pq.read_schema(p) for p in local_paths], promote_options="permissive"
+            )
+            if deduplicate:
+                keys = ["entityId", "firstSeen"]
+            else:
+                keys = [c for c in self.config.output.sort_by if c in schema.names]
+            output = os.path.join(tmp, "out.parquet")
+            rows = compact_files(
+                local_paths,
+                presorted,
+                keys,
+                output,
+                deduplicate_rows=deduplicate,
+                times=pa.array(sorted(times), TIMESTAMP) if deduplicate else None,
+            )
+            storage.save_file(output, compacted)
+            return rows
 
     def _extract_datetime_from_filename(
         self, filename: str, timezone: Optional[pytz.BaseTzInfo] = None

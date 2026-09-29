@@ -38,6 +38,15 @@ class StorageInterface(ABC):
         with open(local_path, "rb") as f:
             return self.save_bytes(f.read(), path)
 
+    def read_to_file(self, path: str, local_path: str):
+        """
+        Download a file from storage to a local file.
+
+        Backends override this to download without reading the file in memory.
+        """
+        with open(local_path, "wb") as f:
+            f.write(self.read_bytes(path))
+
     @abstractmethod
     def read_bytes(self, path: str) -> bytes:
         """

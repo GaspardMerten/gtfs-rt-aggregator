@@ -69,6 +69,9 @@ class FileSystemStorage(StorageInterface):
                 os.remove(tmp_path)
             raise
 
+    def read_to_file(self, path: str, local_path: str):
+        shutil.copyfile(self._get_full_path(path), local_path)
+
     def read_bytes(self, path: str) -> bytes:
         """Read binary data from the file system."""
         self.logger.debug(f"Reading data from {path}")

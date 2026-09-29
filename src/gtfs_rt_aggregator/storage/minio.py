@@ -87,6 +87,14 @@ class MinioStorage(StorageInterface):
         )
         return path
 
+    def read_to_file(self, path: str, local_path: str):
+        """Download to a local file without reading it in memory."""
+        self.client.fget_object(
+            bucket_name=self.bucket_name,
+            object_name=self._get_object_name(path),
+            file_path=local_path,
+        )
+
     def read_bytes(self, path: str) -> bytes:
         """Read binary data from MinIO storage."""
         self.logger.debug(f"Reading data from {path}")

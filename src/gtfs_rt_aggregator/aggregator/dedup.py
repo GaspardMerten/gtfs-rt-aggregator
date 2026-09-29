@@ -1,8 +1,10 @@
+from typing import Optional
+
 import pyarrow as pa
 import pyarrow.compute as pc
 
 
-def deduplicate(table: pa.Table) -> pa.Table:
+def deduplicate(table: pa.Table, times: Optional[pa.Array] = None) -> pa.Table:
     """
     Merge consecutive rows of the same entity with the same content.
 
@@ -15,6 +17,9 @@ def deduplicate(table: pa.Table) -> pa.Table:
     be merged again with new rows.
 
     Rows without contentHash (written before 0.5.0) are kept as they are.
+
+    times: every fetch time to consider for gaps, when the table is only part
+    of the data (streaming compaction); by default, those found in the table.
     """
     # New rows (no firstSeen / lastSeen yet, or null after being concatenated
     # with a deduplicated file) were seen once, at fetchTime
@@ -40,15 +45,16 @@ def deduplicate(table: pa.Table) -> pa.Table:
 
     # Every fetch time present in the table, in order: an entity missing from
     # a fetch between two of its rows ends its run there
-    times = pc.unique(
-        pa.chunked_array(
-            [
-                table["fetchTime"].combine_chunks(),
-                table["firstSeen"].combine_chunks(),
-                table["lastSeen"].combine_chunks(),
-            ]
+    if times is None:
+        times = pc.unique(
+            pa.chunked_array(
+                [
+                    table["fetchTime"].combine_chunks(),
+                    table["firstSeen"].combine_chunks(),
+                    table["lastSeen"].combine_chunks(),
+                ]
+            )
         )
-    )
     times = pc.take(times, pc.sort_indices(times))
     first_rank = pc.index_in(table["firstSeen"].chunk(0), value_set=times)
     last_rank = pc.index_in(table["lastSeen"].chunk(0), value_set=times)

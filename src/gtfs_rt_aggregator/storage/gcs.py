@@ -47,6 +47,10 @@ class GoogleCloudStorage(StorageInterface):
         self.bucket.blob(blob_path).upload_from_filename(local_path)
         return f"gs://{self.bucket_name}/{blob_path}"
 
+    def read_to_file(self, path: str, local_path: str):
+        """Download to a local file without reading it in memory."""
+        self.bucket.blob(self._get_full_path(path)).download_to_filename(local_path)
+
     def read_bytes(self, path: str) -> bytes:
         """Read binary data from Google Cloud Storage."""
         try:
