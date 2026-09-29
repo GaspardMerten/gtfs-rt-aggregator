@@ -409,6 +409,7 @@ class TestKeepUnmatchedAdded(unittest.TestCase):
             {"T-rail"},
             known_routes={"rail", "bus"},
             keep_unmatched_added=True,
+            known_trips={"T-rail", "T-bus"},
         )
         cases = [
             ("ADDED", "", True),  # route unknown: kept
@@ -424,8 +425,15 @@ class TestKeepUnmatchedAdded(unittest.TestCase):
                     entity_filter.keep(self._entity(relationship, route)), expected
                 )
 
+        # A duplicated trip points at a static trip: a bus trip is dropped
+        self.assertFalse(entity_filter.keep(self._entity("DUPLICATED", "", "T-bus")))
+
         without = EntityFilter({2}, {"rail"}, set(), known_routes={"rail"})
         self.assertFalse(without.keep(self._entity("ADDED", "")))
+
+    def test_needs_a_route_filter(self):
+        with self.assertRaises(ValueError):
+            FilterConfig(trip_ids=["T1"], keep_unmatched_added=True)
 
 
 class TestArrowBuilder(unittest.TestCase):
@@ -481,3 +489,49 @@ class TestArrowBuilder(unittest.TestCase):
         row = table.to_pylist()[0]
         self.assertEqual(row["selectedTrips"], [{"tripIds": ["T1"], "shapeId": "S1"}])
         self.assertEqual(row["modifications"][0]["lastModifiedTime"], 1742550861)
+
+
+class TestOddValues(unittest.TestCase):
+    def test_severity_and_huge_timestamps(self):
+        from datetime import datetime
+
+        import pytz
+        from google.transit import gtfs_realtime_pb2
+
+        from src.gtfs_rt_aggregator.fetcher.gtfs_rt import row_metadata
+
+        message = gtfs_realtime_pb2.FeedMessage()
+        message.header.gtfs_realtime_version = "2.0"
+        message.header.timestamp = 2**63 + 5
+        alert = message.entity.add(id="a").alert
+        alert.severity_level = gtfs_realtime_pb2.Alert.SeverityLevel.Value("WARNING")
+        vehicle = message.entity.add(id="v").vehicle
+        vehicle.timestamp = 2**63 + 5
+        vehicle.trip.trip_id = "T"
+        entities = list(message.entity)
+        now = datetime.now(pytz.UTC)
+        meta = row_metadata("p", now, message.header.timestamp, None)
+        self.assertIsNone(meta["feedTimestamp"])
+        tables = GtfsRtFetcher.build_tables(
+            entities,
+            [GtfsRtFetcher.entity_hash(e) for e in entities],
+            ["Alert", "VehiclePosition"],
+            now,
+            meta,
+        )
+        self.assertEqual(tables["Alert"]["severityLevel"].to_pylist(), ["WARNING"])
+        self.assertEqual(tables["VehiclePosition"]["timestamp"].to_pylist(), [None])
+
+    def test_conform_huge_legacy_values(self):
+        from src.gtfs_rt_aggregator.schema.conform import conform
+
+        legacy = pa.table(
+            {
+                "entityId": ["a", "b"],
+                "fetchTime": pa.array([1742550861, 2**63 + 5], pa.uint64()),
+                "timestamp": pa.array([1, 2**63 + 5], pa.uint64()),
+            }
+        )
+        table = conform(legacy, "VehiclePosition", "p")
+        self.assertEqual(table["fetchTime"].null_count, 1)
+        self.assertEqual(table.schema.field("timestamp").type, pa.int64())

@@ -16,7 +16,7 @@ from ..storage.base import StorageInterface
 
 # Changed when the resolution changes (2: route_type no longer truncated by
 # gtfs-parquet < 0.6.1), so earlier cached results are not reused
-CACHE_FORMAT = 3
+CACHE_FORMAT = 4
 
 # Trips that are not in the static timetable by nature
 _ADDED = {
@@ -42,12 +42,15 @@ class EntityFilter:
         trips: Set[str],
         known_routes: Optional[Set[str]] = None,
         keep_unmatched_added: bool = False,
+        known_trips: Optional[Set[str]] = None,
     ):
         self.route_types = route_types
         self.routes = routes - {""}
         self.trips = trips - {""}
         # Every route of the static feed, to tell unknown routes from unwanted ones
         self.known_routes = (known_routes or set()) - {""}
+        # Every trip of the static feed: a DUPLICATED trip points at one
+        self.known_trips = (known_trips or set()) - {""}
         self.keep_unmatched_added = keep_unmatched_added
 
     def keep(self, entity) -> bool:
@@ -81,6 +84,7 @@ class EntityFilter:
             self.keep_unmatched_added
             and trip.schedule_relationship in _ADDED
             and trip.route_id not in self.known_routes
+            and trip.trip_id not in self.known_trips
         )
 
 
@@ -102,21 +106,18 @@ def build_filter(
     """
     route_types = config.route_type_set()
     if not config.needs_static:
-        return EntityFilter(
-            route_types,
-            set(),
-            set(config.trip_ids),
-            keep_unmatched_added=config.keep_unmatched_added,
-        )
+        return EntityFilter(route_types, set(), set(config.trip_ids))
     if not tables or "routes" not in tables or "trips" not in tables:
         return None
 
-    # Resolved once per static version and filter, then read from local disk:
-    # each fetch runs in its own process
-    # CACHE_FORMAT changes when resolution changes, so old results are not reused
+    # Resolved once per static version and filter, kept in this process, and on
+    # local disk for the other workers. CACHE_FORMAT changes when resolution
+    # changes, so old results are not reused.
     digest = hashlib.sha1(
         f"{CACHE_FORMAT}|{cache_key}|{config.model_dump_json()}".encode()
     ).hexdigest()
+    if digest in _MEMO:
+        return _MEMO[digest]
     # Per user: files other users can write must not decide what is filtered
     cache = os.path.join(
         tempfile.gettempdir(), f"gtfs_rt_aggregator-{_user()}", f"filter-{digest}.json"
@@ -124,36 +125,48 @@ def build_filter(
     try:
         with open(cache) as f:
             cached = json.load(f)
-        return EntityFilter(
-            route_types,
+        resolved = (
             set(cached["routes"]),
             set(cached["trips"]),
             set(cached["known_routes"]),
-            config.keep_unmatched_added,
+            set(cached["known_trips"]),
         )
     except (OSError, ValueError, KeyError):
-        pass
-
-    routes, trips, known_routes = _resolve(config, route_types, storage, tables)
-    try:
-        os.makedirs(os.path.dirname(cache), mode=0o700, exist_ok=True)
-        tmp = f"{cache}.tmp-{os.getpid()}"
-        with open(tmp, "w") as f:
-            json.dump(
-                {
-                    "routes": sorted(routes),
-                    "trips": sorted(trips),
-                    "known_routes": sorted(known_routes),
-                },
-                f,
-            )
-        os.replace(tmp, cache)
-    except OSError:
-        # Only a cache (e.g. the folder belongs to another user)
-        pass
-    return EntityFilter(
-        route_types, routes, trips, known_routes, config.keep_unmatched_added
+        resolved = _resolve(config, route_types, storage, tables)
+        try:
+            os.makedirs(os.path.dirname(cache), mode=0o700, exist_ok=True)
+            tmp = f"{cache}.tmp-{os.getpid()}"
+            with open(tmp, "w") as f:
+                json.dump(
+                    dict(
+                        zip(
+                            ("routes", "trips", "known_routes", "known_trips"),
+                            (sorted(values) for values in resolved),
+                        )
+                    ),
+                    f,
+                )
+            os.replace(tmp, cache)
+        except OSError:
+            # Only a cache (e.g. the folder belongs to another user)
+            pass
+    routes, trips, known_routes, known_trips = resolved
+    entity_filter = EntityFilter(
+        route_types,
+        routes,
+        trips,
+        known_routes,
+        config.keep_unmatched_added,
+        known_trips,
     )
+    if len(_MEMO) >= 16:
+        _MEMO.pop(next(iter(_MEMO)))
+    _MEMO[digest] = entity_filter
+    return entity_filter
+
+
+# Filters of this process, by digest (a worker processes many fetches)
+_MEMO: Dict[str, EntityFilter] = {}
 
 
 def _user() -> str:
@@ -170,7 +183,7 @@ def _resolve(
     route_types: Set[int],
     storage: StorageInterface,
     tables: Dict[str, str],
-) -> Tuple[Set[str], Set[str], Set[str]]:
+) -> Tuple[Set[str], Set[str], Set[str], Set[str]]:
     """Route ids and trip ids to keep, and all route ids, from the static
     routes and trips tables."""
     routes_table = pq.read_table(
@@ -196,4 +209,10 @@ def _resolve(
     trips = set(config.trip_ids)
     trips.update(trips_table.filter(mask)["trip_id"].to_pylist())
     known_routes = set(routes_table["route_id"].cast(pa.string()).to_pylist())
-    return routes, trips, known_routes
+    # Only needed (and large: millions on national feeds) for keep_unmatched_added
+    known_trips = (
+        set(trips_table["trip_id"].cast(pa.string()).to_pylist())
+        if config.keep_unmatched_added
+        else set()
+    )
+    return routes, trips, known_routes, known_trips

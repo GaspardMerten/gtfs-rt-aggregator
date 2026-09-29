@@ -87,6 +87,15 @@ class FilterConfig(BaseModel):
                 types.update(range(int(low), int(high) + 1))
         return types
 
+    @model_validator(mode="after")
+    def validate_keep_unmatched_added(self):
+        if self.keep_unmatched_added and not (self.route_types or self.route_ids):
+            raise ValueError(
+                "keep_unmatched_added only applies with route_types or route_ids "
+                "(it keeps added trips whose route cannot be resolved)"
+            )
+        return self
+
     @property
     def needs_static(self) -> bool:
         # Route ids and types are matched through the static trips and routes

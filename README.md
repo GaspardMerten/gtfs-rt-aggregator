@@ -142,7 +142,8 @@ base_path = "gtfs-feeds"  # Optional: subfolder within the bucket
     `<TMPDIR>/gtfs_rt_aggregator-spool`). Use a persistent disk: what is in it survives restarts.
   - **spool_max_gb**: Past this size, feeds stop being fetched, lowest `priority` first (default `10`)
   - **fetch_threads**: Downloads running at the same time (default `16`)
-  - **workers**: Worker processes; `"auto"` is the number of CPUs minus one, at least 1 (default `"auto"`)
+  - **workers**: Worker processes; `"auto"` is the number of CPUs this process may use (container limits and CPU
+    affinity included) minus one, at least 1 (default `"auto"`)
   - **heavy_slots**: Worker processes for memory-heavy work: fetches larger than `heavy_threshold_mb`, static feeds,
     aggregation and compaction (default `1`)
   - **heavy_threshold_mb**: Fetches larger than this go to the heavy workers (default `8`)
@@ -160,8 +161,9 @@ base_path = "gtfs-feeds"  # Optional: subfolder within the bucket
     the provider's timezone, with `strftime` formats). Default:
     `"provider={provider}/service={service}/date={start:%Y-%m-%d}/{start:%H-%M-%S}_to_{end:%H-%M-%S}.parquet"`
   - **compact_daily**: Merge the aggregated files of each finished day into one file (default `false`). Runs at
-    startup, then every 24 hours, on the last 7 days. Needs one folder per day in `path_template`. Streams: memory
-    stays around one hourly file, whatever the size of the day.
+    startup, then every 24 hours, on the last 7 days. Needs one folder per day in `path_template`. Streams: files
+    are sorted one at a time, then merged in batches. A day of 7.2 million rows (24 hourly files) peaks around 0.9 GB,
+    against 3.5 GB when sorted in memory.
   - **compacted_name**: Name of that file, in the day's folder (default `"day.parquet"`)
   - **sort_by**: Columns the compacted file is sorted by (default `["entityId", "fetchTime"]`)
 
@@ -233,8 +235,9 @@ is a new row. Fetches skipped as unchanged are not counted, so `lastSeen` is the
 - `route_types`: GTFS route types, as numbers or ranges, e.g. `[2, "100-199"]` for rail
 - `route_ids`: route ids
 - `trip_ids`: trip ids
-- `keep_unmatched_added`: also keep ADDED, NEW and DUPLICATED trips whose route cannot be resolved (no route id, or a
-  route unknown to the static feed): added trips are not in the static timetable (default `false`)
+- `keep_unmatched_added`: also keep ADDED, NEW and DUPLICATED trips whose route cannot be found in the static feed.
+  Such trips are not in the timetable, so a route filter would otherwise drop them (default `false`; needs
+  `route_types` or `route_ids`)
 
 Realtime entities often carry only a trip id, so `route_types` and `route_ids` are resolved through the trips and
 routes of the provider's latest static version (checked once a minute, every 5 seconds until the first version is stored): the provider needs a
@@ -256,11 +259,11 @@ scheduler ─▶ fetch threads ─▶ spool/incoming ─▶ worker processes ─
 ```
 
 - **Fetch threads** only download, streaming each fetch to a file in the spool (`runtime.spool_dir`): a fetch is
-  never held in memory and never waits for processing. A fetch identical, byte for byte, to the previous one is
-  dropped right away.
+  never held in memory and never waits for processing. With `skip_unchanged` (the default), a fetch identical, byte
+  for byte, to the previous one is dropped right away.
 - **Worker processes** (a fixed pool, `runtime.workers`) parse, filter and convert each fetch to Parquet, one at a time
   per feed and in fetch order. Memory-heavy work goes to a separate pool (`runtime.heavy_slots`, 1 by default): large
-  fetches, static feeds, aggregation and compaction, so they never run side by side. Each static feed is converted in a
+  fetches, static feeds, aggregation and compaction: with the default `heavy_slots = 1`, two of them never run at once. Each static feed is converted in a
   new process, which gives all its memory back when done.
 - **The upload thread** moves results to storage, and checks they arrived. While storage is down, results wait on
   disk.
@@ -310,8 +313,11 @@ A new static version is stored only when a file inside the zip changed. The pipe
     seconds. Times inside the entities (e.g. a vehicle's `timestamp`) stay Unix seconds, as in GTFS-RT.
   - Unsigned integer columns are now signed 64-bit integers.
   - Every row has `provider` and `date` (the local date of `fetchTime`) columns.
-  Files written by earlier versions keep their types; the aggregator converts them when it reads them, so old and
-  new files are merged into the new types.
+  - Alerts' `severityLevel` is the enum name (e.g. `WARNING`), like other enums: alerts with a severity used to fail.
+
+  Files already stored keep their old types; only the files the aggregator rewrites are converted. DuckDB, Polars and
+  other engines cannot read old and new files as one table, so convert the old ones once:
+  `gtfs-rt-pipeline configuration.toml --convert-old-files` (each file is read whole).
 - `accumulate_minutes` blocks live on disk in the spool instead of in memory; `accumulate_concatenate` is ignored.
 - `FetcherService.run_once` stores each fetch right away (no accumulation); the runtime does the rest.
 - New options: `[runtime]`, `[raw]`, per-feed `priority`, and `filter.keep_unmatched_added`.
@@ -361,6 +367,12 @@ Run the pipeline with a configuration file:
 
 ```bash
 gtfs-rt-pipeline configuration.toml
+```
+
+Rewrite aggregated files stored before 0.6.0 with the current types, then exit:
+
+```bash
+gtfs-rt-pipeline configuration.toml --convert-old-files
 ```
 
 Remove API keys from the URLs saved in static manifests by versions before 0.5.1, then exit:

@@ -10,7 +10,7 @@ import pyarrow.compute as pc
 import pyarrow.parquet as pq
 import pytz
 
-from ..aggregator.compaction import compact_files
+from ..aggregator.compaction import compact_files, sorted_by, write_sorted
 from ..aggregator.dedup import deduplicate as deduplicate_rows
 from ..config.models import GtfsRtConfig
 from ..schema.conform import conform
@@ -521,38 +521,44 @@ class AggregatorService:
         memory stays around one hourly file, whatever the size of the day.
         """
         with tempfile.TemporaryDirectory(prefix="gtfs_rt_aggregator-compact-") as tmp:
-            local_paths, presorted, times = [], [], set()
+            downloaded = []
             for index, path in enumerate(files):
                 local = os.path.join(tmp, f"in-{index}.parquet")
                 storage.read_to_file(path, local)
-                current = pq.read_schema(local).field("fetchTime").type == TIMESTAMP
-                if posixpath.basename(path) == name and current:
-                    # A day compacted since 0.6.0: already sorted and conformed
-                    presorted.append(True)
+                downloaded.append((path, local))
+
+            if deduplicate:
+                keys = ["entityId", "firstSeen"]
+            else:
+                # Sort columns present in every file
+                names = [set(pq.read_schema(local).names) for _, local in downloaded]
+                keys = [
+                    c for c in self.config.output.sort_by if all(c in n for n in names)
+                ]
+
+            sorted_paths, times = [], set()
+            for index, (path, local) in enumerate(downloaded):
+                if posixpath.basename(path) == name and sorted_by(local) == keys:
+                    # Compacted since 0.6.0 with the same settings: already sorted
+                    sorted_paths.append(local)
                 else:
+                    # One file in memory at a time
                     table = conform(
                         pq.read_table(local), service_type, provider_name, tz
                     )
                     if deduplicate:
                         table = deduplicate_rows(table)
-                    pq.write_table(table, local, compression="lz4")
+                    prepared = os.path.join(tmp, f"sorted-{index}.parquet")
+                    write_sorted(table, keys, prepared)
                     del table
-                    presorted.append(False)
-                local_paths.append(local)
+                    os.remove(local)
+                    sorted_paths.append(prepared)
                 if deduplicate:
-                    times.update(_fetch_times(local))
+                    times.update(_fetch_times(sorted_paths[-1]))
 
-            schema = pa.unify_schemas(
-                [pq.read_schema(p) for p in local_paths], promote_options="permissive"
-            )
-            if deduplicate:
-                keys = ["entityId", "firstSeen"]
-            else:
-                keys = [c for c in self.config.output.sort_by if c in schema.names]
             output = os.path.join(tmp, "out.parquet")
             rows = compact_files(
-                local_paths,
-                presorted,
+                sorted_paths,
                 keys,
                 output,
                 deduplicate_rows=deduplicate,

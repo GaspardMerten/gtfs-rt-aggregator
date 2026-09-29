@@ -38,6 +38,10 @@ class StorageInterface(ABC):
         with open(local_path, "rb") as f:
             return self.save_bytes(f.read(), path)
 
+    def walk_files(self, directory: str) -> List[str]:
+        """Every file under directory, subfolders included."""
+        return self.list_files(directory)
+
     def read_to_file(self, path: str, local_path: str):
         """
         Download a file from storage to a local file.

@@ -11,6 +11,7 @@ import pytz
 # Metadata times: timestamps since 0.6.0, Unix seconds (uint64) before
 TIME_COLUMNS = ("fetchTime", "feedTimestamp", "firstSeen", "lastSeen")
 TIMESTAMP = pa.timestamp("us", tz="UTC")
+_MAX_SECONDS = (2**63 - 1) // 1_000_000
 
 
 @lru_cache(maxsize=None)
@@ -45,7 +46,12 @@ def conform(
         if name in table.column_names and pa.types.is_integer(
             table.schema.field(name).type
         ):
-            seconds = pc.cast(table[name], pa.int64())
+            column = table[name]
+            # Beyond what microseconds hold: nonsense, kept as null
+            valid = pc.less_equal(column, pa.scalar(_MAX_SECONDS, column.type))
+            seconds = pc.cast(
+                pc.if_else(valid, column, pa.scalar(None, column.type)), pa.int64()
+            )
             values = pc.cast(pc.cast(seconds, pa.timestamp("s", tz="UTC")), TIMESTAMP)
             table = table.set_column(table.schema.get_field_index(name), name, values)
 
@@ -55,9 +61,13 @@ def conform(
                 current = table.schema.field(field.name).type
                 if current != field.type:
                     index = table.schema.get_field_index(field.name)
-                    table = table.set_column(
-                        index, field.name, pc.cast(table[field.name], field.type)
-                    )
+                    try:
+                        values = pc.cast(table[field.name], field.type)
+                    except pa.ArrowInvalid:
+                        # e.g. an unsigned value over 2^63 somewhere in a nested
+                        # column: such values are nonsense, don't fail the file
+                        values = pc.cast(table[field.name], field.type, safe=False)
+                    table = table.set_column(index, field.name, values)
 
     if "provider" not in table.column_names and provider is not None:
         table = table.append_column(

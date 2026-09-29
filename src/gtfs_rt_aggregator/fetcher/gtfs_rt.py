@@ -67,14 +67,18 @@ def row_metadata(
     @param header_timestamp: Timestamp of the feed header (Unix time), if any
     @param static_version: Static version current at fetch time, if any
     """
-    return {
-        "provider": provider,
-        "date": fetch_time.date(),
-        "feedTimestamp": (
+    try:
+        feed_timestamp = (
             datetime.fromtimestamp(header_timestamp, dt_timezone.utc)
             if header_timestamp
             else None
-        ),
+        )
+    except (OverflowError, OSError, ValueError):
+        feed_timestamp = None  # a header time out of any sensible range
+    return {
+        "provider": provider,
+        "date": fetch_time.date(),
+        "feedTimestamp": feed_timestamp,
         "staticVersion": static_version,
     }
 

@@ -373,3 +373,40 @@ class TestStaticSources(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestConvertOldFiles(unittest.TestCase):
+    def test_convert(self):
+        import os
+        import tempfile
+
+        from src.gtfs_rt_aggregator.aggregator.convert import convert_old_files
+        from src.gtfs_rt_aggregator.storage.filesystem import FileSystemStorage
+
+        with tempfile.TemporaryDirectory() as tmp:
+            storage = FileSystemStorage(tmp)
+            config = GtfsRtConfig(
+                storage=StorageConfig(
+                    type="filesystem", params={"base_directory": tmp}
+                ),
+                providers=[
+                    ProviderConfig(
+                        name="nl",
+                        realtime=[ApiConfig(url="u", services=["VehiclePosition"])],
+                    )
+                ],
+            )
+            old = _rows(["a"], ["h"], [1742550861])
+            buffer = io.BytesIO()
+            pq.write_table(old, buffer)
+            path = "provider=nl/service=VehiclePosition/date=2025-03-21/09-00-00_to_10-00-00.parquet"
+            storage.save_bytes(buffer.getvalue(), path)
+
+            self.assertEqual(convert_old_files(config, {"global": storage}), 1)
+            table = pq.read_table(os.path.join(tmp, path))
+            self.assertEqual(
+                table.schema.field("fetchTime").type, pa.timestamp("us", tz="UTC")
+            )
+            self.assertEqual(table["provider"].to_pylist(), ["nl"])
+            # Already converted: left alone
+            self.assertEqual(convert_old_files(config, {"global": storage}), 0)

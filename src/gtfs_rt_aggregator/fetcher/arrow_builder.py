@@ -40,6 +40,10 @@ def _read(name: str) -> str:
     return f"getattr(message, {name!r})"
 
 
+_UNSIGNED_64 = (FieldDescriptor.TYPE_UINT64, FieldDescriptor.TYPE_FIXED64)
+_INT64_MAX = 2**63 - 1
+
+
 class _Leaf:
     """A scalar column."""
 
@@ -51,6 +55,9 @@ class _Leaf:
         if proto_field is not None and proto_field.type == FieldDescriptor.TYPE_ENUM:
             names = {v.number: v.name for v in proto_field.enum_type.values}
             self.add = lambda number: append(names.get(number, number))
+        elif proto_field is not None and proto_field.type in _UNSIGNED_64:
+            # Stored signed (no unsigned types): out-of-range values are nonsense
+            self.add = lambda value: append(value if value <= _INT64_MAX else None)
         else:
             self.add = append
 

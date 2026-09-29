@@ -69,6 +69,14 @@ class FileSystemStorage(StorageInterface):
                 os.remove(tmp_path)
             raise
 
+    def walk_files(self, directory: str) -> List[str]:
+        root = Path(self.base_directory).resolve()
+        found = []
+        for dirpath, _, filenames in os.walk(self._get_full_path(directory)):
+            for name in filenames:
+                found.append(str(Path(dirpath, name).resolve().relative_to(root)))
+        return sorted(found)
+
     def read_to_file(self, path: str, local_path: str):
         shutil.copyfile(self._get_full_path(path), local_path)
 

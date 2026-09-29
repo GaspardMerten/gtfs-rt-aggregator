@@ -75,7 +75,8 @@ alert_schema = pa.schema(
         pa.field("ttsHeaderText", translated_string_type, nullable=True),
         pa.field("ttsDescriptionText", translated_string_type, nullable=True),
         # severity_level is an enum => int32
-        pa.field("severityLevel", pa.int32(), nullable=True),
+        # Enum name (e.g. WARNING), like the other enums
+        pa.field("severityLevel", pa.string(), nullable=True),
         pa.field("image", translated_image_type, nullable=True),
         pa.field("imageAlternativeText", translated_string_type, nullable=True),
         pa.field("causeDetail", translated_string_type, nullable=True),
