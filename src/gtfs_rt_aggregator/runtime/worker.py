@@ -268,6 +268,21 @@ def compact(**kwargs) -> Dict:
 
 
 @_timed
+def iceberg_sync(days_back: Optional[int] = 7) -> Dict:
+    from ..sinks.iceberg import IcebergSink
+
+    return {"registered": IcebergSink(_ctx().config, _ctx().storages).sync(days_back)}
+
+
+@_timed
+def iceberg_maintain() -> Dict:
+    from ..sinks.iceberg import IcebergSink
+
+    IcebergSink(_ctx().config, _ctx().storages).maintain()
+    return {}
+
+
+@_timed
 def bundle_raw(folder: str, provider_name: str, storage_path: str) -> Dict:
     """
     Bundle the raw fetches of one feed and hour (.pb + .json) into a

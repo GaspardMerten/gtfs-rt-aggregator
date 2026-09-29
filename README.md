@@ -303,6 +303,51 @@ Individual files and static versions are named after their fetch time in UTC (th
 
 A new static version is stored only when a file inside the zip changed. The pipeline first asks the server whether the feed changed since the last check (ETag / Last-Modified), then compares the checksum and size of each file in the zip. A zip rebuilt with the same files is not stored again. Each version is a full copy of the feed (unless `reuse_unchanged_tables` is set: `manifest.json` then gives the path of each table), converted table by table with gtfs-parquet's `convert_gtfs_zip`, so the feed is never fully in memory: the German national feed (a 298 MB zip, 40 million stop times) takes about a minute and 0.5 GB of RAM. Static jobs limit Polars to 4 threads, since its memory grows with the thread count; set `POLARS_MAX_THREADS` to change it. Rows keep the order of the source files. The zip and the converted tables are kept in a temporary folder until uploaded (about 1.5 GB for the German feed): if `/tmp` is in RAM (tmpfs, common in containers), point `TMPDIR` to a disk. If a check is still running when the next one is due, the next one is skipped.
 
+### Iceberg tables (optional)
+
+With `pip install "gtfs-rt-aggregator[iceberg]"` and an `[iceberg]` section, the compacted days are also exposed as
+Iceberg tables, one per service type, readable by DuckDB, Polars, Spark or Trino:
+
+```toml
+[output]
+compact_daily = true  # required: the tables are made of the compacted days
+
+[iceberg]
+catalog = "sql"                                     # "sql" (a SQLite file, no service) or "rest"
+catalog_uri = "sqlite:////var/lib/gtfs/iceberg.db"  # or the REST catalog URL
+warehouse = "iceberg"                               # folder of the tables in the global storage
+namespace = "archive"
+services = ["TripUpdate", "VehiclePosition"]
+write_version_hint = true                           # lets readers without a catalog find the tables
+expire_snapshots_days = 7
+sync_minutes = 60                                   # how often new compacted days are registered
+```
+
+- The day files are registered as they are (no copy): a table adds no storage besides its metadata. A day compacted
+  again (late files) replaces its earlier file in the same commit.
+- Tables are partitioned by `provider` and `date` (the local date, as the files are).
+- The storage settings (MinIO/S3, GCS or filesystem) are reused to read and write the tables. Providers with their own
+  storage are not registered.
+- Every week, snapshots older than `expire_snapshots_days` are expired.
+- To register the days compacted before the tables existed (and convert files written before 0.6.0), run once:
+  `gtfs-rt-pipeline configuration.toml --iceberg-backfill`.
+
+Reading without a catalog, from the metadata the tables keep in storage:
+
+```sql
+INSTALL iceberg; LOAD iceberg;
+SELECT provider, date, count(*) FROM iceberg_scan('s3://my-bucket/iceberg/TripUpdate') GROUP BY ALL;
+```
+
+```python
+import polars as pl
+pl.scan_iceberg("s3://my-bucket/iceberg/TripUpdate/metadata/<latest>.metadata.json")
+```
+
+### Upgrading to 0.6.1
+
+- Optional Iceberg tables (see above), with the `iceberg` extra.
+
 ### Upgrading to 0.6.0
 
 - The pipeline runs with a disk spool, a fixed pool of worker processes and an upload thread, instead of one process
@@ -369,6 +414,12 @@ Run the pipeline with a configuration file:
 gtfs-rt-pipeline configuration.toml
 ```
 
+Register every compacted day in the Iceberg tables (converting files stored before 0.6.0 first), then exit:
+
+```bash
+gtfs-rt-pipeline configuration.toml --iceberg-backfill
+```
+
 Rewrite aggregated files stored before 0.6.0 with the current types, then exit:
 
 ```bash
@@ -416,6 +467,7 @@ src/gtfs_rt_aggregator/
   ├── __init__.py                # Package initialization
   ├── pipeline.py                # Main pipeline implementation
   ├── runtime/                   # Spool, fetch threads, worker processes, upload thread
+  ├── sinks/                     # Optional Iceberg tables
   ├── aggregator/                # Aggregation functionality
   ├── config/                    # Configuration loading and validation
   ├── fetcher/                   # GTFS-RT data fetching functionality

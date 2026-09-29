@@ -471,6 +471,50 @@ class RawConfig(BaseModel):
     )
 
 
+class IcebergConfig(BaseModel):
+    """Optional Iceberg tables over the compacted days (extra: iceberg)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    catalog: str = Field(
+        "sql",
+        pattern="^(sql|rest)$",
+        description='"sql" (SQLite file, no service) or "rest" (Lakekeeper, Polaris, Nessie...)',
+    )
+    catalog_uri: str = Field(
+        ..., description="sqlite:////path/catalog.db, or the REST catalog URL"
+    )
+    warehouse: str = Field(
+        "iceberg",
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._/-]*$",
+        description="Folder of the tables in the global storage",
+    )
+    namespace: str = Field("archive", pattern=r"^[A-Za-z0-9_]+$")
+    services: List[str] = Field(
+        default_factory=lambda: ["TripUpdate", "VehiclePosition"],
+        description="One table per service type",
+    )
+    write_version_hint: bool = Field(
+        True,
+        description="Write metadata/version-hint.text, so readers without a catalog find the latest metadata",
+    )
+    expire_snapshots_days: int = Field(
+        7, ge=1, description="Snapshots older than this are expired (weekly)"
+    )
+    sync_minutes: int = Field(
+        60, gt=0, description="How often new compacted days are registered"
+    )
+
+    @field_validator("services")
+    @classmethod
+    def validate_services(cls, v):
+        valid = {"VehiclePosition", "TripUpdate", "Alert", "TripModifications"}
+        invalid = sorted(set(v) - valid)
+        if invalid:
+            raise ValueError(f"Invalid Iceberg services: {', '.join(invalid)}")
+        return v
+
+
 class GtfsRtConfig(BaseModel):
     """Main configuration for the GTFS-RT fetcher and aggregator."""
 
@@ -480,6 +524,9 @@ class GtfsRtConfig(BaseModel):
         default_factory=RuntimeConfig, description="How the pipeline runs"
     )
     raw: RawConfig = Field(default_factory=RawConfig, description="Raw archive")
+    iceberg: Optional[IcebergConfig] = Field(
+        None, description="Iceberg tables over the compacted days"
+    )
     output: OutputConfig = Field(
         default_factory=OutputConfig, description="Output configuration"
     )
@@ -494,6 +541,21 @@ class GtfsRtConfig(BaseModel):
         if duplicates:
             raise ValueError(f"Provider names must be unique: {', '.join(duplicates)}")
         return providers
+
+    @model_validator(mode="after")
+    def validate_iceberg(self):
+        if self.iceberg is not None:
+            if not self.output.compact_daily:
+                raise ValueError(
+                    "[iceberg] registers compacted days: set compact_daily = true in [output]"
+                )
+            import importlib.util
+
+            if importlib.util.find_spec("pyiceberg") is None:
+                raise ValueError(
+                    "[iceberg] needs PyIceberg: pip install 'gtfs_rt_aggregator[iceberg]'"
+                )
+        return self
 
     def get_provider_storage(self, provider_name: str) -> StorageConfig:
         """

@@ -38,6 +38,14 @@ class StorageInterface(ABC):
         with open(local_path, "rb") as f:
             return self.save_bytes(f.read(), path)
 
+    def uri(self, path: str) -> str:
+        """URI of a file for other readers (e.g. Iceberg): file://, s3://, gs://."""
+        raise NotImplementedError(f"{self.__class__.__name__} has no URI for its files")
+
+    def file_size(self, path: str) -> int:
+        """Size of a stored file, in bytes."""
+        return len(self.read_bytes(path))
+
     def walk_files(self, directory: str) -> List[str]:
         """Every file under directory, subfolders included."""
         return self.list_files(directory)

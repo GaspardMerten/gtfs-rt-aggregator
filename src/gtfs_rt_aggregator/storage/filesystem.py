@@ -69,6 +69,14 @@ class FileSystemStorage(StorageInterface):
                 os.remove(tmp_path)
             raise
 
+    def uri(self, path: str) -> str:
+        # Not Path.as_uri(): it escapes "=" (Hive folders), which readers
+        # such as PyIceberg then look for literally
+        return "file://" + str(Path(self._get_full_path(path)).resolve())
+
+    def file_size(self, path: str) -> int:
+        return os.path.getsize(self._get_full_path(path))
+
     def walk_files(self, directory: str) -> List[str]:
         root = Path(self.base_directory).resolve()
         found = []

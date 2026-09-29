@@ -87,6 +87,14 @@ class MinioStorage(StorageInterface):
         )
         return path
 
+    def uri(self, path: str) -> str:
+        return f"s3://{self.bucket_name}/{self._get_object_name(path)}"
+
+    def file_size(self, path: str) -> int:
+        return self.client.stat_object(
+            self.bucket_name, self._get_object_name(path)
+        ).size
+
     def read_to_file(self, path: str, local_path: str):
         """Download to a local file without reading it in memory."""
         self.client.fget_object(

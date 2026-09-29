@@ -287,6 +287,20 @@ class Runtime:
                 ),
             )
 
+        if self.config.iceberg is not None:
+            add(
+                "Iceberg sync",
+                self.config.iceberg.sync_minutes * 60,
+                lambda: self._queue_heavy("iceberg_sync", "Iceberg sync", {}),
+            )
+            add(
+                "Iceberg maintenance",
+                7 * 24 * 3600,
+                lambda: self._queue_heavy(
+                    "iceberg_maintain", "Iceberg maintenance", {}
+                ),
+            )
+
         # Housekeeping, in this thread: cheap
         self._jobs += [
             Job("windows", WINDOWS_EVERY_SECONDS, self._close_windows, now),
@@ -508,7 +522,11 @@ class Runtime:
                 break
         while free["heavy"] > 0 and self._heavy_queue:
             task = self._heavy_queue.pop(0)
-            function = worker.compact if task.kind == "compact" else worker.aggregate
+            function = {
+                "compact": worker.compact,
+                "iceberg_sync": worker.iceberg_sync,
+                "iceberg_maintain": worker.iceberg_maintain,
+            }.get(task.kind, worker.aggregate)
             self._submit(task, function, **task.info)
             free["heavy"] -= 1
 

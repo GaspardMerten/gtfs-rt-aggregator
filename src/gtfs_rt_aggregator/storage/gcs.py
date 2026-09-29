@@ -47,6 +47,12 @@ class GoogleCloudStorage(StorageInterface):
         self.bucket.blob(blob_path).upload_from_filename(local_path)
         return f"gs://{self.bucket_name}/{blob_path}"
 
+    def uri(self, path: str) -> str:
+        return f"gs://{self.bucket_name}/{self._get_full_path(path)}"
+
+    def file_size(self, path: str) -> int:
+        return self.bucket.get_blob(self._get_full_path(path)).size
+
     def read_to_file(self, path: str, local_path: str):
         """Download to a local file without reading it in memory."""
         self.bucket.blob(self._get_full_path(path)).download_to_filename(local_path)

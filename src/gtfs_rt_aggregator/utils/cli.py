@@ -20,6 +20,11 @@ def main():
         "--log-level", type=str, default="INFO", help="Logging level (default: INFO)"
     )
     parser.add_argument(
+        "--iceberg-backfill",
+        action="store_true",
+        help="Convert files stored before 0.6.0, then register every compacted day in Iceberg, then exit",
+    )
+    parser.add_argument(
         "--convert-old-files",
         action="store_true",
         help="Rewrite aggregated files stored before 0.6.0 with the current types, then exit",
@@ -37,6 +42,17 @@ def main():
     try:
         logging.basicConfig(level=args.log_level)
         install_redaction()
+        if args.iceberg_backfill:
+            from ..aggregator.convert import convert_old_files
+            from ..pipeline import create_storages
+            from ..sinks.iceberg import IcebergSink
+
+            config = load_config_from_toml(args.toml_path)
+            storages = create_storages(config)
+            converted = convert_old_files(config, storages)
+            registered = IcebergSink(config, storages).sync(days_back=None)
+            print(f"Converted {converted} files, registered {registered} days")
+            return
         if args.convert_old_files:
             from ..aggregator.convert import convert_old_files
             from ..pipeline import create_storages
