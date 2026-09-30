@@ -11,6 +11,15 @@ from pydantic import (
 )
 
 
+def _check_source(url, adapter, what: str):
+    if bool(url) == bool(adapter):
+        raise ValueError(f"{what} needs either url or adapter")
+    if adapter:
+        from ..adapters import parse_spec
+
+        parse_spec(adapter)
+
+
 class _Model(BaseModel):
     # Validation errors would print the values, which can be secrets (API
     # keys in URLs and headers, storage credentials)
@@ -119,7 +128,11 @@ class ApiConfig(_Model):
     # Catch typos such as refresh_second instead of silently using the default
     model_config = ConfigDict(extra="forbid")
 
-    url: str = Field(..., description="URL of the GTFS-RT feed")
+    url: Optional[str] = Field(None, description="URL of the GTFS-RT feed")
+    adapter: Optional[str] = Field(
+        None,
+        description="Instead of url: Python function giving each fetch, 'path/to/file.py:function' (relative to the config file) or 'module:function' (see gtfs_rt_aggregator.adapters)",
+    )
     services: List[str] = Field(
         ...,
         description="List of service types to fetch (VehiclePosition, TripUpdate, Alert, TripModifications)",
@@ -182,6 +195,16 @@ class ApiConfig(_Model):
         return values
 
     @model_validator(mode="after")
+    def validate_source(self):
+        _check_source(self.url, self.adapter, "A realtime feed")
+        return self
+
+    @property
+    def source(self) -> str:
+        """The feed's URL (without query string, which may hold a key) or adapter."""
+        return strip_query(self.url) if self.url else f"adapter {self.adapter}"
+
+    @model_validator(mode="after")
     def validate_accumulate_minutes(self):
         # Windows are aligned on minutes since midnight, and must never span two
         # aggregation periods
@@ -217,6 +240,10 @@ class StaticConfig(_Model):
     model_config = ConfigDict(extra="forbid")
 
     url: Optional[str] = Field(None, description="URL of the GTFS zip")
+    adapter: Optional[str] = Field(
+        None,
+        description="Instead of url: Python function building the GTFS, 'path/to/file.py:function' or 'module:function' (see gtfs_rt_aggregator.adapters)",
+    )
     index_url: Optional[str] = Field(
         None,
         description="Page listing the GTFS zip, for feeds whose URL changes (with url_pattern)",
@@ -248,9 +275,16 @@ class StaticConfig(_Model):
 
     @model_validator(mode="after")
     def validate_source(self):
+        if self.adapter is not None:
+            if self.url or self.index_url or self.url_pattern:
+                raise ValueError(
+                    "A static feed needs one of url, index_url or adapter, not several"
+                )
+            _check_source(None, self.adapter, "A static feed")
+            return self
         if bool(self.url) == bool(self.index_url):
             raise ValueError(
-                "A static feed needs either url, or index_url and url_pattern"
+                "A static feed needs either url, index_url and url_pattern, or adapter"
             )
         if self.index_url and not self.url_pattern:
             raise ValueError("index_url needs a url_pattern")
@@ -327,7 +361,7 @@ class ProviderConfig(_Model):
             raise ValueError(
                 f"Static feed names of provider {self.name} cannot be a realtime service type: {sorted(services & set(names))}"
             )
-        urls = [api.url for api in self.realtime]
+        urls = [api.url or api.adapter for api in self.realtime]
         if len(urls) != len(set(urls)):
             raise ValueError(f"Provider {self.name} lists the same realtime feed twice")
         # Feeds sharing a service write to the same files, aggregated together
@@ -341,11 +375,11 @@ class ProviderConfig(_Model):
         for api in self.realtime:
             if api.static is not None and api.static not in names:
                 raise ValueError(
-                    f"Realtime feed {strip_query(api.url)} of provider {self.name} refers to static feed {api.static!r}, which is not defined"
+                    f"Realtime feed {api.source} of provider {self.name} refers to static feed {api.static!r}, which is not defined"
                 )
             if api.filter and api.filter.needs_static and self.static_for(api) is None:
                 raise ValueError(
-                    f"The route filter of {strip_query(api.url)} needs a static feed in provider {self.name}"
+                    f"The route filter of {api.source} needs a static feed in provider {self.name}"
                     + (
                         ' (several are defined: set static = "<name>")'
                         if self.static
@@ -615,6 +649,10 @@ class GtfsRtConfig(_Model):
     )
     output: OutputConfig = Field(
         default_factory=OutputConfig, description="Output configuration"
+    )
+    base_dir: Optional[str] = Field(
+        None,
+        description="Folder relative adapter paths start from: the configuration file's (set by the loader; the working directory if None)",
     )
 
     @field_validator("providers")

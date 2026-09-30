@@ -1,3 +1,4 @@
+import copy
 import json
 from datetime import datetime
 from typing import Dict, List, Any, Optional, Tuple
@@ -48,7 +49,8 @@ class FetcherService:
 
     def _find(self, provider_name: str, url: str) -> Tuple[ProviderConfig, ApiConfig]:
         provider = next(p for p in self.config.providers if p.name == provider_name)
-        api = next(a for a in provider.realtime if a.url == url)
+        # url: the feed's URL, or its adapter spec
+        api = next(a for a in provider.realtime if url in (a.url, a.adapter))
         return provider, api
 
     def run_once(
@@ -76,7 +78,17 @@ class FetcherService:
         status = {"last_attempt": fetch_time.isoformat()}
 
         try:
-            data = GtfsRtFetcher.fetch_feed(url, headers, api.retries)
+            if api.adapter:
+                from .. import adapters
+
+                adapter_state = copy.deepcopy(state.get("adapter", {}))
+                data = adapters.fetch_realtime(
+                    api.adapter, self.config.base_dir, adapter_state
+                )
+                # Kept in memory only: the runtime keeps it across restarts
+                state["adapter"] = adapter_state
+            else:
+                data = GtfsRtFetcher.fetch_feed(url, headers, api.retries)
             try:
                 result = process_payload(
                     data,
@@ -137,7 +149,7 @@ class FetcherService:
             merged = {**state.get("status", {}), **status}
             state["status"] = merged
             document = {
-                "url": api.url.split("?")[0],
+                "url": api.source,
                 "services": api.services,
                 **merged,
             }
@@ -146,7 +158,7 @@ class FetcherService:
                 f"{provider_name}/_status/{feed_slug(api)}.json",
             )
         except Exception as e:
-            logger.warning(f"Could not write the status of {redact(api.url)}: {e}")
+            logger.warning(f"Could not write the status of {api.source}: {e}")
 
     def _get_storage_for_provider(self, provider_name: str) -> StorageInterface:
         """

@@ -119,6 +119,7 @@ A provider needs at least one realtime or static feed.
 | Key | Default | Meaning |
 |---|---|---|
 | `url` | required | Feed URL. |
+| `adapter` | | Instead of `url`: a Python function that returns each fetch. See [Adapters](#adapters). |
 | `services` | required | Any of `VehiclePosition`, `TripUpdate`, `Alert`, `TripModifications`. |
 | `refresh_seconds` | `60` | How often to fetch. |
 | `frequency_minutes` | `60` | Length of an aggregation period. |
@@ -167,6 +168,7 @@ Needs the `static` extra. A new version is stored only when a file inside the zi
 |---|---|---|
 | `url` | | URL of the GTFS zip. |
 | `index_url`, `url_pattern` | | Instead of `url`, for feeds published under a new URL for each version. The page at `index_url` (HTML or JSON) is read and the greatest link matching the regex `url_pattern` is downloaded. |
+| `adapter` | | Instead of `url`: a Python function that builds the GTFS. See [Adapters](#adapters). |
 | `check_minutes` | `60` | How often to check for a new version. |
 | `name` | `"static"` | Folder the versions are stored in. Only needed if the provider has several static feeds. |
 | `headers` | none | HTTP headers. |
@@ -182,6 +184,34 @@ check_minutes = 1440
 
 Static conversion writes temporary files (about 1.5 GB for a large national feed). If `/tmp` is in RAM, set `TMPDIR`
 to a folder on disk.
+
+### Adapters
+
+For a source that is not a GTFS-RT or GTFS URL, such as a JSON API, write a Python function and name it with `adapter`
+instead of `url`: `"path/to/file.py:function"` (relative to the configuration file) or `"module:function"`.
+
+```toml
+[[providers.realtime]]
+adapter = "adapters/trafikverket.py:fetch"
+services = ["TripUpdate"]
+refresh_seconds = 30
+
+[[providers.static]]
+adapter = "adapters/trafikverket.py:timetable"
+check_minutes = 1440
+```
+
+```python
+def fetch(state: dict, env) -> FeedMessage | bytes: ...          # one poll, as GTFS-RT
+def timetable(state: dict, env, out_dir: Path) -> Path: ...     # a GTFS zip or folder, written in out_dir
+```
+
+What they return is handled like a download: filter, deduplication, versions, and so on. `state` is the adapter's
+own dict (JSON values only). It is kept between calls and across restarts, and saved only after a call that succeeds.
+Use it for things like a change id. `env` is `os.environ`, for API keys. Adapters run in the worker processes, and a
+file is loaded again when it changes. An adapter that raises counts as a failed fetch, and it is called again at the
+next refresh. `feedId` is computed from the `adapter` text as written. After a restart, a static adapter is not
+called again before `check_minutes` if a version is already stored.
 
 ### `[output]`
 

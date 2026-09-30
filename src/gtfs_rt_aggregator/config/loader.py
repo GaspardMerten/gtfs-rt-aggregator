@@ -34,10 +34,12 @@ def load_config_from_toml(toml_path: Union[str, Path]) -> GtfsRtConfig:
     try:
         with open(toml_path, "rb") as f:
             config = load_config_from_toml_file(f)
-            logger.info(
-                f"Successfully loaded configuration with {len(config.providers)} providers"
-            )
-            return config
+        # Relative adapter paths start from the configuration file's folder
+        config.base_dir = str(Path(toml_path).resolve().parent)
+        logger.info(
+            f"Successfully loaded configuration with {len(config.providers)} providers"
+        )
+        return config
     except FileNotFoundError:
         logger.error(f"Configuration file not found: {toml_path}")
         raise
@@ -223,28 +225,18 @@ def _convert_toml_to_config(config_dict: Dict[str, Any]) -> GtfsRtConfig:
         apis = []
 
         for api_dict in apis_list:
-            url = api_dict.get("url")
-            if not url:
-                logger.error(
-                    f"Missing required field: provider.realtime.url for provider {name}"
-                )
+            source = strip_query(api_dict.get("url")) or api_dict.get("adapter")
+            if not source:
                 raise ValueError(
-                    f"Missing required field: provider.realtime.url for provider {name}"
+                    f"Missing required field: provider.realtime.url (or adapter) for provider {name}"
                 )
-
-            services = api_dict.get("services", [])
-            if not services:
-                logger.error(
-                    f"Missing required field: provider.realtime.services for provider {name} and URL {strip_query(url)}"
-                )
+            if not api_dict.get("services"):
                 raise ValueError(
-                    f"Missing required field: provider.realtime.services for provider {name} and URL {strip_query(url)}"
+                    f"Missing required field: provider.realtime.services for provider {name} and {source}"
                 )
 
             api = ApiConfig(**api_dict)
-            logger.debug(
-                f"Realtime feed for {name}: {strip_query(api.url)} {api.services}"
-            )
+            logger.debug(f"Realtime feed for {name}: {api.source} {api.services}")
 
             apis.append(api)
 
@@ -252,7 +244,7 @@ def _convert_toml_to_config(config_dict: Dict[str, Any]) -> GtfsRtConfig:
         static_feeds = []
         for static_dict in provider_dict.get("static", []):
             logger.debug(
-                f"Static feed for {name}: {strip_query(static_dict.get('url') or static_dict.get('index_url'))}"
+                f"Static feed for {name}: {strip_query(static_dict.get('url') or static_dict.get('index_url')) or static_dict.get('adapter')}"
             )
             static_feeds.append(StaticConfig(**static_dict))
 

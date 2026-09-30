@@ -319,6 +319,105 @@ def close_window(folder: str) -> Dict:
 
 
 @_timed
+def adapter_fetch(feed: str, previous_sha256: Optional[str]) -> Dict:
+    """
+    One poll of a realtime adapter (see adapters.py): the fetch goes to the
+    spool like a download, then its state is saved. Unchanged bytes (with
+    skip_unchanged) are not stored.
+    """
+    import hashlib
+
+    from .. import adapters
+
+    ctx = _ctx()
+    provider, api = ctx.feeds[feed]
+    fetch_time = datetime.now(pytz.timezone(provider.timezone))
+    saved = adapters.AdapterState(ctx.spool.path("state", f"{feed}.adapter.json"))
+    state = saved.working_copy()
+    data = adapters.fetch_realtime(api.adapter, ctx.config.base_dir, state)
+    sha256 = hashlib.sha256(data).hexdigest()
+    result = {
+        "fetch_time": fetch_time.isoformat(),
+        "size": len(data),
+        "sha256": sha256,
+    }
+    if api.skip_unchanged and sha256 == previous_sha256:
+        result["unchanged"] = True
+    else:
+        item = ctx.spool.new_item(feed, fetch_time)
+        tmp = item.with_name(item.name + ".part")
+        tmp.write_bytes(data)
+        ctx.spool.commit_item(
+            item,
+            tmp,
+            {
+                "feed": feed,
+                "provider": provider.name,
+                "url": api.source,
+                "services": api.services,
+                "fetch_time": fetch_time.isoformat(),
+                "size": len(data),
+                "sha256": sha256,
+                "attempt": 1,
+            },
+        )
+        result["item"] = str(item)
+    # Only once the fetch is in the spool: after a failure, the adapter is
+    # called again with the same state
+    saved.save(state)
+    return result
+
+
+@_timed
+def static_adapter(provider_name: str, feed_name: str, first: bool) -> Dict:
+    """
+    Build a static feed with its adapter (see adapters.py) and store it like
+    a downloaded zip. At the first check after a start, skipped if a version
+    is stored and the adapter ran less than check_minutes ago.
+    """
+    import tempfile
+
+    from .. import adapters
+    from ..static.service import read_latest, static_base
+
+    ctx = _ctx()
+    provider = next(p for p in ctx.config.providers if p.name == provider_name)
+    static = next(f for f in provider.static if f.name == feed_name)
+    saved = adapters.AdapterState(
+        ctx.spool.path("state", f"{provider_name}__static__{feed_name}.adapter.json")
+    )
+    if first and saved.last_run is not None:
+        age = (datetime.now(timezone.utc) - saved.last_run).total_seconds()
+        if age < static.check_minutes * 60 and read_latest(
+            ctx.storage(provider_name), static_base(provider_name, feed_name), logger
+        ):
+            return {"skipped": True}
+    state = saved.working_copy()
+    fetch_time = datetime.now(pytz.timezone(provider.timezone))
+    with tempfile.TemporaryDirectory(prefix="gtfs_rt_aggregator-static-") as tmp:
+        out_dir = Path(tmp, "adapter")
+        out_dir.mkdir()
+        zip_path = adapters.build_static(
+            static.adapter, ctx.config.base_dir, state, out_dir
+        )
+        ctx.static.process(
+            provider_name,
+            feed_name,
+            str(zip_path),
+            {
+                "url": f"adapter:{static.adapter}",
+                "etag": None,
+                "last_modified": None,
+                "fetch_time": fetch_time.isoformat(),
+            },
+            static.reuse_unchanged_tables,
+            logger,
+        )
+    saved.save(state)
+    return {}
+
+
+@_timed
 def process_static(
     provider_name: str, feed_name: str, folder: str, reuse_unchanged_tables: bool
 ) -> Dict:

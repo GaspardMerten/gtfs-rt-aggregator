@@ -14,7 +14,6 @@ from ..fetcher.filter import build_filter
 from ..fetcher.gtfs_rt import GtfsRtFetcher, row_metadata
 from ..static.service import manifest_tables, read_latest, static_base
 from ..storage.base import StorageInterface, storage_for
-from ..utils.redact import strip_query
 
 # How long the static version found for a provider is reused; when none is
 # stored yet (first start), it is looked for again sooner
@@ -38,8 +37,9 @@ def feed_slug(api: ApiConfig) -> str:
 
 
 def feed_hash(api: ApiConfig) -> str:
-    """8 hex characters identifying a realtime feed (feedId column, file names)."""
-    return hashlib.sha1(api.url.encode()).hexdigest()[:8]
+    """8 hex characters identifying a realtime feed (feedId column, file names):
+    from its URL, or from its adapter spec as written."""
+    return hashlib.sha1((api.url or api.adapter).encode()).hexdigest()[:8]
 
 
 def feed_id(provider_name: str, api: ApiConfig) -> str:
@@ -155,7 +155,7 @@ def process_payload(
         )
         if entity_filter is None:
             raise StaticNotReady(
-                f"{provider.name}: the filter of {strip_query(api.url)} needs a "
+                f"{provider.name}: the filter of {api.source} needs a "
                 "static version, none can be read yet"
             )
         entities = [e for e in entities if entity_filter.keep(e)]

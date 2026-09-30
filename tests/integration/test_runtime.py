@@ -224,6 +224,35 @@ class TestRuntime(unittest.TestCase):
         self.assertIn(latest["version"], versions)
         self.assertEqual(list(Path(self.tmp, "spool", "static").rglob("feed.zip")), [])
 
+    def test_adapter_feeds(self):
+        from src.gtfs_rt_aggregator.config.models import StaticConfig
+        from src.gtfs_rt_aggregator.runtime.core import feed_hash, feed_id
+        from tests.unit.test_adapters import _write_adapter
+
+        _write_adapter(Path(self.tmp))
+        config = self._config()
+        config.base_dir = self.tmp
+        config.providers[0].realtime = [
+            ApiConfig(
+                adapter="adapters/fake.py:fetch",
+                services=["VehiclePosition"],
+                refresh_seconds=1,
+            )
+        ]
+        config.providers[0].static.append(
+            StaticConfig(adapter="adapters/fake.py:timetable")
+        )
+        self._run(config, 6)
+        # Same entities at each poll (only the header changes): stored once
+        (individual,) = self._individual()
+        self.assertTrue(
+            individual.stem.endswith(feed_hash(config.providers[0].realtime[0]))
+        )
+        self.assertTrue(Path(self.tmp, "out", "p", "static", "latest.json").exists())
+        feed = feed_id("p", config.providers[0].realtime[0])
+        state = Path(self.tmp, "spool", "state", f"{feed}.adapter.json")
+        self.assertGreaterEqual(json.loads(state.read_text())["state"]["polls"], 3)
+
     def test_spool_full_pauses_fetching(self):
         from unittest.mock import patch
 

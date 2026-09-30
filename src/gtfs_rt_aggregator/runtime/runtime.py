@@ -179,10 +179,9 @@ class Runtime:
         self._status_dirty: set = set()
         self._written: Dict[str, bytes] = {}  # status files as last written
         self._window_failures: Dict[str, int] = {}
-        self._rerun: Dict[str, Task] = {}
-        self._waiting_static: set = (
-            set()
-        )  # feeds waiting for a static version  # heavy tasks to run again once done
+        self._rerun: Dict[str, Task] = {}  # heavy tasks to run again once done
+        self._waiting_static: set = set()  # feeds waiting for a static version
+        self._statics_checked: set = set()  # static adapter feeds run since start
         self._spool_lock = None
         self._paused: set = set()
         self._pause_level = -1
@@ -453,7 +452,53 @@ class Runtime:
                 )
                 return
             self._fetching.add(feed)
-        self._fetch_pool.submit(self._fetch, feed)
+        _, api = self.feeds[feed]
+        if api.adapter:
+            self._submit_adapter_fetch(feed)
+        else:
+            self._fetch_pool.submit(self._fetch, feed)
+
+    def _submit_adapter_fetch(self, feed: str):
+        """An adapter runs in a worker process (see adapters.py)."""
+        provider, _ = self.feeds[feed]
+        now = datetime.now(pytz.timezone(provider.timezone))
+        try:
+            self._submit(
+                Task("adapter", f"adapter {feed}", "normal", {"feed": feed}),
+                worker.adapter_fetch,
+                feed,
+                self._last_sha.get(feed),
+            )
+        except Exception:
+            with self._lock:
+                self._fetching.discard(feed)
+            raise
+        with self._lock:
+            self._update_status(feed, last_attempt=now.isoformat())
+
+    def _adapter_fetched(
+        self, task: Task, result: Optional[Dict], error: Optional[str]
+    ):
+        """Like the end of _fetch, for a fetch made by an adapter."""
+        feed = task.info["feed"]
+        provider, api = self.feeds[feed]
+        now = datetime.now(pytz.timezone(provider.timezone)).isoformat()
+        status = {}
+        if error is not None:
+            status.update(last_error=error, last_error_at=now)
+            logger.error(f"Fetching {feed} ({api.source}) failed: {error}")
+        else:
+            status.update(
+                last_success=result["fetch_time"],
+                size=result["size"],
+                unchanged=bool(result.get("unchanged")),
+            )
+            self._last_sha[feed] = result["sha256"]
+        with self._lock:
+            if error is None and result.get("item"):
+                bisect.insort(self._queues.setdefault(feed, []), Path(result["item"]))
+            self._fetching.discard(feed)
+            self._update_status(feed, **status)
 
     def _fetch(self, feed: str):
         provider, api = self.feeds[feed]
@@ -506,6 +551,21 @@ class Runtime:
                 self._update_status(feed, **status)
 
     def _submit_static_download(self, feed: str):
+        provider, static = self.statics[feed]
+        if static.adapter:
+            # Built by its adapter in a fresh process, like a conversion
+            self._queue_heavy(
+                "static_adapter",
+                f"static {feed}",
+                {
+                    "provider_name": provider.name,
+                    "feed_name": static.name,
+                    "first": feed not in self._statics_checked,
+                },
+                lane="static",
+            )
+            self._statics_checked.add(feed)
+            return
         with self._lock:
             waiting = any(self.spool.path("static", feed).glob("*/meta.json"))
             if (
@@ -650,6 +710,7 @@ class Runtime:
                 "iceberg_sync": worker.iceberg_sync,
                 "iceberg_maintain": worker.iceberg_maintain,
                 "trip_stop_events": worker.trip_stop_events,
+                "static_adapter": worker.static_adapter,
             }.get(task.kind, worker.aggregate)
             self._submit(task, function, **task.info)
             free["heavy"] -= 1
@@ -816,6 +877,8 @@ class Runtime:
                     last_processing_error=error,
                     quarantined=self.spool.quarantined(),
                 )
+        elif task.kind == "adapter":
+            self._adapter_fetched(task, result, error)
         elif task.kind == "static" and cancelled:
             pass  # still waiting in spool/static, dispatched again
         elif task.kind == "static" and error is None:
@@ -1024,7 +1087,10 @@ class Runtime:
             if feed not in self.feeds:
                 continue
             provider, api = self.feeds[feed]
-            document = {"url": strip_query(api.url), "services": api.services, **status}
+            source = (
+                {"url": strip_query(api.url)} if api.url else {"adapter": api.adapter}
+            )
+            document = {**source, "services": api.services, **status}
             self._put_if_changed(
                 provider.name,
                 f"{provider.name}/_status/{feed_slug(api)}.json",
