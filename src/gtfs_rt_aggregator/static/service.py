@@ -7,7 +7,7 @@ import re
 import os
 import tempfile
 import zipfile
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from urllib.parse import urljoin
 from typing import Dict, Any, Optional, Tuple
 
@@ -21,6 +21,11 @@ from ..utils.http import get_bytes, raise_for_status, with_retries
 from ..utils.log_helper import setup_logger
 from ..utils.cleanup import STATIC_WORK_PREFIX
 from ..utils.redact import strip_query
+
+
+# min_change compares the trips running in the coming days: a stored version
+# is kept while it still describes them
+CHANGE_DAYS = 7
 
 
 def _version_tuple(version: str) -> Tuple[int, ...]:
@@ -76,6 +81,11 @@ def scrub_urls(storage: StorageInterface, base: str) -> int:
             storage.save_bytes(json.dumps(manifest, indent=2).encode("utf-8"), path)
             rewritten += 1
     return rewritten
+
+
+def _fetch(storage: StorageInterface, path: str, local_path: str):
+    with open(local_path, "wb") as f:
+        f.write(storage.read_bytes(path))
 
 
 def manifest_tables(manifest: dict, base: str) -> Dict[str, str]:
@@ -266,7 +276,23 @@ class StaticService:
         if not files:
             raise ValueError(f"No GTFS .txt file found in {saved_url}")
 
-        if latest and latest.get("files") == files:
+        static = self._static_config(provider_name, feed_name)
+        route_types = sorted(static.route_type_set()) if static else []
+        expired = bool(
+            latest
+            and static
+            and static.max_days
+            and latest.get("fetched_at")
+            and (fetch_time - datetime.fromisoformat(latest["fetched_at"])).total_seconds()
+            >= static.max_days * 86400
+        )
+        # checked_files: a later check found changes too small to store
+        # (min_change), which max_days eventually stores
+        # A new route_types stores the feed again, filtered the new way
+        if latest and latest.get("route_types", []) == route_types and (
+            files == latest.get("files")
+            or (files == latest.get("checked_files") and not expired)
+        ):
             logger.info(f"{base}: unchanged since {latest.get('version')}")
             # Keep the validators fresh so the next check can get a 304
             if (etag, last_modified, saved_url) != (
@@ -283,15 +309,55 @@ class StaticService:
         if not converted:
             raise ValueError(f"No GTFS table could be parsed from {saved_url}")
 
+        filtered = (
+            self._keep_route_types(converted, route_types, saved_url)
+            if route_types
+            else set()
+        )
+        signatures = None
+        if static and static.min_change:
+            signatures = os.path.join(os.path.dirname(zip_path), "trip_signatures.parquet")
+            if not self._trip_signatures(converted, signatures):
+                signatures = None
+
+        same_filter = latest is not None and latest.get("route_types", []) == route_types
+        if signatures and same_filter:
+            share = self._changed_share(
+                storage, base, latest, converted, signatures, fetch_time.date(), logger
+            )
+            if share is not None and share < static.min_change and not expired:
+                logger.info(
+                    f"{base}: {share:.1%} of trips changed since {latest.get('version')}, "
+                    f"below min_change {static.min_change:.1%}: not stored"
+                )
+                # Not "files": reuse_unchanged_tables compares with what is stored
+                latest.update(
+                    url=saved_url,
+                    etag=etag,
+                    last_modified=last_modified,
+                    checked_files=files,
+                    checked_at=fetch_time.isoformat(),
+                    checked_change=round(share, 4),
+                )
+                self._save_json(storage, f"{base}/latest.json", latest)
+                return
+
+        def unchanged(source: str) -> bool:
+            return source in files and latest.get("files", {}).get(source) == files[source]
+
         version = format_file_time(fetch_time)
         tables = {}
         for table_name, local_path in converted.items():
             source = f"{table_name}.txt"
             if (
                 reuse_unchanged_tables
-                and latest
-                and source in files
-                and latest.get("files", {}).get(source) == files[source]
+                and same_filter
+                and unchanged(source)
+                # A filtered table also depends on which routes and trips are kept
+                and (
+                    table_name not in filtered
+                    or (unchanged("routes.txt") and unchanged("trips.txt"))
+                )
                 and table_name in manifest_tables(latest, base)
             ):
                 tables[table_name] = manifest_tables(latest, base)[table_name]
@@ -310,7 +376,14 @@ class StaticService:
             # Storage path of each table; with reuse_unchanged_tables, some
             # point to an earlier version's folder
             "tables": tables,
+            "route_types": route_types,
         }
+        if signatures:
+            # Compared with the next check's, for min_change
+            path = f"{base}/{version}/_trip_signatures.parquet"
+            storage.save_file(signatures, path)
+            manifest["signatures"] = path
+            manifest["signature_version"] = self._signature_version()
         self._save_json(storage, f"{base}/{version}/manifest.json", manifest)
         # Written last, so a run that fails halfway is retried at the next
         # check (the incomplete version folder stays behind)
@@ -379,6 +452,216 @@ class StaticService:
                 # GTFS files must be at the root of the zip
                 if "/" not in info.filename and info.filename.endswith(".txt")
             }
+
+    def _static_config(self, provider_name: str, feed_name: str):
+        provider = next(
+            (p for p in self.config.providers if p.name == provider_name), None
+        )
+        return next(
+            (f for f in (provider.static if provider else []) if f.name == feed_name),
+            None,
+        )
+
+    @staticmethod
+    def _keep_route_types(converted: Dict[str, str], route_types, url) -> set:
+        """
+        Keep only the routes of route_types in the converted tables, and the
+        trips, stop times, frequencies, services and shapes they use. Stops are
+        all kept. Returns the names of the tables that were filtered.
+        """
+        import polars as pl
+
+        if "routes" not in converted or "trips" not in converted:
+            raise ValueError(f"route_types needs routes and trips, missing in {url}")
+
+        def rewrite(name, frame):
+            part = f"{converted[name]}.part"
+            frame.write_parquet(part, compression="zstd", compression_level=9)
+            os.replace(part, converted[name])
+
+        routes = pl.read_parquet(converted["routes"])
+        routes = routes.filter(pl.col("route_type").cast(pl.Int32).is_in(route_types))
+        if routes.is_empty():
+            raise ValueError(f"No route of route_types {route_types} in {url}")
+        rewrite("routes", routes)
+        trips = pl.read_parquet(converted["trips"]).filter(
+            pl.col("route_id").is_in(routes["route_id"].implode())
+        )
+        rewrite("trips", trips)
+        keys = {
+            "stop_times": "trip_id",
+            "frequencies": "trip_id",
+            "calendar": "service_id",
+            "calendar_dates": "service_id",
+            "shapes": "shape_id",
+        }
+        filtered = {"routes", "trips"}
+        for name, key in keys.items():
+            if name not in converted or key not in trips.columns:
+                continue
+            kept = trips[key].drop_nulls().unique().implode()
+            # Streamed: stop_times can be millions of rows
+            frame = pl.scan_parquet(converted[name]).filter(pl.col(key).is_in(kept))
+            part = f"{converted[name]}.part"
+            # As gtfs-parquet writes them
+            frame.sink_parquet(part, compression="zstd", compression_level=9)
+            os.replace(part, converted[name])
+            filtered.add(name)
+        return filtered
+
+    @staticmethod
+    def _signature_version() -> str:
+        # Polars' hashes may differ between its versions
+        import polars as pl
+
+        return f"polars-{pl.__version__}"
+
+    @staticmethod
+    def _trip_signatures(tables: Dict[str, str], out_path: str) -> bool:
+        """
+        Write one row per trip: trip_id, route_id, service_id and a hash of its
+        stop times. False if the feed has no trips or stop times.
+        """
+        import polars as pl
+
+        if "trips" not in tables or "stop_times" not in tables:
+            return False
+        st = pl.scan_parquet(tables["stop_times"])
+        columns = [
+            c
+            for c in ("stop_sequence", "stop_id", "arrival_time", "departure_time")
+            if c in st.collect_schema().names()
+        ]
+        # Summed: the hash of a trip's stop times does not depend on row order
+        # (stop_sequence is in each row's hash). Divided so a long trip cannot overflow.
+        times = st.group_by("trip_id").agg(
+            (pl.struct(columns).hash(seed=0) // 65536).sum().alias("stops")
+        )
+        trips = pl.scan_parquet(tables["trips"]).select("trip_id", "route_id", "service_id")
+        trips.join(times, on="trip_id", how="left").sink_parquet(out_path)
+        return True
+
+    @staticmethod
+    def _service_days(tables: Dict[str, str], first: date):
+        """
+        service_id and a bit mask of the days it runs among the CHANGE_DAYS
+        days from first (bit i: first + i days), from calendar and
+        calendar_dates. None if the feed has neither.
+        """
+        import polars as pl
+
+        days = pl.DataFrame(
+            {
+                "i": range(CHANGE_DAYS),
+                "date": [first + timedelta(days=i) for i in range(CHANGE_DAYS)],
+            }
+        ).with_columns(weekday=pl.col("date").dt.weekday())
+        weekdays = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
+        parts = []
+        if "calendar" in tables:
+            calendar = pl.read_parquet(tables["calendar"])
+            runs = calendar.join(days, how="cross").filter(
+                pl.col("date").is_between(pl.col("start_date"), pl.col("end_date"))
+                & (
+                    pl.concat_list(weekdays)
+                    .list.get(pl.col("weekday").cast(pl.Int64) - 1)
+                    .cast(pl.Int32)
+                    == 1
+                )
+            )
+            parts.append(runs.select("service_id", "i", pl.lit(1, pl.Int8).alias("kind")))
+        if "calendar_dates" in tables:
+            exceptions = pl.read_parquet(tables["calendar_dates"]).join(days, on="date")
+            parts.append(
+                exceptions.select(
+                    "service_id", "i", pl.col("exception_type").cast(pl.Int8).alias("kind")
+                )
+            )
+        if not parts:
+            return None
+        # A removed day (exception_type 2) wins over the calendar and an added day
+        runs = (
+            pl.concat(parts)
+            .group_by("service_id", "i")
+            .agg((pl.col("kind") == 2).any().alias("removed"))
+            .filter(~pl.col("removed"))
+        )
+        return runs.group_by("service_id").agg(
+            (pl.lit(1, pl.UInt64) * 2 ** pl.col("i").cast(pl.UInt64)).sum().alias("days")
+        )
+
+    def _changed_share(
+        self,
+        storage: StorageInterface,
+        base: str,
+        latest: dict,
+        tables: Dict[str, str],
+        new_path: str,
+        first: date,
+        logger,
+    ) -> Optional[float]:
+        """
+        Share of the trips running in the CHANGE_DAYS days from first that
+        were added, removed or changed (route, days or stop times) since the
+        latest stored version, or None if its trips cannot be read. Feeds that
+        renumber their services, or put the date in their trip ids, only
+        change with their timetable. The latest version's signatures are
+        computed and saved if it has none (stored before 0.7.8, or with another
+        Polars).
+        """
+        import polars as pl
+
+        folder = os.path.dirname(new_path)
+        stored = manifest_tables(latest, base)
+        if "trips" not in stored or "stop_times" not in stored:
+            return None
+        old = {}
+        for name in ("calendar", "calendar_dates"):
+            if name in stored:
+                old[name] = os.path.join(folder, f"latest_{name}.parquet")
+                _fetch(storage, stored[name], old[name])
+        old_path = os.path.join(folder, "latest_signatures.parquet")
+        if (
+            latest.get("signatures")
+            and latest.get("signature_version") == self._signature_version()
+            and storage.file_exists(latest["signatures"])
+        ):
+            _fetch(storage, latest["signatures"], old_path)
+        else:
+            local = {}
+            for name in ("trips", "stop_times"):
+                local[name] = os.path.join(folder, f"latest_{name}.parquet")
+                _fetch(storage, stored[name], local[name])
+            self._trip_signatures(local, old_path)
+            for path in local.values():
+                os.remove(path)
+            path = f"{base}/{latest['version']}/_trip_signatures.parquet"
+            storage.save_file(old_path, path)
+            latest.update(signatures=path, signature_version=self._signature_version())
+            self._save_json(storage, f"{base}/latest.json", latest)
+            logger.info(f"{base}: computed the signatures of {latest['version']}")
+
+        def running(path, calendars):
+            trips = pl.read_parquet(path)
+            days = self._service_days(calendars, first)
+            if days is None:
+                # No calendar: every trip counts
+                return trips.with_columns(days=pl.lit(1, pl.UInt64)).drop("service_id")
+            return trips.join(days, on="service_id", how="inner").drop("service_id")
+
+        before = running(old_path, old).rename(
+            {"route_id": "old_route", "stops": "old_stops", "days": "old_days"}
+        )
+        after = running(new_path, tables)
+        both = before.join(after, on="trip_id", how="full", coalesce=True)
+        if both.is_empty():
+            return 0.0
+        changed = ~(
+            pl.col("old_route").eq_missing(pl.col("route_id"))
+            & pl.col("old_stops").eq_missing(pl.col("stops"))
+            & pl.col("old_days").eq_missing(pl.col("days"))
+        )
+        return both.select(changed.mean()).item()
 
     @staticmethod
     def _convert(zip_path: str, out_dir: str) -> Dict[str, str]:

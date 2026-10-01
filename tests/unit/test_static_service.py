@@ -79,7 +79,9 @@ class _FakeDatetime(datetime):
         return cls.current.astimezone(tz)
 
 
-class TestStaticService(unittest.TestCase):
+class _StaticTestCase(unittest.TestCase):
+    """A local server serving the feed, and the service storing it."""
+
     @classmethod
     def setUpClass(cls):
         cls.server = http.server.ThreadingHTTPServer(("localhost", 0), _FeedHandler)
@@ -116,7 +118,7 @@ class TestStaticService(unittest.TestCase):
         )
         self.service = StaticService(config, {"global": self.storage})
 
-    def _run(self, hour=None):
+    def _run(self, hour=None, reuse_unchanged_tables=False):
         if hour is not None:
             _FakeDatetime.current = datetime(2026, 9, 28, hour, 0, 0, tzinfo=pytz.UTC)
         self.service.run_once(
@@ -126,6 +128,7 @@ class TestStaticService(unittest.TestCase):
             timezone="Europe/Amsterdam",
             headers={"x-api-key": "secret"},
             retries=0,
+            reuse_unchanged_tables=reuse_unchanged_tables,
         )
 
     def _versions(self):
@@ -137,6 +140,8 @@ class TestStaticService(unittest.TestCase):
             }
         )
 
+
+class TestStaticService(_StaticTestCase):
     def test_first_run_stores_full_version(self):
         self._run()
 
@@ -228,6 +233,215 @@ class TestStaticService(unittest.TestCase):
 
         latest = json.loads(self.storage.get_bytes("nl/static/latest.json"))
         self.assertEqual(latest["version"], "2026-09-28_02-00-00Z")
+
+
+def _mixed_feed(trains=20, retimed=0, buses=5):
+    """Feed with `trains` rail trips (the first `retimed` 1 min later) and `buses` bus trips."""
+    trips, times = ["route_id,service_id,trip_id,shape_id"], [
+        "trip_id,arrival_time,departure_time,stop_id,stop_sequence"
+    ]
+    for i in range(trains):
+        trips.append(f"RAIL,WD,T{i},SH1")
+        minute = 1 if i < retimed else 0
+        times += [f"T{i},08:0{minute}:00,08:0{minute}:00,S1,1", f"T{i},08:10:00,08:10:00,S2,2"]
+    for i in range(buses):
+        trips.append(f"BUS,WE,B{i},SH2")
+        times += [f"B{i},09:00:00,09:00:00,S2,1", f"B{i},09:10:00,09:10:00,S3,2"]
+    files = dict(GTFS_FILES)
+    files.update(
+        {
+            "stops.txt": GTFS_FILES["stops.txt"] + "S3,Stop Three,52.39,4.91\n",
+            "routes.txt": "route_id,agency_id,route_short_name,route_type\n"
+            "RAIL,A1,IC,2\nBUS,A1,10,3\n",
+            "trips.txt": "\n".join(trips) + "\n",
+            "stop_times.txt": "\n".join(times) + "\n",
+            "calendar.txt": GTFS_FILES["calendar.txt"]
+            + "WE,0,0,0,0,0,1,1,20260101,20261231\n",
+            "shapes.txt": "shape_id,shape_pt_lat,shape_pt_lon,shape_pt_sequence\n"
+            "SH1,52.37,4.89,1\nSH2,52.38,4.90,1\n",
+        }
+    )
+    return files
+
+
+class TestStaticChangeRules(_StaticTestCase):
+    """min_change, max_days and route_types."""
+
+    def setUp(self):
+        super().setUp()
+        _FeedHandler.body = _make_zip(_mixed_feed())
+
+    def _configure(self, **static):
+        config = GtfsRtConfig(
+            storage=StorageConfig(type="filesystem", params={}),
+            providers=[
+                ProviderConfig(
+                    name="nl",
+                    timezone="Europe/Amsterdam",
+                    static=[StaticConfig(url=self.url, **static)],
+                )
+            ],
+        )
+        self.service = StaticService(config, {"global": self.storage})
+
+    def _table(self, name):
+        latest = json.loads(self.storage.get_bytes("nl/static/latest.json"))
+        return pd.read_parquet(io.BytesIO(self.storage.get_bytes(latest["tables"][name])))
+
+    def test_small_change_not_stored(self):
+        self._configure(min_change=0.1)
+        self._run(1)
+        # 2 of 25 trips retimed: 8%
+        _FeedHandler.body = _make_zip(_mixed_feed(retimed=2))
+        self._run(2)
+
+        self.assertEqual(self._versions(), ["2026-09-28_01-00-00Z"])
+        latest = json.loads(self.storage.get_bytes("nl/static/latest.json"))
+        self.assertEqual(latest["checked_change"], 0.08)
+        self.assertIn("checked_files", latest)
+        # The same feed again is recognised without converting it
+        with patch.object(StaticService, "_convert") as convert:
+            self._run(3)
+        convert.assert_not_called()
+
+    def test_large_change_stored(self):
+        self._configure(min_change=0.1)
+        self._run(1)
+        _FeedHandler.body = _make_zip(_mixed_feed(retimed=3))
+        self._run(2)
+
+        self.assertEqual(len(self._versions()), 2)
+
+    def test_added_and_removed_trips_count(self):
+        self._configure(min_change=0.1)
+        self._run(1)
+        # 3 trips gone out of 25
+        _FeedHandler.body = _make_zip(_mixed_feed(trains=17))
+        self._run(2)
+
+        self.assertEqual(len(self._versions()), 2)
+
+    def test_renumbered_services_not_a_change(self):
+        self._configure(min_change=0.1)
+        self._run(1)
+        files = _mixed_feed()
+        for name in ("trips.txt", "calendar.txt"):
+            files[name] = files[name].replace("WD", "000001").replace("WE", "000002")
+        _FeedHandler.body = _make_zip(files)
+        self._run(2)
+
+        self.assertEqual(len(self._versions()), 1)
+
+    def test_changed_days_count(self):
+        self._configure(min_change=0.1)
+        self._run(1)
+        # The weekday trains no longer run on Wednesday 30 September
+        files = _mixed_feed()
+        files["calendar_dates.txt"] = "service_id,date,exception_type\nWD,20260930,2\n"
+        _FeedHandler.body = _make_zip(files)
+        self._run(2)
+
+        self.assertEqual(len(self._versions()), 2)
+
+    def test_trips_after_the_coming_days_ignored(self):
+        self._configure(min_change=0.1)
+        self._run(1)
+        # A new timetable from December, the trains of the coming days unchanged
+        files = _mixed_feed()
+        files["trips.txt"] += "".join(f"RAIL,DEC,X{i},SH1\n" for i in range(20))
+        files["stop_times.txt"] += "".join(
+            f"X{i},07:00:00,07:00:00,S1,1\nX{i},07:10:00,07:10:00,S2,2\n" for i in range(20)
+        )
+        files["calendar.txt"] += "DEC,1,1,1,1,1,1,1,20261213,20271211\n"
+        _FeedHandler.body = _make_zip(files)
+        self._run(2)
+
+        self.assertEqual(len(self._versions()), 1)
+
+    def test_max_days_stores_small_change(self):
+        self._configure(min_change=0.5, max_days=7)
+        self._run(1)
+        _FeedHandler.body = _make_zip(_mixed_feed(retimed=1))
+        self._run(2)
+        self.assertEqual(len(self._versions()), 1)
+        _FakeDatetime.current = datetime(2026, 10, 5, 1, 0, 0, tzinfo=pytz.UTC)
+        self._run()
+
+        self.assertEqual(len(self._versions()), 2)
+
+    def test_version_without_signatures_gets_them(self):
+        # Stored without min_change: no signatures
+        self._run(1)
+        self.assertNotIn("signatures", json.loads(self.storage.get_bytes("nl/static/latest.json")))
+        self._configure(min_change=0.1)
+        _FeedHandler.body = _make_zip(_mixed_feed(retimed=1))
+        self._run(2)
+
+        self.assertEqual(len(self._versions()), 1)
+        latest = json.loads(self.storage.get_bytes("nl/static/latest.json"))
+        self.assertEqual(
+            latest["signatures"], "nl/static/2026-09-28_01-00-00Z/_trip_signatures.parquet"
+        )
+
+    def test_route_types_keep_rail_only(self):
+        self._configure(route_types=[2, "100-199"])
+        self._run(1)
+
+        self.assertEqual(list(self._table("routes")["route_id"]), ["RAIL"])
+        self.assertEqual(len(self._table("trips")), 20)
+        self.assertEqual(set(self._table("stop_times")["trip_id"]), {f"T{i}" for i in range(20)})
+        self.assertEqual(list(self._table("calendar")["service_id"]), ["WD"])
+        self.assertEqual(list(self._table("shapes")["shape_id"]), ["SH1"])
+        # Stops are all kept
+        self.assertEqual(len(self._table("stops")), 3)
+        latest = json.loads(self.storage.get_bytes("nl/static/latest.json"))
+        self.assertEqual(latest["route_types"][:2], [2, 100])
+
+    def test_route_types_ignore_other_modes_changes(self):
+        self._configure(route_types=[2], min_change=0.01)
+        self._run(1)
+        _FeedHandler.body = _make_zip(_mixed_feed(buses=50))
+        self._run(2)
+
+        self.assertEqual(len(self._versions()), 1)
+
+    def test_new_route_types_store_a_version(self):
+        self._configure(min_change=0.5)
+        self._run(1)
+        self._configure(route_types=[2], min_change=0.5)
+        _FeedHandler.body = _make_zip(_mixed_feed(retimed=1))
+        self._run(2)
+
+        self.assertEqual(len(self._versions()), 2)
+        self.assertEqual(len(self._table("trips")), 20)
+
+    def test_filtered_tables_not_reused_when_trips_change(self):
+        self._configure(route_types=[2])
+        self._run(1, reuse_unchanged_tables=True)
+        # Only trips.txt changes: calendar.txt is unchanged, but WD is no longer used
+        files = _mixed_feed()
+        files["trips.txt"] = files["trips.txt"].replace(",WD,", ",WE,")
+        _FeedHandler.body = _make_zip(files)
+        self._run(2, reuse_unchanged_tables=True)
+
+        latest = json.loads(self.storage.get_bytes("nl/static/latest.json"))
+        self.assertTrue(latest["tables"]["calendar"].startswith(f"nl/static/{latest['version']}/"))
+        self.assertEqual(list(self._table("calendar")["service_id"]), ["WE"])
+        # Unfiltered and unchanged: reused
+        self.assertTrue(latest["tables"]["stops"].startswith("nl/static/2026-09-28_01-00-00Z/"))
+
+    def test_new_route_types_on_unchanged_feed_stored(self):
+        self._run(1)
+        self._configure(route_types=[2])
+        self._run(2)
+
+        self.assertEqual(len(self._versions()), 2)
+        self.assertEqual(len(self._table("trips")), 20)
+
+    def test_no_route_of_route_types_stores_nothing(self):
+        self._configure(route_types=[1])
+        self._run(1)
+        self.assertEqual(self._versions(), [])
 
 
 class TestGtfsParquetVersion(unittest.TestCase):

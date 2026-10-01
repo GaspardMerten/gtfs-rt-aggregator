@@ -162,7 +162,7 @@ informed route, route type or trip. Other entity types are always kept.
 
 ### `[[providers.static]]`
 
-Needs the `static` extra. A new version is stored only when a file inside the zip changed.
+Needs the `static` extra. A new version is stored only when a file inside the zip changed (and, with `min_change`, enough trips changed).
 
 | Key | Default | Meaning |
 |---|---|---|
@@ -174,6 +174,9 @@ Needs the `static` extra. A new version is stored only when a file inside the zi
 | `headers` | none | HTTP headers. |
 | `retries` | `3` | As for realtime feeds. |
 | `reuse_unchanged_tables` | `false` | Point to the previous version's file for tables that did not change, instead of storing them again. `manifest.json` then gives each table's path. |
+| `route_types` | none | Keep only the routes of these GTFS route types, e.g. `[2, "100-199"]` for rail, and the trips, stop times, frequencies, services and shapes they use (stops are all kept). For a mixed-mode feed whose realtime is filtered to the same route types. |
+| `min_change` | `0` | Store a changed feed only if at least this share of the trips running in the next 7 days was added, removed or changed (route, running days or stop times), e.g. `0.01`. Renumbered services do not count; renamed trips do, since realtime feeds use the new names. A skipped feed is remembered in `latest.json` (`checked_files`, `checked_change`) so it is not converted again. |
+| `max_days` | none | With `min_change`: store a changed feed anyway once the stored version is this many days old. |
 
 ```toml
 [[providers.static]]

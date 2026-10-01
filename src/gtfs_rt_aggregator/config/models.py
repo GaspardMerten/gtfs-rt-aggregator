@@ -20,6 +20,32 @@ def _check_source(url, adapter, what: str):
         parse_spec(adapter)
 
 
+def _validate_route_types(v):
+    for item in v:
+        if isinstance(item, bool) or not isinstance(item, (int, str)):
+            raise ValueError(f"route_types entries are numbers or ranges, got {item!r}")
+        if isinstance(item, str):
+            low, _, high = item.partition("-")
+            if not (low.strip().isdigit() and high.strip().isdigit()):
+                raise ValueError(
+                    f'route_types entries are numbers or ranges like "100-199", got {item!r}'
+                )
+            if int(low) > int(high):
+                raise ValueError(f"Empty route_types range {item!r}")
+    return v
+
+
+def _route_type_set(route_types) -> set:
+    types = set()
+    for item in route_types:
+        if isinstance(item, int):
+            types.add(item)
+        else:
+            low, _, high = item.partition("-")
+            types.update(range(int(low), int(high) + 1))
+    return types
+
+
 class _Model(BaseModel):
     # Validation errors would print the values, which can be secrets (API
     # keys in URLs and headers, storage credentials)
@@ -82,30 +108,10 @@ class FilterConfig(_Model):
     @field_validator("route_types", mode="before")
     @classmethod
     def validate_route_types(cls, v):
-        for item in v:
-            if isinstance(item, bool) or not isinstance(item, (int, str)):
-                raise ValueError(
-                    f"route_types entries are numbers or ranges, got {item!r}"
-                )
-            if isinstance(item, str):
-                low, _, high = item.partition("-")
-                if not (low.strip().isdigit() and high.strip().isdigit()):
-                    raise ValueError(
-                        f'route_types entries are numbers or ranges like "100-199", got {item!r}'
-                    )
-                if int(low) > int(high):
-                    raise ValueError(f"Empty route_types range {item!r}")
-        return v
+        return _validate_route_types(v)
 
     def route_type_set(self) -> set:
-        types = set()
-        for item in self.route_types:
-            if isinstance(item, int):
-                types.add(item)
-            else:
-                low, _, high = item.partition("-")
-                types.update(range(int(low), int(high) + 1))
-        return types
+        return _route_type_set(self.route_types)
 
     @model_validator(mode="after")
     def validate_keep_unmatched_added(self):
@@ -272,6 +278,29 @@ class StaticConfig(_Model):
         False,
         description="Point to the previous version's file for tables whose source file did not change, instead of storing them again",
     )
+    route_types: List[Union[int, str]] = Field(
+        default_factory=list,
+        description='Keep only the routes of these GTFS route types (e.g. [2, "100-199"] for rail) and what they use: trips, stop times, services, shapes, stops',
+    )
+    min_change: float = Field(
+        0,
+        ge=0,
+        le=1,
+        description="Store a new version only if at least this share of trips changed (added, removed, or a different route, service or stop times) since the stored one; 0 stores any change",
+    )
+    max_days: Optional[int] = Field(
+        None,
+        gt=0,
+        description="With min_change: store a changed feed anyway once the stored version is this many days old",
+    )
+
+    @field_validator("route_types", mode="before")
+    @classmethod
+    def validate_route_types(cls, v):
+        return _validate_route_types(v)
+
+    def route_type_set(self) -> set:
+        return _route_type_set(self.route_types)
 
     @model_validator(mode="after")
     def validate_source(self):
