@@ -225,6 +225,8 @@ called again before `check_minutes` if a version is already stored.
 | `compacted_name` | `"day.parquet"` | Name of that file in the day's folder. |
 | `sort_by` | `["entityId", "fetchTime"]` | Sort order of the aggregated and compacted files. |
 | `trip_stop_events` | `false` | Build a daily `TripStopEvent` file. Needs the `static` extra. See below. |
+| `live_snapshot` | `false` | After each fetch with new content, write it whole to `{provider}/_live/{service}/{feed}.parquet`, replacing the previous one: the current state of every feed, for live maps and boards. |
+| `live_seconds` | `60` | Least time between two live snapshots of one feed. |
 
 `compact_daily` and `trip_stop_events` need a `path_template` with one folder per day and `{service}` in a folder name.
 

@@ -468,6 +468,13 @@ class OutputConfig(_Model):
         False,
         description="Once a service date is over, write one row per trip and stop (service TripStopEvent), from the trip updates and the static timetable",
     )
+    live_snapshot: bool = Field(
+        False,
+        description="After a fetch with new content, write it whole to {provider}/_live/{service}/{feed}.parquet, replacing the previous one (at most every live_seconds): the current state of every feed, for live views",
+    )
+    live_seconds: int = Field(
+        60, gt=0, description="Least time between two live snapshots of a feed"
+    )
 
     @field_validator("path_template")
     @classmethod

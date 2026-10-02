@@ -98,6 +98,19 @@ class TestWorkerTasks(unittest.TestCase):
         times = fetch_times.decode(table.schema.metadata)
         self.assertEqual(len(times[feed_hash(self.api)]), 2)
 
+    def test_live_snapshot(self):
+        worker._CTX = None
+        self.config.output.live_snapshot = True
+        worker.init_worker(self.config, str(self.tmp / "spool"), logging.INFO)
+        first = datetime(2026, 9, 29, 8, 1, tzinfo=timezone.utc)
+        live = self.tmp / "out" / "p" / "_live" / "VehiclePosition" / f"VehiclePosition-{feed_hash(self.api)}.parquet"
+        worker.process_item(str(self._item(first)))
+        self.assertEqual(pq.read_table(live).num_rows, 3549)
+        written = live.stat().st_mtime_ns
+        # Within live_seconds of the previous snapshot: not rewritten
+        worker.process_item(str(self._item(first.replace(minute=2))))
+        self.assertEqual(live.stat().st_mtime_ns, written)
+
     def test_feeds_of_one_service_fetched_in_the_same_second(self):
         # A second feed of the same provider and service (e.g. another operator)
         other = ApiConfig(

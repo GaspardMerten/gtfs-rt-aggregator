@@ -25,6 +25,7 @@ from ..runtime.core import (
     StaticNotReady,
     StaticVersions,
     feed_hash,
+    feed_slug,
     process_payload,
     realtime_feeds,
 )
@@ -237,10 +238,28 @@ def process_item(item_path: str) -> Dict:
                 path = f"{provider.name}/{service_type}/individual/{name}.parquet"
                 ctx.spool.put_ready(provider.name, path, data)
                 written.append(path)
+    if result.tables is not None and ctx.config.output.live_snapshot:
+        _write_live(ctx, provider.name, api, result.tables, fetch_time, state)
     # Only once written: after a failure, the same content is tried again
     state["snapshot"] = result.snapshot
     ctx.spool.save_state(feed, state)
     return {"feed": feed, "summary": result.summary, "written": written}
+
+
+def _write_live(ctx, provider_name, api, tables, fetch_time, state) -> None:
+    """The fetch, whole, as the feed's live snapshot. A failure only costs this snapshot."""
+    now = time.time()
+    if now - state.get("live_at", 0) < ctx.config.output.live_seconds:
+        return
+    try:
+        for service_type, table in tables.items():
+            ctx.storage(provider_name).save_bytes(
+                ParquetSerializer.pyarrow_table_to_bytes(table, compression="zstd"),
+                f"{provider_name}/_live/{service_type}/{feed_slug(api)}.parquet",
+            )
+        state["live_at"] = now
+    except Exception as e:
+        logger.warning(f"Could not write the live snapshot of {api.source}: {e}")
 
 
 def _add_to_window(
