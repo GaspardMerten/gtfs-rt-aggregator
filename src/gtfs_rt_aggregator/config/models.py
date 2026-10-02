@@ -1,4 +1,4 @@
-from typing import List, Optional, Dict, Any, Union
+from typing import List, Literal, Optional, Dict, Any, Union
 
 from ..utils.redact import strip_query
 from pydantic import (
@@ -250,6 +250,10 @@ class StaticConfig(_Model):
         None,
         description="Instead of url: Python function building the GTFS, 'path/to/file.py:function' or 'module:function' (see gtfs_rt_aggregator.adapters)",
     )
+    format: Literal["gtfs", "netex"] = Field(
+        "gtfs",
+        description="Format of the downloaded file: a GTFS zip, or a NeTEx timetable (.xml, .xml.gz or a .zip of XML files), stored as the same GTFS tables",
+    )
     index_url: Optional[str] = Field(
         None,
         description="Page listing the GTFS zip, for feeds whose URL changes (with url_pattern)",
@@ -310,6 +314,8 @@ class StaticConfig(_Model):
                     "A static feed needs one of url, index_url or adapter, not several"
                 )
             _check_source(None, self.adapter, "A static feed")
+            if self.format != "gtfs":
+                raise ValueError("An adapter builds a GTFS zip: format must be gtfs")
             return self
         if bool(self.url) == bool(self.index_url):
             raise ValueError(

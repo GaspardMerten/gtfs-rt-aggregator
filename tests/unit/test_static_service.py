@@ -474,3 +474,106 @@ class TestGtfsParquetVersion(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+NETEX = """<?xml version="1.0" encoding="UTF-8"?>
+<PublicationDelivery xmlns="http://www.netex.org.uk/netex">
+ <dataObjects><CompositeFrame id="C">
+  <FrameDefaults><DefaultLocale><TimeZone>Europe/Rome</TimeZone></DefaultLocale></FrameDefaults>
+  <frames>
+   <ResourceFrame id="R"><organisations><Operator id="OP"><Name>Rail Co</Name></Operator></organisations></ResourceFrame>
+   <ServiceFrame id="SF">
+    <lines>
+     <Line id="L:REG"><Name>Regionale</Name><TransportMode>rail</TransportMode></Line>
+     <Line id="L:BUS"><Name>Autobus</Name><TransportMode>bus</TransportMode></Line>
+    </lines>
+    <scheduledStopPoints>
+     <ScheduledStopPoint id="A"><Name>Alpha</Name><Location><Longitude>9.1</Longitude><Latitude>45.4</Latitude></Location></ScheduledStopPoint>
+     <ScheduledStopPoint id="B"><Name>Beta</Name><Location><Longitude>9.2</Longitude><Latitude>45.5</Latitude></Location></ScheduledStopPoint>
+    </scheduledStopPoints>
+    <journeyPatterns>
+     <ServiceJourneyPattern id="JP:REG"><RouteView><LineRef ref="L:REG"/></RouteView><pointsInSequence>
+      <StopPointInJourneyPattern id="P1" order="1"><ScheduledStopPointRef ref="A"/></StopPointInJourneyPattern>
+      <StopPointInJourneyPattern id="P2" order="2"><ScheduledStopPointRef ref="B"/></StopPointInJourneyPattern>
+     </pointsInSequence></ServiceJourneyPattern>
+     <ServiceJourneyPattern id="JP:BUS"><RouteView><LineRef ref="L:BUS"/></RouteView><pointsInSequence>
+      <StopPointInJourneyPattern id="P3" order="1"><ScheduledStopPointRef ref="B"/></StopPointInJourneyPattern>
+      <StopPointInJourneyPattern id="P4" order="2"><ScheduledStopPointRef ref="A"/></StopPointInJourneyPattern>
+     </pointsInSequence></ServiceJourneyPattern>
+    </journeyPatterns>
+   </ServiceFrame>
+   <TimetableFrame id="TF"><vehicleJourneys>
+    <ServiceJourney id="SJ:1"><Name>10201</Name><dayTypes><DayTypeRef ref="DT"/></dayTypes><ServiceJourneyPatternRef ref="JP:REG"/>
+     <passingTimes>
+      <TimetabledPassingTime><StopPointInJourneyPatternRef ref="P1"/><DepartureTime>08:00:00</DepartureTime></TimetabledPassingTime>
+      <TimetabledPassingTime><StopPointInJourneyPatternRef ref="P2"/><ArrivalTime>08:30:00</ArrivalTime></TimetabledPassingTime>
+     </passingTimes></ServiceJourney>
+    <ServiceJourney id="SJ:2"><Name>B1</Name><dayTypes><DayTypeRef ref="DT"/></dayTypes><ServiceJourneyPatternRef ref="JP:BUS"/>
+     <passingTimes>
+      <TimetabledPassingTime><StopPointInJourneyPatternRef ref="P3"/><DepartureTime>09:00:00</DepartureTime></TimetabledPassingTime>
+      <TimetabledPassingTime><StopPointInJourneyPatternRef ref="P4"/><ArrivalTime>09:30:00</ArrivalTime></TimetabledPassingTime>
+     </passingTimes></ServiceJourney>
+   </vehicleJourneys></TimetableFrame>
+   <ServiceCalendarFrame id="CF">
+    <operatingPeriods><UicOperatingPeriod id="OP:1"><FromDate>2026-09-28T00:00:00</FromDate><ToDate>2026-10-04T00:00:00</ToDate><ValidDayBits>1111100</ValidDayBits></UicOperatingPeriod></operatingPeriods>
+    <dayTypeAssignments><DayTypeAssignment id="DTA" order="1"><OperatingPeriodRef ref="OP:1"/><DayTypeRef ref="DT"/></DayTypeAssignment></dayTypeAssignments>
+   </ServiceCalendarFrame>
+  </frames>
+ </CompositeFrame></dataObjects>
+</PublicationDelivery>
+"""
+
+
+def _gzip(text, mtime=0):
+    import gzip
+
+    return gzip.compress(text.encode(), mtime=mtime)
+
+
+class TestNetexFeed(_StaticTestCase):
+    def setUp(self):
+        super().setUp()
+        _FeedHandler.body = _gzip(NETEX)
+
+    def _configure(self, **static):
+        config = GtfsRtConfig(
+            storage=StorageConfig(type="filesystem", params={}),
+            providers=[
+                ProviderConfig(
+                    name="nl",
+                    timezone="Europe/Amsterdam",
+                    static=[StaticConfig(url=self.url, format="netex", **static)],
+                )
+            ],
+        )
+        self.service = StaticService(config, {"global": self.storage})
+
+    def _table(self, name):
+        latest = json.loads(self.storage.get_bytes("nl/static/latest.json"))
+        return pd.read_parquet(io.BytesIO(self.storage.get_bytes(latest["tables"][name])))
+
+    def test_stored_as_gtfs_tables(self):
+        self._configure(route_types=[2])
+        self._run(1)
+
+        self.assertEqual(self._versions(), ["2026-09-28_01-00-00Z"])
+        self.assertEqual(list(self._table("trips")["trip_short_name"]), ["10201"])
+        self.assertEqual(len(self._table("calendar_dates")), 5)
+        latest = json.loads(self.storage.get_bytes("nl/static/latest.json"))
+        self.assertEqual(list(latest["files"]), ["netex.xml"])
+
+    def test_recompressed_file_not_stored_again(self):
+        self._configure()
+        self._run(1)
+        # Same XML, gzipped at another time: the gzip header differs
+        _FeedHandler.body = _gzip(NETEX, mtime=1_000_000)
+        self._run(2)
+        self.assertEqual(len(self._versions()), 1)
+
+        _FeedHandler.body = _gzip(NETEX.replace("08:30:00", "08:35:00"))
+        self._run(3)
+        self.assertEqual(len(self._versions()), 2)
+
+    def test_adapter_and_netex_rejected(self):
+        with self.assertRaises(ValueError):
+            StaticConfig(adapter="module:function", format="netex")

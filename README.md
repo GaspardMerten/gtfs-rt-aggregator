@@ -169,6 +169,7 @@ Needs the `static` extra. A new version is stored only when a file inside the zi
 | `url` | | URL of the GTFS zip. |
 | `index_url`, `url_pattern` | | Instead of `url`, for feeds published under a new URL for each version. The page at `index_url` (HTML or JSON) is read and the greatest link matching the regex `url_pattern` is downloaded. |
 | `adapter` | | Instead of `url`: a Python function that builds the GTFS. See [Adapters](#adapters). |
+| `format` | `gtfs` | `netex` for a NeTEx timetable (`.xml`, `.xml.gz` or a zip of XML files), such as the ones published on national access points: it is stored as the same GTFS tables (needs gtfs-parquet 0.7). |
 | `check_minutes` | `60` | How often to check for a new version. |
 | `name` | `"static"` | Folder the versions are stored in. Only needed if the provider has several static feeds. |
 | `headers` | none | HTTP headers. |

@@ -1,3 +1,4 @@
+import gzip
 import html
 import importlib.metadata
 import itertools
@@ -7,6 +8,7 @@ import re
 import os
 import tempfile
 import zipfile
+import zlib
 from datetime import date, datetime, timedelta
 from urllib.parse import urljoin
 from typing import Dict, Any, Optional, Tuple
@@ -125,9 +127,16 @@ class StaticService:
                     "Static feeds need gtfs-parquet: pip install 'gtfs_rt_aggregator[static]'"
                 )
             version = importlib.metadata.version("gtfs-parquet")
-            if _version_tuple(version) < (0, 6, 1):
+            netex = any(
+                static.format == "netex"
+                for provider in config.providers
+                for static in provider.static
+            )
+            needed = (0, 7, 0) if netex else (0, 6, 1)
+            if _version_tuple(version) < needed:
                 raise ImportError(
-                    f"Static feeds need gtfs-parquet 0.6.1 or later, found {version}: "
+                    f"{'NeTEx' if netex else 'Static'} feeds need gtfs-parquet "
+                    f"{'.'.join(map(str, needed))} or later, found {version}: "
                     "pip install -U 'gtfs_rt_aggregator[static]'"
                 )
 
@@ -272,11 +281,15 @@ class StaticService:
         )
         fetch_time = datetime.fromisoformat(meta["fetch_time"])
 
-        files = self._zip_fingerprint(zip_path)
-        if not files:
-            raise ValueError(f"No GTFS .txt file found in {saved_url}")
-
         static = self._static_config(provider_name, feed_name)
+        netex = static is not None and static.format == "netex"
+        files = (
+            self._netex_fingerprint(zip_path) if netex else self._zip_fingerprint(zip_path)
+        )
+        if not files:
+            kind = "NeTEx .xml" if netex else "GTFS .txt"
+            raise ValueError(f"No {kind} file found in {saved_url}")
+
         route_types = sorted(static.route_type_set()) if static else []
         expired = bool(
             latest
@@ -305,7 +318,7 @@ class StaticService:
             return
 
         work_dir = os.path.join(os.path.dirname(zip_path), "parquet")
-        converted = self._convert(zip_path, work_dir)
+        converted = self._convert(zip_path, work_dir, netex)
         if not converted:
             raise ValueError(f"No GTFS table could be parsed from {saved_url}")
 
@@ -452,6 +465,31 @@ class StaticService:
                 # GTFS files must be at the root of the zip
                 if "/" not in info.filename and info.filename.endswith(".txt")
             }
+
+    @staticmethod
+    def _netex_fingerprint(path: str) -> Dict[str, Dict[str, int]]:
+        """
+        Checksum and size of each NeTEx XML document in the download.
+
+        A gzipped file is checksummed uncompressed, since its header holds the
+        time it was compressed; a zip, from its index.
+        """
+        with open(path, "rb") as f:
+            magic = f.read(4)
+        if magic == b"PK\x03\x04":
+            with zipfile.ZipFile(path) as zf:
+                return {
+                    info.filename: {"crc": info.CRC, "size": info.file_size}
+                    for info in zf.infolist()
+                    if info.filename.lower().endswith(".xml")
+                }
+        opener = gzip.open if magic[:2] == b"\x1f\x8b" else open
+        crc, size = 0, 0
+        with opener(path, "rb") as f:
+            while chunk := f.read(1 << 20):
+                crc = zlib.crc32(chunk, crc)
+                size += len(chunk)
+        return {"netex.xml": {"crc": crc, "size": size}} if size else {}
 
     def _static_config(self, provider_name: str, feed_name: str):
         provider = next(
@@ -664,12 +702,16 @@ class StaticService:
         return both.select(changed.mean()).item()
 
     @staticmethod
-    def _convert(zip_path: str, out_dir: str) -> Dict[str, str]:
-        """Convert the GTFS zip to one Parquet file per table, in out_dir."""
+    def _convert(zip_path: str, out_dir: str, netex: bool = False) -> Dict[str, str]:
+        """Convert the GTFS zip (or NeTEx file) to one Parquet file per table, in out_dir."""
         # Polars' memory grows with its thread count (one per core by default):
         # 4 threads keep a national feed around 0.5 GB. Only effective if Polars
         # was not imported yet in this process, which is the case in a job.
         os.environ.setdefault("POLARS_MAX_THREADS", "4")
+        if netex:
+            from gtfs_parquet import convert_netex
+
+            return convert_netex(zip_path, out_dir)
         from gtfs_parquet import convert_gtfs_zip
 
         return convert_gtfs_zip(zip_path, out_dir)
