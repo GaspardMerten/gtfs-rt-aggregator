@@ -27,16 +27,15 @@ trip_tripId; stopTimeUpdate a list of structs), including the next local day's f
 midnight. The timetable comes through a callback, so any storage works (see storage_timetable).
 
 Limits: trips are keyed by trip_id and service date, so frequency-based trips (one trip_id, several runs)
-and trips sent without a trip_id are not supported, and the service date is trip.startDate or, when the
-feed sends none, the local date of the fetch (a trip without startDate running past midnight is split in
-two). Rail feeds fit; for frequency-based or undated feeds, TripStopEvent (aggregator/trip_stop_events.py)
+and trips sent without a trip_id are not supported. The service date is trip.startDate or, when the feed
+sends none, the local date of the fetch (after midnight, the previous day's for a trip the timetable runs
+past midnight). Rail feeds fit; for frequency-based feeds, TripStopEvent (aggregator/trip_stop_events.py)
 resolves runs from the schedule.
 """
 
-import logging
-
 import datetime as dt
 import json
+import logging
 import re
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Tuple, Union
@@ -60,6 +59,10 @@ CALL_WINDOW_S = 600
 FIT_S = 1800
 MIN_FIT = 0.5
 SAMPLE_ROWS = 20_000
+# A fetch without startDate, after midnight, belongs to the previous day's run of a trip running past midnight
+# when it comes before that run's last scheduled time plus LATE_S, and over LEAD_S before the coming run starts
+LATE_S = 3 * 3600
+LEAD_S = 3600
 
 # Ties between updates of one fetch: the later row of the files, then the values (one list can repeat a stop)
 LATER = ("src DESC, rn DESC, arr_t DESC NULLS LAST, dep_t DESC NULLS LAST, arr_d DESC NULLS LAST, "
@@ -209,6 +212,31 @@ def _quote(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
 
 
+def _undated_runs(con, tmp: Path, timetable: Timetable, c, fallback_version: str, service_day: str) -> bool:
+    """Trips without startDate running past midnight, with their first and last scheduled seconds (table
+    night): a fetch after midnight then belongs to the previous day's run, not to the coming one."""
+    con.execute("CREATE TABLE night (trip VARCHAR, first_s DOUBLE, last_s DOUBLE)")
+    con.execute(f"""CREATE TEMP TABLE undated AS SELECT DISTINCT _trip AS trip, coalesce({c('staticVersion')}, {fallback_version}) AS version
+        FROM keyed WHERE _start IS NULL AND _trip IS NOT NULL""")
+    versions = [r[0] for r in con.execute("SELECT DISTINCT version FROM undated WHERE version IS NOT NULL ORDER BY 1").fetchall()]
+    for i, version in enumerate(versions):
+        path = tmp / f"static-night{i}-stop_times.parquet"
+        if not timetable(version, "stop_times", path):
+            continue
+        st = pq.read_schema(path)
+        kind = con.execute(f"SELECT typeof(arrival_time) FROM read_parquet({_quote(str(path))}) LIMIT 1").fetchone() if "arrival_time" in st.names else None
+        sec = lambda n: ("CAST(NULL AS DOUBLE)" if n not in st.names else
+                         f'epoch("{n}")' if kind and kind[0].startswith("INTERVAL") else f'"{n}" / 1000.0')
+        con.execute(f"""INSERT INTO night SELECT trip, min(coalesce({sec('departure_time')}, {sec('arrival_time')})),
+                max(coalesce({sec('arrival_time')}, {sec('departure_time')}))
+            FROM (SELECT *, trim(CAST(trip_id AS VARCHAR)) AS trip FROM read_parquet({_quote(str(path))}))
+            WHERE trip IN (SELECT trip FROM undated WHERE version = ?) GROUP BY trip HAVING max(coalesce({sec('arrival_time')}, {sec('departure_time')})) > 86400""",
+                    [version])
+        path.unlink()
+    con.execute("CREATE OR REPLACE TABLE night AS SELECT trip, min(first_s) AS first_s, max(last_s) AS last_s FROM night GROUP BY trip")
+    return con.execute("SELECT count(*) FROM night").fetchone()[0] > 0
+
+
 def _final_calls(con, files: List[Path], schema: pa.Schema, service_day: str, tz: str, timetable: Timetable,
                  tmp: Path, default_version: Optional[str], memory_limit: Optional[str], threads: Optional[int]):
     if memory_limit is not None:
@@ -223,14 +251,22 @@ def _final_calls(con, files: List[Path], schema: pa.Schema, service_day: str, tz
     # a day always gives the same result
     # (rows without a fetch time never win, as with arg_max on observed alone)
     last = "CASE WHEN observed IS NOT NULL THEN struct_pack(o := observed, f := src, r := rn) END"
-    # The service day: trip_startDate (either format), else the local day of the fetch
-    fetch_day = f"strftime({c('date', 'DATE')}, '%Y%m%d')" if "date" in schema.names else f"'{service_day}'"
+    # The service day: trip_startDate (either format), else the run the fetch saw (_undated_runs)
+    local = f"timezone({_quote(tz)}, to_timestamp({observed}))"
+    fetch_day = (f"coalesce(strftime({c('date', 'DATE')}, '%Y%m%d'), strftime({local}, '%Y%m%d'))" if "date" in schema.names
+                 else f"strftime({local}, '%Y%m%d')")
     # One feed per source (most): ignore feedId, which files written before 0.7.3 lack (a trip would be split in two)
     feeds = con.execute(f"SELECT count(DISTINCT {c('feedId')}) FROM raw").fetchone()[0] if "feedId" in schema.names else 0
     feed = f"coalesce({c('feedId')}, '')" if feeds > 1 else "''"
-    trip_keys = (f"{feed} AS feed, replace(coalesce({c('trip_startDate')}, {fetch_day}), '-', '') AS sd, "
-                 f"{c('trip_tripId')} AS trip")
     fallback_version = _quote(default_version) if default_version else "NULL"
+    start_date = f"nullif(trim({c('trip_startDate')}), '')"
+    con.execute(f"""CREATE VIEW keyed AS SELECT *, trim({c('trip_tripId')}) AS _trip, {start_date} AS _start,
+        {fetch_day} AS _fetch_day, epoch({local}) % 86400 AS _tod FROM raw""")
+    night = _undated_runs(con, tmp, timetable, c, fallback_version, service_day)
+    shifted = (f"CASE WHEN _start IS NULL AND _trip IN (SELECT trip FROM night WHERE _tod + 86400 <= last_s + {LATE_S} AND _tod < first_s - {LEAD_S})"
+               f" THEN strftime(strptime(_fetch_day, '%Y%m%d') - INTERVAL 1 DAY, '%Y%m%d') ELSE _fetch_day END") if night else "_fetch_day"
+    con.execute(f"CREATE VIEW raw2 AS SELECT *, replace(coalesce(_start, {shifted}), '-', '') AS _sd FROM keyed")
+    trip_keys = f"{feed} AS feed, _sd AS sd, _trip AS trip"
     # Each trip is matched to the timetable version its rows name (trip ids change between versions for
     # some feeds); rows without one use default_version
     con.execute(f"""CREATE TABLE t AS
@@ -238,7 +274,7 @@ def _final_calls(con, files: List[Path], schema: pa.Schema, service_day: str, tz
                max(start_time) AS start_time, coalesce(arg_max(version, {last}) FILTER (version IS NOT NULL), {fallback_version}) AS version
         FROM (SELECT {trip_keys}, {c('trip_scheduleRelationship')} AS status, {c('trip_routeId')} AS route_id,
                      {c('trip_startTime')} AS start_time, {c('staticVersion')} AS version, {observed} AS observed,
-                     filename AS src, file_row_number AS rn FROM raw)
+                     filename AS src, file_row_number AS rn FROM raw2)
         WHERE trip IS NOT NULL AND sd = '{service_day}' GROUP BY ALL""")
     fields = _update_fields(schema)
     f = lambda path, t: f"CAST(s.{path} AS {t})" if path in fields else f"CAST(NULL AS {t})"
@@ -252,7 +288,7 @@ def _final_calls(con, files: List[Path], schema: pa.Schema, service_day: str, tz
                        {f('arrival.delay', 'BIGINT')} AS arr_d, {f('arrival.time', 'BIGINT')} AS arr_t,
                        {f('departure.delay', 'BIGINT')} AS dep_d, {f('departure.time', 'BIGINT')} AS dep_t,
                        {f('scheduleRelationship', 'VARCHAR')} AS stop_status
-                FROM raw, UNNEST(raw.stopTimeUpdate) AS x(s))
+                FROM raw2, UNNEST(raw2.stopTimeUpdate) AS x(s))
               WHERE trip IS NOT NULL AND sd = '{service_day}'
               QUALIFY row_number() OVER (PARTITION BY feed, sd, trip, seq, stop_id,
                 CAST(floor(coalesce(arr_t - arr_d, dep_t - dep_d, arr_t, dep_t, 0) / {CALL_WINDOW_S}) AS BIGINT)
@@ -268,9 +304,9 @@ def _final_calls(con, files: List[Path], schema: pa.Schema, service_day: str, tz
     con.execute("CREATE TABLE alias (version VARCHAR, trip VARCHAR, static VARCHAR, route_id VARCHAR)")
     versions = [r[0] for r in con.execute("SELECT version FROM t WHERE version IS NOT NULL GROUP BY 1 ORDER BY count(*) DESC, 1").fetchall()]
     stats["timetable_versions"] = versions
-    undated = con.execute(f"SELECT count(*) FROM (SELECT {trip_keys} FROM raw) WHERE trip IS NOT NULL AND sd IS NULL").fetchone()[0]
+    undated = con.execute("SELECT count(*) FROM raw2 WHERE _trip IS NOT NULL AND _sd IS NULL").fetchone()[0]
     if undated:
-        logger.warning("final_calls: %d rows without trip.startDate nor a date column are left out", undated)
+        logger.warning("final_calls: %d rows without trip.startDate nor a fetch time are left out", undated)
     if not versions:
         logger.warning("final_calls: no static version for the trips (no staticVersion in the files and no "
                        "default_version): calls have no schedule")
@@ -375,6 +411,8 @@ def _final_calls(con, files: List[Path], schema: pa.Schema, service_day: str, tz
         LEFT JOIN s ON s.version = pc.version AND s.stop_id = u.stop_id
         WHERE u.stop_id IS NOT NULL AND (pc.stop_id = u.stop_id OR pc.station = coalesce(s.station, u.stop_id))
         QUALIFY row_number() OVER (PARTITION BY u.id ORDER BY pc.stop_id = u.stop_id DESC,
+          -- A train calling twice at a stop: the call numbered as the update (in any numbering), then the nearest
+          coalesce(u.seq IN (pc.seq, pc.pos, pc.crank), false) DESC,
           abs(coalesce({est}, pc.sched) - pc.sched), pc.seq) = 1""")
     # By stop_sequence, for the rest: feeds number calls as the timetable does, by position, or by commercial
     # rank; the numbering kept is the one whose scheduled times fit the live ones best
@@ -432,8 +470,10 @@ def _final_calls(con, files: List[Path], schema: pa.Schema, service_day: str, tz
           FROM dated),
         planned AS (
           SELECT timed.*, min(call_seq) OVER (PARTITION BY feed, sd, trip) AS first_listed,
-                 last_value(coalesce(dep_d, arr_d) IGNORE NULLS) OVER (PARTITION BY feed, sd, trip ORDER BY seq
-                   ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) AS carried
+                 -- The last delay before the call, unless a NO_DATA stop came after it (no data from there on)
+                 (last_value(CASE WHEN listed AND upper(coalesce(stop_status, '')) = 'NO_DATA' THEN struct_pack(d := NULL::BIGINT)
+                                  WHEN coalesce(dep_d, arr_d) IS NOT NULL THEN struct_pack(d := coalesce(dep_d, arr_d)) END IGNORE NULLS)
+                   OVER (PARTITION BY feed, sd, trip ORDER BY seq ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING)).d AS carried
           FROM timed),
         running AS (
           SELECT p.feed, p.sd, p.trip, p.seq AS stop_sequence, p.stop_id, p.sched_arr, p.sched_dep,

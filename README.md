@@ -413,13 +413,14 @@ Use it or `TripStopEvent`:
 - `TripStopEvent` runs in the pipeline, keeps the first and last prediction per stop, and resolves runs from the
   schedule, so it suits buses and frequency-based feeds that follow the spec.
 - `final_calls` runs on a finished day, keeps only the last value, and is built for rail feeds that bend the spec.
-  It needs a `trip_id` per trip and does not support frequency-based trips. The service day is `trip.startDate`,
-  or the local day of the fetch when the feed sends none, so an undated trip running past midnight is split in two.
+  It needs a `trip_id` per trip and does not support frequency-based trips. The service day is `trip.startDate`;
+  when the feed sends none, it is the local day of the fetch, except that a fetch after midnight goes to the
+  previous day's run of a trip the timetable runs past midnight.
 
 What `final_calls` does:
 
-- Updates are matched by stop, or by another platform of the same station, nearest scheduled time first. A train
-  calling twice at one stop keeps both calls.
+- Updates are matched by stop, or by another platform of the same station. When the train calls there twice, the
+  call numbered as the update wins, then the nearest scheduled time.
 - The other updates are matched by `stop_sequence`, read in whichever way fits the live times best: as the
   timetable's own numbering, as the position in the trip, or as the rank among stops where passengers can board
   or alight.
@@ -427,7 +428,8 @@ What `final_calls` does:
   from that version uses the newest version that has it. A trip id ending in a date and missing from the timetable
   takes the only trip with the same id up to that date running on the day.
 - Feeds sending only times get delays from the schedule. A time dated a whole day off is moved to the right day.
-- Planned stops the feed skipped after its first update take the previous delay (`delay_source = "propagated"`).
+- Planned stops the feed skipped after its first update take the previous delay (`delay_source = "propagated"`),
+  up to a stop marked `NO_DATA`.
 - Canceled trips get every planned stop where passengers can board or alight. Updates of added trips are kept
   without a schedule.
 - When one fetch holds a stop twice, the later row of the files wins, so a day always gives the same result.

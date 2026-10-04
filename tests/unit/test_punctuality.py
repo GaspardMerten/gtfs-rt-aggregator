@@ -266,3 +266,79 @@ class TestInputs(_Case):
         pq.write_table(pa.table({"trip_tripId": ["T"], "fetchTime": pa.array([1], pa.timestamp("us", "UTC"))}), b)
         with self.assertRaisesRegex(ValueError, "schemas differ"):
             final_calls([a, b], DAY, TZ, lambda *a: False, self.dir / "work")
+
+
+class TestCallingTwice(_Case):
+    # A loop: A, B, C, then A again
+    TT = {"v1": {"stop_times": stop_times([("L", 1, "A", 9, True), ("L", 2, "B", 9.2, True), ("L", 3, "C", 9.4, True),
+                                           ("L", 4, "A", 9.6, True)])}}
+
+    def delays(self, updates):
+        calls, _ = self.run_calls([trip_row("L", updates)], self.TT)
+        return [(r["stop_sequence"], r["arrival_delay"], r["delay_source"]) for r in self.of(calls, "L")]
+
+    def test_delays_only(self):
+        got = self.delays([stu(seq=1, stop="A", dep_delay=60), stu(seq=2, stop="B", arr_delay=120),
+                           stu(seq=3, stop="C", arr_delay=180), stu(seq=4, stop="A", arr_delay=240)])
+        self.assertEqual(got[3], (4, 240, "feed"))
+
+    def test_first_calls_passed(self):
+        got = self.delays([stu(seq=3, stop="C", arr_delay=180), stu(seq=4, stop="A", arr_delay=240)])
+        self.assertEqual(got, [(3, 180, "feed"), (4, 240, "feed")])
+
+    def test_times_only_late_beyond_half_the_gap(self):
+        tt = {"v1": {"stop_times": stop_times([("X", 1, "X", 9, True), ("X", 2, "Y", 9.1, True), ("X", 3, "X", 9.2, True),
+                                               ("X", 4, "Z", 9.3, True), ("X", 5, "X", 9.4, True)])}}
+        late = lambda h: at(h + 0.25)
+        calls, _ = self.run_calls([trip_row("X", [stu(seq=1, stop="X", dep_time=late(9)), stu(seq=3, stop="X", arr_time=late(9.2)),
+                                                  stu(seq=5, stop="X", arr_time=late(9.4))])], tt)
+        self.assertEqual({r["stop_sequence"]: r["arrival_delay"] or r["departure_delay"] for r in self.of(calls, "X") if r["stop_id"] == "X"},
+                         {1: 900, 3: 900, 5: 900})
+
+
+class TestPropagation(_Case):
+    def test_stops_at_no_data(self):
+        tt = {"v1": {"stop_times": stop_times([("T", 1, "A", 8, True), ("T", 2, "B", 9, True), ("T", 3, "C", 10, True),
+                                               ("T", 4, "D", 11, True)])}}
+        calls, _ = self.run_calls([trip_row("T", [stu(seq=1, stop="A", dep_delay=300), stu(seq=2, stop="B", status="NO_DATA")])], tt)
+        self.assertEqual([(r["stop_id"], r["departure_delay"]) for r in self.of(calls, "T")], [("A", 300), ("B", None)])
+
+    def test_goes_on_after_skipped(self):
+        tt = {"v1": {"stop_times": stop_times([("T", 1, "A", 8, True), ("T", 2, "B", 9, True), ("T", 3, "C", 10, True)])}}
+        calls, _ = self.run_calls([trip_row("T", [stu(seq=1, stop="A", dep_delay=300), stu(seq=2, stop="B", status="SKIPPED")])], tt)
+        self.assertEqual([(r["stop_id"], r["departure_delay"], r["delay_source"]) for r in self.of(calls, "T")][2], ("C", 300, "propagated"))
+
+
+class TestUndated(_Case):
+    # Night train: A 23:30, B 24:00, C 24:30; the feed sends no startDate
+    TT = {"v1": {"stop_times": stop_times([("N", 1, "A", 23.5, True), ("N", 2, "B", 24, True), ("N", 3, "C", 24.5, True)])}}
+
+    @staticmethod
+    def row(updates, local_day, utc):
+        return dict(trip_row("N", updates, fetch=utc), trip_startDate=None, date=local_day)
+
+    def test_fetch_after_midnight_counts_for_the_previous_day(self):
+        rows = [self.row([stu(seq=1, stop="A", dep_delay=60)], date(2026, 10, 5), datetime(2026, 10, 5, 21, 40, tzinfo=timezone.utc)),
+                self.row([stu(seq=3, stop="C", arr_delay=600)], date(2026, 10, 6), datetime(2026, 10, 5, 22, 20, tzinfo=timezone.utc))]
+        calls, _ = self.run_calls(rows, self.TT)
+        self.assertEqual([(r["stop_id"], r["arrival_delay"], r["delay_source"]) for r in self.of(calls, "N")][2], ("C", 600, "feed"))
+
+    def test_last_nights_run_is_left_out(self):
+        rows = [self.row([stu(seq=3, stop="C", arr_delay=900)], date(2026, 10, 5), datetime(2026, 10, 4, 22, 20, tzinfo=timezone.utc)),
+                self.row([stu(seq=1, stop="A", dep_delay=60)], date(2026, 10, 5), datetime(2026, 10, 5, 21, 40, tzinfo=timezone.utc))]
+        calls, _ = self.run_calls(rows, self.TT)
+        self.assertEqual([(r["stop_id"], r["arrival_delay"], r["delay_source"]) for r in self.of(calls, "N")][2], ("C", 60, "propagated"))
+
+    def test_files_without_date_column(self):
+        # Before 0.6.0: no date column; the next day's run of a daily trip must not count
+        tt = {"v1": {"stop_times": stop_times([("D", 1, "A", 8, True), ("D", 2, "B", 9, True)])}}
+        schema = TU_SCHEMA.remove(TU_SCHEMA.get_field_index("date"))
+        rows = [dict(trip_row("D", [stu(seq=2, stop="B", arr_delay=d)], fetch=f), trip_startDate=None)
+                for d, f in ((60, datetime(2026, 10, 5, 6, 50, tzinfo=timezone.utc)), (1200, datetime(2026, 10, 6, 6, 50, tzinfo=timezone.utc)))]
+        for r in rows:
+            del r["date"]
+        path = self.dir / "old.parquet"
+        pq.write_table(pa.Table.from_pylist(rows, schema=schema), path)
+        calls, _ = final_calls([path], DAY, TZ, lambda v, t, d: t in tt["v1"] and (pq.write_table(tt["v1"][t], d) or True),
+                               self.dir / "work", default_version="v1")
+        self.assertEqual([r["arrival_delay"] for r in calls.to_pylist() if r["stop_id"] == "B"], [60])
