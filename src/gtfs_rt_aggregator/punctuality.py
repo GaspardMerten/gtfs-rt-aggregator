@@ -87,6 +87,7 @@ COLUMNS = [
     "trip_schedule_relationship",  # as in the feed, e.g. CANCELED, ADDED
     "route_id",
     "trip_start_time",
+    "timetable_version",  # the static version the train was matched to (names, ids): trip and stop ids change between versions
 ]
 
 
@@ -95,7 +96,7 @@ _EMPTY = [("feed_id", pa.string()), ("service_date", pa.string()), ("trip_id", p
           ("arrival_delay", pa.int64()), ("departure_delay", pa.int64()), ("predicted_arrival", pa.float64()),
           ("predicted_departure", pa.float64()), ("observed_at", pa.float64()), ("stop_schedule_relationship", pa.string()),
           ("delay_source", pa.string()), ("trip_schedule_relationship", pa.string()), ("route_id", pa.string()),
-          ("trip_start_time", pa.string())]
+          ("trip_start_time", pa.string()), ("timetable_version", pa.string())]
 
 
 def storage_timetable(storage, provider_name: str, feed_name: str = "static") -> Timetable:
@@ -450,6 +451,8 @@ def _final_calls(con, files: List[Path], schema: pa.Schema, service_day: str, tz
                avg(CAST({added} AS DOUBLE)) FROM t""").fetchone()
 
     cancelled = "upper(coalesce(t.status, '')) IN ('CANCELED', 'CANCELLED', 'DELETED')"
+    skipped = "upper(coalesce(stop_status, '')) = 'SKIPPED'"
+    f_skipped = "upper(coalesce(f.stop_status, '')) = 'SKIPPED'"
     table = con.execute(f"""
         WITH dated AS (  -- a predicted time on the wrong day (some feeds date stops after midnight on the day
                          -- before) moves by whole days to the planned time's day
@@ -471,15 +474,18 @@ def _final_calls(con, files: List[Path], schema: pa.Schema, service_day: str, tz
         planned AS (
           SELECT timed.*, min(call_seq) OVER (PARTITION BY feed, sd, trip) AS first_listed,
                  -- The last delay before the call, unless a NO_DATA stop came after it (no data from there on)
+                 -- A SKIPPED stop has no time of its own: it is not a delay to carry (its row is passed over)
                  (last_value(CASE WHEN listed AND upper(coalesce(stop_status, '')) = 'NO_DATA' THEN struct_pack(d := NULL::BIGINT)
+                                  WHEN listed AND {skipped} THEN NULL
                                   WHEN coalesce(dep_d, arr_d) IS NOT NULL THEN struct_pack(d := coalesce(dep_d, arr_d)) END IGNORE NULLS)
                    OVER (PARTITION BY feed, sd, trip ORDER BY seq ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING)).d AS carried
           FROM timed),
         running AS (
           SELECT p.feed, p.sd, p.trip, p.seq AS stop_sequence, p.stop_id, p.sched_arr, p.sched_dep,
-                 CASE WHEN listed THEN arr_d ELSE carried END AS arr_d, CASE WHEN listed THEN dep_d ELSE carried END AS dep_d,
-                 CASE WHEN listed THEN coalesce(arr_t, sched_arr + arr_d) ELSE sched_arr + carried END AS pred_arr,
-                 CASE WHEN listed THEN coalesce(dep_t, sched_dep + dep_d) ELSE sched_dep + carried END AS pred_dep,
+                 CASE WHEN listed AND {skipped} THEN NULL WHEN listed THEN arr_d ELSE carried END AS arr_d,
+                 CASE WHEN listed AND {skipped} THEN NULL WHEN listed THEN dep_d ELSE carried END AS dep_d,
+                 CASE WHEN listed AND {skipped} THEN NULL WHEN listed THEN coalesce(arr_t, sched_arr + arr_d) ELSE sched_arr + carried END AS pred_arr,
+                 CASE WHEN listed AND {skipped} THEN NULL WHEN listed THEN coalesce(dep_t, sched_dep + dep_d) ELSE sched_dep + carried END AS pred_dep,
                  p.observed, p.stop_status, CASE WHEN listed THEN 'feed' ELSE 'propagated' END AS delay_source
           FROM planned p JOIN t USING (feed, sd, trip)
           WHERE NOT {cancelled} AND (listed OR (p.commercial AND p.seq > p.first_listed AND p.carried IS NOT NULL))),
@@ -487,7 +493,10 @@ def _final_calls(con, files: List[Path], schema: pa.Schema, service_day: str, tz
           SELECT pc.feed, pc.sd, pc.trip, pc.seq, pc.stop_id, pc.sched_arr, pc.sched_dep, NULL, NULL, NULL, NULL, NULL, NULL, NULL
           FROM pc JOIN t USING (feed, sd, trip) WHERE {cancelled} AND pc.commercial),
         unmatched AS (
-          SELECT f.feed, f.sd, f.trip, f.seq, f.stop_id, NULL, NULL, f.arr_d, f.dep_d, coalesce(f.arr_t, NULL), coalesce(f.dep_t, NULL),
+          -- A cancelled train or a skipped stop keeps no delay (the feed's value is not a time the train ran)
+          SELECT f.feed, f.sd, f.trip, f.seq, f.stop_id, NULL, NULL,
+                 CASE WHEN {cancelled} OR {f_skipped} THEN NULL ELSE f.arr_d END, CASE WHEN {cancelled} OR {f_skipped} THEN NULL ELSE f.dep_d END,
+                 CASE WHEN {cancelled} OR {f_skipped} THEN NULL ELSE f.arr_t END, CASE WHEN {cancelled} OR {f_skipped} THEN NULL ELSE f.dep_t END,
                  f.observed, f.stop_status, 'feed'
           FROM f JOIN t USING (feed, sd, trip) WHERE f.call_seq IS NULL
             AND NOT EXISTS (SELECT 1 FROM pc WHERE pc.feed = f.feed AND pc.sd = f.sd AND pc.trip = f.trip AND ({cancelled} OR NOT ({informative})))),
@@ -499,7 +508,7 @@ def _final_calls(con, files: List[Path], schema: pa.Schema, service_day: str, tz
                x.sched_arr AS scheduled_arrival, x.sched_dep AS scheduled_departure, x.arr_d AS arrival_delay,
                x.dep_d AS departure_delay, x.pred_arr AS predicted_arrival, x.pred_dep AS predicted_departure,
                x.observed AS observed_at, x.stop_status AS stop_schedule_relationship, x.delay_source,
-               t.status AS trip_schedule_relationship, t.route_id, t.start_time AS trip_start_time FROM (
+               t.status AS trip_schedule_relationship, t.route_id, t.start_time AS trip_start_time, t.version AS timetable_version FROM (
           SELECT * FROM running UNION ALL SELECT * FROM stopped UNION ALL SELECT * FROM unmatched UNION ALL SELECT * FROM bare) x
         JOIN t USING (feed, sd, trip)
         ORDER BY feed_id, trip_id, stop_sequence NULLS LAST, stop_id, scheduled_arrival""")

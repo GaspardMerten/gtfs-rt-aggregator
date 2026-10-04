@@ -308,6 +308,31 @@ class TestPropagation(_Case):
         calls, _ = self.run_calls([trip_row("T", [stu(seq=1, stop="A", dep_delay=300), stu(seq=2, stop="B", status="SKIPPED")])], tt)
         self.assertEqual([(r["stop_id"], r["departure_delay"], r["delay_source"]) for r in self.of(calls, "T")][2], ("C", 300, "propagated"))
 
+    def test_skipped_stop_keeps_no_delay_and_is_not_carried(self):
+        # The feed sends a time-looking delay at a skipped stop (+40 min): the stop keeps none, and the next
+        # stop carries the last delay of a stop the train called at (+5 min)
+        tt = {"v1": {"stop_times": stop_times([("T", 1, "A", 8, True), ("T", 2, "B", 9, True), ("T", 3, "C", 10, True)])}}
+        calls, _ = self.run_calls([trip_row("T", [stu(seq=1, stop="A", dep_delay=300),
+                                                  stu(seq=2, stop="B", arr_delay=2400, dep_delay=2400, status="SKIPPED")])], tt)
+        rows = [(r["stop_id"], r["arrival_delay"], r["predicted_arrival"], r["stop_schedule_relationship"]) for r in self.of(calls, "T")]
+        self.assertEqual(rows[1], ("B", None, None, "SKIPPED"))
+        self.assertEqual(self.of(calls, "T")[2]["arrival_delay"], 300)
+
+    def test_cancelled_train_outside_the_timetable_keeps_no_delay(self):
+        calls, _ = self.run_calls([trip_row("GONE", [stu(seq=1, stop="A", arr_delay=900)], status="CANCELED")],
+                                  {"v1": {"stop_times": stop_times([("T", 1, "A", 8, True)])}})
+        self.assertEqual([(r["stop_id"], r["arrival_delay"]) for r in self.of(calls, "GONE")], [("A", None)])
+
+
+class TestVersions(_Case):
+    def test_each_row_names_its_timetable_version(self):
+        # Ids changed between versions (a timetable release mid-day): each train names the version it matched
+        tt = {"v1": {"stop_times": stop_times([("OLD", 1, "A", 8, True)])},
+              "v2": {"stop_times": stop_times([("NEW", 1, "A", 9, True)])}}
+        calls, _ = self.run_calls([trip_row("OLD", [stu(seq=1, stop="A", arr_delay=60)], version="v1"),
+                                   trip_row("NEW", [stu(seq=1, stop="A", arr_delay=60)], version="v2")], tt)
+        self.assertEqual({r["trip_id"]: r["timetable_version"] for r in calls}, {"OLD": "v1", "NEW": "v2"})
+
 
 class TestUndated(_Case):
     # Night train: A 23:30, B 24:00, C 24:30; the feed sends no startDate

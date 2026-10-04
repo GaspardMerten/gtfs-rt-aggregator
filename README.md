@@ -430,8 +430,11 @@ What `final_calls` does:
 - Feeds sending only times get delays from the schedule. A time dated a whole day off is moved to the right day.
 - Planned stops the feed skipped after its first update take the previous delay (`delay_source = "propagated"`),
   up to a stop marked `NO_DATA`.
-- Canceled trips get every planned stop where passengers can board or alight. Updates of added trips are kept
-  without a schedule.
+- A stop marked `SKIPPED` keeps no delay or predicted time, and is not a delay later stops take.
+- Canceled trips get every planned stop where passengers can board or alight, without delays. Updates of added
+  trips are kept without a schedule.
+- `timetable_version` names the version each train was matched to: resolve its stop and route names in that
+  version, as ids can change meaning between versions.
 - When one fetch holds a stop twice, the later row of the files wins, so a day always gives the same result.
 
 ```python
