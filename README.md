@@ -15,6 +15,7 @@ Python 3.11 or later.
 pip install gtfs-rt-aggregator             # realtime feeds only
 pip install "gtfs-rt-aggregator[static]"   # also GTFS static feeds and TripStopEvent
 pip install "gtfs-rt-aggregator[iceberg]"  # also Iceberg tables
+pip install "gtfs-rt-aggregator[punctuality]"  # also final delays per call (DuckDB)
 ```
 
 From source:
@@ -401,6 +402,66 @@ WHERE observed
 GROUP BY ALL
 ORDER BY minutes DESC;
 ```
+
+### Final delays (punctuality)
+
+`gtfs_rt_aggregator.punctuality.final_calls` gives the final delay of every trip at every planned call of a
+service day, from the stored TripUpdate files and timetable versions (`pip install "gtfs-rt-aggregator[punctuality]"`).
+
+Use it or `TripStopEvent`:
+
+- `TripStopEvent` runs in the pipeline, keeps the first and last prediction per stop, and resolves runs from the
+  schedule, so it suits buses and frequency-based feeds that follow the spec.
+- `final_calls` runs on a finished day, keeps only the last value, and is built for rail feeds that bend the spec.
+  It needs a `trip_id` per trip and does not support frequency-based trips. The service day is `trip.startDate`,
+  or the local day of the fetch when the feed sends none, so an undated trip running past midnight is split in two.
+
+What `final_calls` does:
+
+- Updates are matched by stop, or by another platform of the same station, nearest scheduled time first. A train
+  calling twice at one stop keeps both calls.
+- The other updates are matched by `stop_sequence`, read in whichever way fits the live times best: as the
+  timetable's own numbering, as the position in the trip, or as the rank among stops where passengers can board
+  or alight.
+- Each trip uses the timetable version its rows name (`staticVersion`), else `default_version`. A trip missing
+  from that version uses the newest version that has it. A trip id ending in a date and missing from the timetable
+  takes the only trip with the same id up to that date running on the day.
+- Feeds sending only times get delays from the schedule. A time dated a whole day off is moved to the right day.
+- Planned stops the feed skipped after its first update take the previous delay (`delay_source = "propagated"`).
+- Canceled trips get every planned stop where passengers can board or alight. Updates of added trips are kept
+  without a schedule.
+- When one fetch holds a stop twice, the later row of the files wins, so a day always gives the same result.
+
+```python
+from gtfs_rt_aggregator.punctuality import final_calls, storage_timetable
+
+calls, figures = final_calls(
+    ["data/provider=be/service=TripUpdate/date=2026-10-24/day.parquet",
+     "data/provider=be/service=TripUpdate/date=2026-10-25/day.parquet"],  # trains running past midnight
+    "2026-10-24", "Europe/Brussels",
+    storage_timetable(storage, "be"),  # or any function (version, table, dest_path) -> bool
+    work_dir="/tmp/punctuality",       # one folder per concurrent call
+    default_version="2026-10-20_06-00-00Z",  # for rows without staticVersion
+    memory_limit="1GB", threads=2,     # optional, DuckDB's defaults otherwise
+)
+```
+
+Files must be local paths: download them first from remote storage.
+
+`calls` (Arrow, sorted by trip and `stop_sequence`) has one row per call:
+
+- `trip_id`, `stop_sequence`, `stop_id`, `service_date` (YYYYMMDD) and `feed_id`
+- `scheduled_*`, `predicted_*` and `observed_at`, in Unix seconds
+- `arrival_delay` and `departure_delay`, in seconds
+- `delay_source`
+- the stop's and the trip's schedule relationship, `route_id` and `trip_start_time`
+
+`figures` tells how well the feed matched:
+
+- `updates_matched`, `trips_in_timetable` and `trips_added`: shares from 0 to 1, or None without data
+- `stop_sequence_mode` (`"full"`, `"position"`, `"commercial"` or None) and `stop_sequence_scores`
+- `timetable_version` (the `default_version`) and `timetable_versions` (the versions used)
+- `trips_matched_by_id_before_date` and `propagated_calls`: counts
 
 ## License
 
