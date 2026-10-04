@@ -30,6 +30,18 @@ from ..utils.redact import strip_query
 CHANGE_DAYS = 7
 
 
+def _http_time(value: Optional[str]) -> Optional[datetime]:
+    """An HTTP date (Last-Modified), or None if absent or unreadable."""
+    if not value:
+        return None
+    from email.utils import parsedate_to_datetime
+
+    try:
+        return parsedate_to_datetime(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _version_tuple(version: str) -> Tuple[int, ...]:
     """(0, 5, 1) for "0.5.1", "0.5.1.dev3+g1234" or "0.5.1rc1"."""
     parts = []
@@ -225,11 +237,15 @@ class StaticService:
         if index_url:
             url = self._resolve_url(index_url, url_pattern, headers, retries, logger)
 
-        # Only reuse the cache validators if they belong to the same URL
+        # Only reuse the cache validators if they belong to the same URL, and the stored version was
+        # processed the way the config says now (a new route_types must read the file again, even if
+        # the publisher did not change it)
         request_headers = dict(headers or {})
         # Saved without its query string, which may hold an API key
         saved_url = strip_query(url)
-        if latest and strip_query(latest.get("url")) == saved_url:
+        static = self._static_config(provider_name, feed_name)
+        route_types = sorted(static.route_type_set()) if static else []
+        if latest and strip_query(latest.get("url")) == saved_url and latest.get("route_types", []) == route_types:
             if latest.get("etag"):
                 request_headers["If-None-Match"] = latest["etag"]
             if latest.get("last_modified"):
@@ -291,6 +307,15 @@ class StaticService:
             raise ValueError(f"No {kind} file found in {saved_url}")
 
         route_types = sorted(static.route_type_set()) if static else []
+        # A publisher serving two copies of its file (es-renfe-cercanias: two servers, one stale) must not
+        # make versions flip between them: a file older than the stored one is not stored
+        sent, stored = _http_time(last_modified), _http_time((latest or {}).get("last_modified"))
+        if sent and stored and sent < stored:
+            logger.warning(
+                f"{base}: the server sent a file of {last_modified}, older than the stored "
+                f"{latest.get('version')} ({latest.get('last_modified')}): not stored"
+            )
+            return
         expired = bool(
             latest
             and static
@@ -552,7 +577,9 @@ class StaticService:
         # Polars' hashes may differ between its versions
         import polars as pl
 
-        return f"polars-{pl.__version__}"
+        # sig2: columns cast to fixed types first (an Int16 → Int32 change of stop_sequence in the
+        # converter changed every hash). Signatures of another version are recomputed from the tables
+        return f"polars-{pl.__version__}-sig2"
 
     @staticmethod
     def _trip_signatures(tables: Dict[str, str], out_path: str) -> bool:
@@ -572,10 +599,21 @@ class StaticService:
         ]
         # Summed: the hash of a trip's stop times does not depend on row order
         # (stop_sequence is in each row's hash). Divided so a long trip cannot overflow.
+        # Fixed types and trimmed ids: the hash then depends on the values only, not on how a converter
+        # version typed or padded them
+        fixed = {
+            "stop_sequence": pl.col("stop_sequence").cast(pl.Int64),
+            "stop_id": pl.col("stop_id").cast(pl.String).str.strip_chars(),
+            "arrival_time": pl.col("arrival_time").cast(pl.Int64),
+            "departure_time": pl.col("departure_time").cast(pl.Int64),
+        }
+        st = st.with_columns(pl.col("trip_id").cast(pl.String).str.strip_chars(), *(fixed[c] for c in columns))
         times = st.group_by("trip_id").agg(
             (pl.struct(columns).hash(seed=0) // 65536).sum().alias("stops")
         )
-        trips = pl.scan_parquet(tables["trips"]).select("trip_id", "route_id", "service_id")
+        trips = pl.scan_parquet(tables["trips"]).select(
+            *(pl.col(c).cast(pl.String).str.strip_chars() for c in ("trip_id", "route_id", "service_id"))
+        )
         trips.join(times, on="trip_id", how="left").sink_parquet(out_path)
         return True
 

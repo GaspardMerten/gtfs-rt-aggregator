@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "gtfs_rt_aggregator"
-version = "0.9.2"
+version = "0.9.3"
 description = "GTFS-RT Fetcher and Aggregator to Parquet format"
 readme = "README.md"
 authors = [
@@ -30,7 +30,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-static = ["gtfs-parquet>=0.7.0"]
+static = ["gtfs-parquet>=0.7.2"]
 iceberg = ["pyiceberg[pyarrow,sql-sqlite]>=0.9", "fastavro>=1.8"]
 punctuality = ["duckdb>=1.1"]
 

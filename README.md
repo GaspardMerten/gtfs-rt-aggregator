@@ -164,6 +164,9 @@ informed route, route type or trip. Other entity types are always kept.
 ### `[[providers.static]]`
 
 Needs the `static` extra. A new version is stored only when a file inside the zip changed (and, with `min_change`, enough trips changed).
+A file whose `Last-Modified` is older than the stored version's is not stored (a publisher serving a stale copy from a
+second server would make versions flip). A changed `route_types` reads the file again even if the server says it did
+not change.
 
 | Key | Default | Meaning |
 |---|---|---|
@@ -323,6 +326,7 @@ ovapi/static/2026-09-28_01-00-00Z/stops.parquet    # one static version, one fil
 ovapi/static/2026-09-28_01-00-00Z/manifest.json
 ovapi/static/latest.json                           # manifest of the latest version
 ovapi/_status/VehiclePosition-1a2b3c4d.json        # status of one realtime feed
+ovapi/_health/VehiclePosition-1a2b3c4d/date=2026-09-28/20260928T080000Z.json  # fetches per local hour (one file per run)
 _status/index.json                                 # summary of all feeds (global storage)
 ```
 
@@ -331,6 +335,11 @@ are added to the period's file.
 
 Each feed's status file holds the last attempt, last success and last error, the feed's age, and the entity count
 before and after the filter. URLs are stored without their query string.
+
+Each feed's health file counts, per local hour, the fetches read (`ok`), those whose entities changed (`changed`) and
+those that failed (`failed`): an hour with reads but no change is a frozen feed, an hour without reads an outage. The
+stored files cannot tell them apart, since unchanged fetches are not stored. Each run of the process writes its own
+file: add them up for a day.
 
 ### Realtime columns
 

@@ -46,6 +46,7 @@ def _make_zip(files, date_time=(2026, 1, 1, 0, 0, 0)):
 class _FeedHandler(http.server.BaseHTTPRequestHandler):
     body = b""
     etag = None
+    last_modified = None
     status = 200
     requests = []
 
@@ -64,6 +65,8 @@ class _FeedHandler(http.server.BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(self.body)))
         if self.etag:
             self.send_header("ETag", self.etag)
+        if self.last_modified:
+            self.send_header("Last-Modified", self.last_modified)
         self.end_headers()
         self.wfile.write(self.body)
 
@@ -96,6 +99,7 @@ class _StaticTestCase(unittest.TestCase):
     def setUp(self):
         _FeedHandler.body = _make_zip(GTFS_FILES)
         _FeedHandler.etag = None
+        _FeedHandler.last_modified = None
         _FeedHandler.status = 200
         _FeedHandler.requests = []
         _FakeDatetime.current = datetime(2026, 9, 28, 1, 0, 0, tzinfo=pytz.UTC)
@@ -206,6 +210,17 @@ class TestStaticService(_StaticTestCase):
             )
         )
         self.assertEqual(len(stops), 3)
+
+    def test_older_file_than_the_stored_one_not_stored(self):
+        # A publisher with a stale second server: versions must not flip back to its older file
+        _FeedHandler.last_modified = "Wed, 01 Oct 2026 10:00:00 GMT"
+        self._run(1)
+        changed = dict(GTFS_FILES, **{"stops.txt": GTFS_FILES["stops.txt"] + "S9,Extra,52.0,4.0\n"})
+        _FeedHandler.body = _make_zip(changed)
+        _FeedHandler.last_modified = "Wed, 24 Sep 2026 10:00:00 GMT"
+        self._run(2)
+
+        self.assertEqual(len(self._versions()), 1)
 
     def test_not_a_gtfs_zip_stores_nothing(self):
         _FeedHandler.body = _make_zip({"readme.md": "nothing here"})
@@ -437,6 +452,16 @@ class TestStaticChangeRules(_StaticTestCase):
 
         self.assertEqual(len(self._versions()), 2)
         self.assertEqual(len(self._table("trips")), 20)
+
+    def test_new_route_types_read_the_file_despite_its_etag(self):
+        # The server would answer 304: the new filter must still be applied to the unchanged file
+        _FeedHandler.etag = '"same"'
+        self._run(1)
+        self._configure(route_types=[2])
+        self._run(2)
+
+        self.assertEqual(len(self._versions()), 2)
+        self.assertNotIn("If-None-Match", _FeedHandler.requests[-1])
 
     def test_no_route_of_route_types_stores_nothing(self):
         self._configure(route_types=[1])

@@ -632,14 +632,14 @@ wheels = [
 
 [[package]]
 name = "gtfs-parquet"
-version = "0.7.1"
+version = "0.7.2"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "polars" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/41/49/cb851f89d52ac9e5a0e7ae8aef1176cdf86f9a20ba57b6b7243b898facc7/gtfs_parquet-0.7.1.tar.gz", hash = "sha256:2ab8721f831367e93c8ce4fc219337d006353ef389562ba932c23278cd2389bd", size = 61562, upload-time = "2026-10-04T14:01:36.323Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/fe/15/fe3846bb2a8762905e8686a18d89f98883284f42f85197aa34d9b8692ea5/gtfs_parquet-0.7.2.tar.gz", hash = "sha256:1f7efa009ebc19c2f191560bfd63a586bf87cbcd6a8309a970dab6aff087da0a", size = 61866, upload-time = "2026-10-04T15:49:08.488Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/cd/3d/c0ea188c60345aec1112dbcb501871cd367921f38fe7f62168459f4ba27d/gtfs_parquet-0.7.1-py3-none-any.whl", hash = "sha256:c1ecc6cf891ce2fd0a53a8141917204f93c789f921131285ff4fc0a4f5fb3844", size = 47116, upload-time = "2026-10-04T14:01:34.845Z" },
+    { url = "https://files.pythonhosted.org/packages/e5/5b/00d283045855a3c8eb46fbe7c90a2a567e67969e142a2bcd1299e78c1630/gtfs_parquet-0.7.2-py3-none-any.whl", hash = "sha256:3da59ef3586b0fd11f5e8e96e142af8add8b72439e4601f85eaf958cfc708c27", size = 47349, upload-time = "2026-10-04T15:49:06.989Z" },
 ]
 
 [[package]]
@@ -656,7 +656,7 @@ wheels = [
 
 [[package]]
 name = "gtfs-rt-aggregator"
-version = "0.9.2"
+version = "0.9.3"
 source = { editable = "." }
 dependencies = [
     { name = "google-cloud-storage" },
@@ -687,7 +687,7 @@ requires-dist = [
     { name = "duckdb", marker = "extra == 'punctuality'", specifier = ">=1.1" },
     { name = "fastavro", marker = "extra == 'iceberg'", specifier = ">=1.8" },
     { name = "google-cloud-storage", specifier = ">=2.13.0" },
-    { name = "gtfs-parquet", marker = "extra == 'static'", specifier = ">=0.7.0" },
+    { name = "gtfs-parquet", marker = "extra == 'static'", specifier = ">=0.7.2" },
     { name = "gtfs-realtime-bindings" },
     { name = "minio" },
     { name = "pandas", specifier = ">=2.0.0" },

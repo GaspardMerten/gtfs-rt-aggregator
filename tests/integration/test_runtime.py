@@ -153,6 +153,11 @@ class TestRuntime(unittest.TestCase):
         )
         self.assertIn("last_success", status)
         self.assertEqual(status["kept_count"], 200)
+        # Fetches per local hour: read, and changed at least once (the first fetch)
+        health = json.loads(next(Path(self.tmp, "out", "p", "_health").rglob("*.json")).read_text())
+        hours = list(health["hours"].values())
+        self.assertGreaterEqual(sum(h["ok"] for h in hours), 1)
+        self.assertGreaterEqual(sum(h["changed"] for h in hours), 1)
         index = json.loads(Path(self.tmp, "out", "_status", "index.json").read_text())
         self.assertEqual(len(index["feeds"]), 1)
         # Everything processed and uploaded

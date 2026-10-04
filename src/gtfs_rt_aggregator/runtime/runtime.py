@@ -178,6 +178,12 @@ class Runtime:
         self._status: Dict[str, Dict] = {}
         self._status_dirty: set = set()
         self._written: Dict[str, bytes] = {}  # status files as last written
+        # Fetches per feed, local day and hour: {feed: {day: {hour: {"ok", "changed", "failed"}}}}. Written
+        # next to the status as _health/<feed>/date=<day>/<start>.json (one file per run of the process):
+        # tells a frozen feed (read, nothing changed) from an outage (not read), which the stored files cannot
+        self._health: Dict[str, Dict[str, Dict[str, Dict[str, int]]]] = {}
+        self._health_dirty: set = set()
+        self._started = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         self._window_failures: Dict[str, int] = {}
         self._rerun: Dict[str, Task] = {}  # heavy tasks to run again once done
         self._waiting_static: set = set()  # feeds waiting for a static version
@@ -278,6 +284,8 @@ class Runtime:
             # (daemon threads: they do not keep the process alive)
             self._fetch_pool.shutdown()
             while self._fetching and time.monotonic() < deadline:
+                # Adapter fetches run in the worker pools: they leave _fetching once collected
+                self._collect(stopping=True)
                 time.sleep(0.2)
         # Running tasks finish; queued ones stay on disk for the next start
         while self._in_flight and time.monotonic() < deadline:
@@ -499,6 +507,7 @@ class Runtime:
                 bisect.insort(self._queues.setdefault(feed, []), Path(result["item"]))
             self._fetching.discard(feed)
             self._update_status(feed, **status)
+            self._count_fetch(feed, datetime.now(timezone.utc), "failed" if error is not None else "ok")
 
     def _fetch(self, feed: str):
         provider, api = self.feeds[feed]
@@ -516,6 +525,8 @@ class Runtime:
                 max_seconds=REALTIME_DOWNLOAD_MAX_SECONDS,
             )
             status.update(last_success=fetch_time.isoformat(), size=size)
+            with self._lock:
+                self._count_fetch(feed, fetch_time, "ok")
             if api.skip_unchanged and self._last_sha.get(feed) == sha256:
                 # Byte for byte the previous fetch: nothing to process
                 tmp.unlink(missing_ok=True)
@@ -544,6 +555,8 @@ class Runtime:
             status.update(
                 last_error=redact(str(e)), last_error_at=fetch_time.isoformat()
             )
+            with self._lock:
+                self._count_fetch(feed, fetch_time, "failed")
             logger.error(f"Fetching {redact(api.url)} failed: {redact(str(e))}")
         finally:
             with self._lock:
@@ -839,6 +852,8 @@ class Runtime:
             if error is None:
                 self.spool.done(item, archive=self.config.raw.enabled)
                 with self._lock:
+                    if result.get("summary", {}).get("unchanged") is False:
+                        self._count_fetch(task.key, _item_time(item), "changed")
                     self._update_status(
                         task.key,
                         waiting_for_static=False,
@@ -1074,6 +1089,17 @@ class Runtime:
             if 0.8 <= ratio < 1:
                 logger.warning(f"Spool at {ratio:.0%} of spool_max_gb")
 
+    def _count_fetch(self, feed: str, when: datetime, kind: str):
+        """One fetch of feed at when (aware): kind is ok, changed or failed. Call with the lock held."""
+        provider, _ = self.feeds[feed]
+        local = when.astimezone(pytz.timezone(provider.timezone))
+        days = self._health.setdefault(feed, {})
+        hour = days.setdefault(local.date().isoformat(), {}).setdefault(f"{local.hour:02d}", {"ok": 0, "changed": 0, "failed": 0})
+        hour[kind] += 1
+        for old in sorted(days)[:-2]:  # today and yesterday are enough: older days are written already
+            del days[old]
+        self._health_dirty.add(feed)
+
     def _update_status(self, feed: str, **fields):
         self._status.setdefault(feed, {}).update(fields)
         self._status_dirty.add(feed)
@@ -1096,6 +1122,20 @@ class Runtime:
                 f"{provider.name}/_status/{feed_slug(api)}.json",
                 _json(document),
             )
+        with self._lock:
+            dirty = set(self._health) if force else set(self._health_dirty)
+            self._health_dirty.clear()
+            health = {feed: {d: {h: dict(c) for h, c in hours.items()} for d, hours in self._health.get(feed, {}).items()} for feed in dirty}
+        for feed, days in health.items():
+            if feed not in self.feeds:
+                continue
+            provider, api = self.feeds[feed]
+            for day, hours in days.items():
+                self._put_if_changed(
+                    provider.name,
+                    f"{provider.name}/_health/{feed_slug(api)}/date={day}/{self._started}.json",
+                    _json({"services": api.services, "timezone": provider.timezone, "hours": hours}),
+                )
 
     def _put_if_changed(self, provider: str, path: str, data: bytes):
         """Queue a status file for upload, unless it is the same as last time."""
