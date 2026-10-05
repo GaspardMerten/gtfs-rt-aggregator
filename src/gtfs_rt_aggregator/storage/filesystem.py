@@ -19,7 +19,8 @@ class FileSystemStorage(StorageInterface):
         """
         super().__init__()
         self.base_directory = base_directory
-        self.logger.info(
+        # DEBUG: every worker process creates its storages
+        self.logger.debug(
             f"Initialized file system storage with base directory: {base_directory}"
         )
 

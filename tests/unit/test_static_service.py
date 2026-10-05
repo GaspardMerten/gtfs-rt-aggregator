@@ -222,6 +222,50 @@ class TestStaticService(_StaticTestCase):
 
         self.assertEqual(len(self._versions()), 1)
 
+    def test_server_alternating_two_files(self):
+        # es-renfe-cercanias: the 24 Sep and 1 Oct files in turn under one URL
+        old = _make_zip(GTFS_FILES)
+        new = _make_zip(dict(GTFS_FILES, **{"stops.txt": GTFS_FILES["stops.txt"] + "S9,Extra,52.0,4.0\n"}))
+        for hour, (body, last_modified) in enumerate(
+            [
+                (old, "Wed, 24 Sep 2026 10:00:00 GMT"),
+                (new, "Wed, 01 Oct 2026 10:00:00 GMT"),
+                (old, "Wed, 24 Sep 2026 10:00:00 GMT"),
+                # The old content again, under a newer date
+                (old, "Fri, 03 Oct 2026 10:00:00 GMT"),
+                (new, "Wed, 01 Oct 2026 10:00:00 GMT"),
+            ],
+            start=1,
+        ):
+            _FeedHandler.body, _FeedHandler.last_modified = body, last_modified
+            self._run(hour)
+        self.assertEqual(
+            self._versions(), ["2026-09-28_01-00-00Z", "2026-09-28_02-00-00Z"]
+        )
+        latest = json.loads(self.storage.get_bytes("nl/static/latest.json"))
+        self.assertEqual(latest["version"], "2026-09-28_02-00-00Z")
+
+    def test_newest_last_modified_kept_without_header(self):
+        _FeedHandler.last_modified = "Wed, 01 Oct 2026 10:00:00 GMT"
+        self._run(1)
+        # A new file without Last-Modified, then a file older than the first
+        for hour, (extra, last_modified) in enumerate(
+            [("S8,New,52.0,4.0\n", None), ("S7,Old,52.0,4.0\n", "Tue, 30 Sep 2026 10:00:00 GMT")],
+            start=2,
+        ):
+            _FeedHandler.body = _make_zip(
+                dict(GTFS_FILES, **{"stops.txt": GTFS_FILES["stops.txt"] + extra})
+            )
+            _FeedHandler.last_modified = last_modified
+            self._run(hour)
+        self.assertEqual(len(self._versions()), 2)
+
+    def test_default_user_agent(self):
+        self._run(1)
+        self.assertTrue(
+            _FeedHandler.requests[0]["User-Agent"].startswith("gtfs-rt-aggregator")
+        )
+
     def test_not_a_gtfs_zip_stores_nothing(self):
         _FeedHandler.body = _make_zip({"readme.md": "nothing here"})
         self._run()

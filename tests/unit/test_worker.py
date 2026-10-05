@@ -63,14 +63,51 @@ class TestWorkerTasks(unittest.TestCase):
             signal.signal(number, handler)
         shutil.rmtree(self.tmp, ignore_errors=True)
 
-    def _item(self, when: datetime) -> Path:
+    def _item(self, when: datetime, **meta) -> Path:
         item = self.spool.new_item(self.feed, when)
         tmp = item.with_name(item.name + ".part")
         tmp.write_bytes((DATA / "vehicle_positions.pb").read_bytes())
         self.spool.commit_item(
-            item, tmp, {"feed": self.feed, "fetch_time": when.isoformat(), "attempt": 1}
+            item,
+            tmp,
+            {"feed": self.feed, "fetch_time": when.isoformat(), "attempt": 1, **meta},
         )
         return self.spool.claim(item)
+
+    def test_unchanged_fetches_recorded(self):
+        self.api.skip_unchanged = True
+        first = datetime(2026, 9, 29, 8, 1, tzinfo=timezone.utc)
+        self.assertEqual(len(worker.process_item(str(self._item(first)))["written"]), 1)
+        # Same entities; the runtime skipped an identical download at 08:02
+        result = worker.process_item(
+            str(
+                self._item(
+                    first.replace(minute=3),
+                    unchanged_fetch_times=[first.replace(minute=2).isoformat()],
+                )
+            )
+        )
+        self.assertTrue(result["summary"]["unchanged"])
+        self.assertEqual(result["written"], [])
+        # Ten minutes after the oldest one: written in a part with no rows
+        result = worker.process_item(str(self._item(first.replace(minute=12))))
+        self.assertEqual(len(result["written"]), 1)
+        self.assertNotIn("unchanged", self.spool.state(self.feed))
+
+        (window,) = self.spool.path("windows").glob("*/*/*")
+        worker.close_window(str(window))
+        (ready,) = self.spool.path("ready").rglob("*.parquet")
+        table = pq.read_table(ready)
+        self.assertEqual(table.num_rows, 3549)
+        feed = feed_hash(self.api)
+        self.assertEqual(len(fetch_times.decode(table.schema.metadata)[feed]), 1)
+        unchanged = fetch_times.decode(
+            table.schema.metadata, fetch_times.UNCHANGED_TIMES_METADATA
+        )[feed]
+        self.assertEqual(
+            sorted(datetime.fromtimestamp(t / 1e6, timezone.utc).minute for t in unchanged),
+            [2, 3, 12],
+        )
 
     def test_accumulation_window(self):
         first = datetime(2026, 9, 29, 8, 1, tzinfo=timezone.utc)
@@ -154,11 +191,11 @@ class TestWorkerTasks(unittest.TestCase):
         with self.assertRaises(StaticNotReady):
             worker.process_item(str(self._item(datetime.now(timezone.utc))))
         self.assertEqual(list(self.spool.path("windows").rglob("*.parquet")), [])
-        # Waiting too long: dropped, never stored unfiltered
-        old = datetime.now(timezone.utc) - timedelta(hours=4)
-        result = worker.process_item(str(self._item(old)))
-        self.assertEqual(result["written"], [])
-        self.assertTrue(result["summary"]["dropped_no_static"])
+        # However long it waited: never dropped, never stored unfiltered
+        old = datetime.now(timezone.utc) - timedelta(hours=30)
+        with self.assertRaises(StaticNotReady):
+            worker.process_item(str(self._item(old)))
+        self.assertEqual(list(self.spool.path("windows").rglob("*.parquet")), [])
 
     def test_fetch_after_close_gets_its_own_window(self):
         first = datetime(2026, 9, 29, 8, 1, tzinfo=timezone.utc)
@@ -194,6 +231,28 @@ class TestWorkerTasks(unittest.TestCase):
                 names = sorted(tar.getnames())
         self.assertEqual(len(names), 2)
         self.assertTrue(names[0].endswith(".json") and names[1].endswith(".pb"))
+
+    def test_raw_retention(self):
+        from datetime import timedelta
+
+        storage = worker._ctx().storage("p")
+        today = datetime.now(timezone.utc).date()
+        paths = {
+            back: f"raw/provider=p/feed=x/date={today - timedelta(days=back)}/08-1.tar.zst"
+            for back in (0, 3, 4, 30)
+        }
+        for path in paths.values():
+            storage.save_bytes(b"x", path)
+        storage.save_bytes(b"x", "raw/provider=other/feed=x/date=2020-01-01/08-1.tar.zst")
+        result = worker.prune_raw("p", "raw", 3)
+        self.assertEqual(result["deleted"], 2)
+        self.assertEqual(
+            sorted(storage.walk_files("raw/provider=p/")), sorted([paths[0], paths[3]])
+        )
+        # Another provider's bundles are its own task's
+        self.assertTrue(
+            storage.file_exists("raw/provider=other/feed=x/date=2020-01-01/08-1.tar.zst")
+        )
 
 
 if __name__ == "__main__":

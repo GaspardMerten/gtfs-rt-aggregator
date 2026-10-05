@@ -110,10 +110,13 @@ class FetcherService:
                 return
             status.update(last_success=fetch_time.isoformat(), **result.summary)
             if result.tables is None:
-                job_logger.info(
+                job_logger.debug(
                     f"{url}: unchanged since the previous fetch, not stored"
                 )
+                # Recorded in the next file stored (see fetch_times.py)
+                fetch_times.note_unchanged(state, [fetch_time.isoformat()])
                 return
+            unchanged = fetch_times.pending_unchanged(state, feed_hash(api))
             for service_type, table in fetch_times.worth_storing(
                 result.tables, state
             ).items():
@@ -122,7 +125,7 @@ class FetcherService:
                 name = format_file_time(fetch_time, feed_hash(api))
                 path = f"{provider_name}/{service_type}/individual/{name}.parquet"
                 table = fetch_times.with_times(
-                    table, fetch_times.of_fetch(feed_hash(api), fetch_time)
+                    table, fetch_times.of_fetch(feed_hash(api), fetch_time), unchanged
                 )
                 storage.save_bytes(
                     ParquetSerializer.pyarrow_table_to_bytes(
@@ -130,11 +133,12 @@ class FetcherService:
                     ),
                     path,
                 )
-                job_logger.info(
+                job_logger.debug(
                     f"Saved {table.num_rows} {service_type} records to {path}"
                 )
             # Only once stored: after a failed save, the same content is tried again
             state["snapshot"] = result.snapshot
+            state.pop("unchanged", None)
         except Exception as e:
             status.update(
                 last_error=redact(str(e)), last_error_at=fetch_time.isoformat()

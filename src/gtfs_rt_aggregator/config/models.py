@@ -605,6 +605,19 @@ class RawConfig(_Model):
         pattern=r"^[A-Za-z0-9][A-Za-z0-9._/-]*$",
         description="Folder of the archive under each provider's storage root",
     )
+    retention_days: int = Field(
+        0,
+        ge=0,
+        description="Bundles of days (UTC) older than this many days are deleted; 0 keeps them forever",
+    )
+    exclude: List[str] = Field(
+        default_factory=list,
+        description="Providers (or feeds, by the <services>-<hash> name of their status file) not archived, e.g. very large feeds",
+    )
+
+    def archives(self, provider_name: str, feed_slug: str) -> bool:
+        """Whether the fetches of a feed are archived."""
+        return self.enabled and not {provider_name, feed_slug} & set(self.exclude)
 
 
 class IcebergConfig(_Model):

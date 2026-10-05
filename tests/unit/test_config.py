@@ -181,6 +181,49 @@ class TestValidators(unittest.TestCase):
         self.assertEqual(StorageConfig(type="FileSystem").type, "filesystem")
 
 
+class TestRawConfig(unittest.TestCase):
+    def test_retention_and_exclude(self):
+        config = _load(
+            STORAGE
+            + """
+[raw]
+enabled = true
+retention_days = 3
+exclude = ["de-gtfsde", "TripUpdate-0123abcd"]
+
+[[providers]]
+name = "de-gtfsde"
+[[providers.realtime]]
+url = "https://example.org/de.pb"
+services = ["TripUpdate"]
+"""
+        )
+        raw = config.raw
+        self.assertEqual(raw.retention_days, 3)
+        self.assertFalse(raw.archives("de-gtfsde", "TripUpdate-ffffffff"))
+        self.assertFalse(raw.archives("nl", "TripUpdate-0123abcd"))
+        self.assertTrue(raw.archives("nl", "TripUpdate-ffffffff"))
+        raw.enabled = False
+        self.assertFalse(raw.archives("nl", "TripUpdate-ffffffff"))
+
+    def test_defaults_keep_everything(self):
+        raw = _load(
+            STORAGE
+            + """
+[raw]
+enabled = true
+
+[[providers]]
+name = "nl"
+[[providers.realtime]]
+url = "https://example.org/nl.pb"
+services = ["TripUpdate"]
+"""
+        ).raw
+        self.assertEqual((raw.retention_days, raw.exclude), (0, []))
+        self.assertTrue(raw.archives("nl", "TripUpdate-ffffffff"))
+
+
 class TestProviderChecks(unittest.TestCase):
     def test_reserved_or_unsafe_names(self):
         for name in ("global", "__global__", "a/b", "..", ""):

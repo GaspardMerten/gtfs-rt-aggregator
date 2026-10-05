@@ -3,7 +3,7 @@
 import io
 import json
 import unittest
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from io import BytesIO
 from unittest.mock import patch
 
@@ -11,7 +11,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytz
 
-from src.gtfs_rt_aggregator.aggregator.dedup import deduplicate
+from src.gtfs_rt_aggregator.aggregator.dedup import deduplicate, max_gap_seconds
 from src.gtfs_rt_aggregator.aggregator.service import AggregatorService
 from src.gtfs_rt_aggregator.config.loader import expand_env, load_config_from_toml_file
 from src.gtfs_rt_aggregator.config.models import (
@@ -203,6 +203,83 @@ class TestDeduplicate(unittest.TestCase):
     def test_rows_without_hash_kept(self):
         table = deduplicate(_rows(["a", "a"], [None, None], [10, 20]))
         self.assertEqual(table.num_rows, 2)
+
+    def test_outage_ends_run(self):
+        # Fetched every minute, then not at all for 7 hours (the pipeline
+        # was down): the entity is not known to have been there all along
+        minutes = [0, 1, 2, 7 * 60 + 2, 7 * 60 + 3]
+        table = _timed_rows(["a"] * 5, ["x"] * 5, minutes)
+        runs = deduplicate(table)
+        self.assertEqual(
+            _spans(runs), [(0, 2), (7 * 60 + 2, 7 * 60 + 3)]
+        )
+
+        # Read every minute but unchanged (no rows written): one run
+        unchanged = _minutes(range(3, 7 * 60 + 2))
+        runs = deduplicate(table, unchanged=unchanged)
+        self.assertEqual(_spans(runs), [(0, 7 * 60 + 3)])
+
+        # The longest wait follows the feed's refresh_seconds: fetched every
+        # 5 minutes, a 15-minute wait is no outage, a 16-minute one is
+        table = _timed_rows(["a"] * 3, ["x"] * 3, [0, 15, 31])
+        self.assertEqual(
+            _spans(deduplicate(table, max_gap=max_gap_seconds(300))), [(0, 15), (31, 31)]
+        )
+        self.assertEqual(
+            _spans(deduplicate(table, max_gap={None: max_gap_seconds(600)})), [(0, 31)]
+        )
+
+    def test_unchanged_fetch_is_no_gap(self):
+        # Unlike a fetch without the entity, an unchanged fetch had all of them
+        table = _timed_rows(["a", "a"], ["x", "x"], [0, 2])
+        self.assertEqual(_spans(deduplicate(table, unchanged=_minutes([1]))), [(0, 2)])
+        self.assertEqual(
+            _spans(deduplicate(table, times=_minutes([1]))), [(0, 0), (2, 2)]
+        )
+
+    def test_trip_updates_told_apart_by_start_date(self):
+        # One entity id for the same trip on two days, in every fetch
+        table = _timed_rows(["a"] * 4, ["d1", "d2", "d1", "d2"], [0, 0, 1, 1])
+        table = table.append_column("trip_tripId", pa.array(["T"] * 4))
+        table = table.append_column(
+            "trip_startDate", pa.array(["20261004", "20261005"] * 2)
+        )
+        result = deduplicate(table)
+        self.assertEqual(result.num_rows, 2)
+        self.assertEqual(sorted(result["trip_startDate"].to_pylist()), ["20261004", "20261005"])
+        self.assertEqual(result["lastSeen"].to_pylist(), [_minutes([1])[0].as_py()] * 2)
+
+
+_START = datetime(2026, 10, 4, 6, 0, tzinfo=timezone.utc)
+
+
+def _minutes(minutes):
+    return pa.array(
+        [_START + timedelta(minutes=m) for m in minutes], pa.timestamp("us", tz="UTC")
+    )
+
+
+def _timed_rows(entity_ids, hashes, minutes):
+    return pa.table(
+        {
+            "entityId": entity_ids,
+            "contentHash": hashes,
+            "fetchTime": _minutes(minutes),
+        }
+    )
+
+
+def _spans(table):
+    """(firstSeen, lastSeen) of each row, in minutes after _START."""
+    def minute(value):
+        return round((value - _START).total_seconds() / 60)
+
+    return sorted(
+        (minute(first), minute(last))
+        for first, last in zip(
+            table["firstSeen"].to_pylist(), table["lastSeen"].to_pylist()
+        )
+    )
 
 
 class TestCompaction(unittest.TestCase):

@@ -126,8 +126,8 @@ A provider needs at least one realtime or static feed.
 | `frequency_minutes` | `60` | Length of an aggregation period. |
 | `check_interval_seconds` | `300` | How often to look for periods ready to aggregate. |
 | `accumulate_minutes` | `0` | Write fetches in blocks of this many minutes, one file per block, aligned on the local clock. `0` writes one file per fetch. Must divide 1440 and `frequency_minutes`. |
-| `headers` | none | HTTP headers, e.g. an API key. |
-| `retries` | `3` | Retries on connection errors, timeouts and HTTP 429/5xx, with backoff. |
+| `headers` | none | HTTP headers, e.g. an API key. Requests carry `User-Agent: gtfs-rt-aggregator/<version>` unless set here. |
+| `retries` | `3` | Retries on connection errors, timeouts, bodies shorter than their `Content-Length` and HTTP 429/5xx, with backoff. |
 | `skip_unchanged` | `true` | Do not store a fetch whose entities are the same as the previous fetch's, in any order. |
 | `deduplicate` | `false` | When aggregating, merge consecutive identical rows of an entity into one row with `firstSeen` and `lastSeen`. |
 | `filter` | keep all | See below. |
@@ -142,8 +142,12 @@ files, and `feedId` tells them apart; deduplication is done feed by feed. Feeds 
 
 With `deduplicate = true`, a vehicle standing still for ten minutes, polled every 30 s, is one row instead of twenty.
 If the entity changes and later returns to an earlier state, that is a new row. So is an entity that was missing from a
-fetch in between. With `skip_unchanged = true`, a fetch identical to the previous one is not stored: `lastSeen` is then
-the last stored fetch that had the entity, which can be earlier than the last time the feed showed it.
+fetch in between, or seen again after the feed was not read for longer than 3 × `refresh_seconds` (at least 10
+minutes): an outage. With `skip_unchanged = true`, a fetch identical to the previous one is not stored: `lastSeen` is
+then the last stored fetch that had the entity, which can be earlier than the last time the feed showed it. The times
+of those unchanged fetches are recorded in the metadata of the next file stored (`gtfs_rt_aggregator.unchanged_fetch_times`,
+or in a file with no rows every 10 minutes while the feed does not change), so a frozen feed is not taken for an outage.
+TripUpdate rows are told apart by entity id, trip id and start date (some feeds reuse an entity id across days).
 
 #### Filter
 
@@ -157,15 +161,18 @@ the last stored fetch that had the entity, which can be earlier than the last ti
 
 `route_types` and `route_ids` are resolved through the trips and routes of the provider's latest static version, so the
 provider needs a `[[providers.static]]` feed. Until a static version can be read (the first one is being downloaded,
-or storage is down), fetches wait in the spool; after 3 hours they are dropped, never stored unfiltered. Trip
+or storage is down), fetches wait in the spool, however long (`spool_max_gb` bounds it), never stored unfiltered, with a
+warning every 30 minutes. The status file counts the entities each fetch dropped (`dropped_count`) and those whose
+trip the static version does not know (`dropped_unknown`, also per hour in the health file and logged once per
+window): many mean the static version is behind the realtime feed. Trip
 updates and vehicle positions match by trip or route (vehicles without a trip are dropped). Alerts match by any
 informed route, route type or trip. Other entity types are always kept.
 
 ### `[[providers.static]]`
 
 Needs the `static` extra. A new version is stored only when a file inside the zip changed (and, with `min_change`, enough trips changed).
-A file whose `Last-Modified` is older than the stored version's is not stored (a publisher serving a stale copy from a
-second server would make versions flip). A changed `route_types` reads the file again even if the server says it did
+A file whose `Last-Modified` is older than the newest stored version's is not stored, nor the content of an earlier
+version (a publisher serving a stale copy from a second server would make versions flip). A changed `route_types` reads the file again even if the server says it did
 not change.
 
 | Key | Default | Meaning |
@@ -260,6 +267,10 @@ Keeps every raw fetch, bundled per feed and hour, so the Parquet files can be re
 |---|---|---|
 | `enabled` | `false` | Turn the archive on. |
 | `prefix` | `"raw"` | Folder of the archive in each provider's storage. |
+| `retention_days` | `0` | Bundles of days (UTC) older than this are deleted, every 6 hours. `0` keeps them forever. |
+| `exclude` | `[]` | Providers, or feeds by the `<services>-<hash>` name of their status file, not archived (e.g. very large feeds). |
+
+Fetches skipped as byte-identical to the previous one are not archived.
 
 ### `[iceberg]`
 
@@ -337,9 +348,13 @@ Each feed's status file holds the last attempt, last success and last error, the
 before and after the filter. URLs are stored without their query string.
 
 Each feed's health file counts, per local hour, the fetches read (`ok`), those whose entities changed (`changed`) and
-those that failed (`failed`): an hour with reads but no change is a frozen feed, an hour without reads an outage. The
-stored files cannot tell them apart, since unchanged fetches are not stored. Each run of the process writes its own
-file: add them up for a day.
+those that failed (`failed`): an hour with reads but no change is a frozen feed, an hour without reads an outage.
+Filtered feeds also count `dropped_unknown` (see Filter). Each run of the process writes its own file: add them up for
+a day.
+
+At `INFO`, the pipeline logs one summary line every 10 minutes (fetches, changes, failures, skips, spool), plus
+warnings and errors; per-fetch and per-period lines are `DEBUG`. A failed request logs the start of the server's
+answer.
 
 ### Realtime columns
 

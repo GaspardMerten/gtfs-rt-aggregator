@@ -150,12 +150,16 @@ def compact_files(
     times=None,
     compression: str = "brotli",
     metadata: Optional[Dict[bytes, bytes]] = None,
+    unchanged=None,
+    max_gap=None,
 ) -> int:
     """
     Merge Parquet files, each already sorted by keys (see write_sorted), into
     one file sorted by keys. With deduplicate_rows, keys must start with
     entityId then firstSeen, and times holds every fetch time by feedId (for
-    gap detection). metadata is added to the output's schema metadata.
+    gap detection), unchanged the unchanged fetch times and max_gap the
+    longest wait between fetches (see dedup.deduplicate). metadata is added
+    to the output's schema metadata.
     Returns the number of rows written.
     """
     schema = pa.unify_schemas(
@@ -194,7 +198,7 @@ def compact_files(
                 )
             )
         if deduplicate_rows:
-            chunks = _deduplicated(chunks, times, schema)
+            chunks = _deduplicated(chunks, times, schema, unchanged, max_gap)
         metadata = {
             **(metadata or {}),
             SORT_KEYS_METADATA: json.dumps(list(keys)).encode(),
@@ -214,13 +218,13 @@ def _write(
     return rows
 
 
-def _deduplicated(chunks, times, schema) -> Iterator[pa.Table]:
+def _deduplicated(chunks, times, schema, unchanged=None, max_gap=None) -> Iterator[pa.Table]:
     """Deduplicate sorted chunks; the last entity of a chunk may continue in the next."""
     carry: Optional[pa.Table] = None
     for chunk in chunks:
         if carry is not None:
             chunk = pa.concat_tables([carry, chunk])
-        chunk = align(deduplicate(chunk, times), schema)
+        chunk = align(deduplicate(chunk, times, unchanged, max_gap), schema)
         if not chunk.num_rows:
             carry = None
             continue

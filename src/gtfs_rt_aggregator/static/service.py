@@ -1,4 +1,5 @@
 import gzip
+import hashlib
 import html
 import importlib.metadata
 import itertools
@@ -19,7 +20,13 @@ import requests
 from ..config.models import GtfsRtConfig
 from ..storage.base import StorageInterface, storage_for
 from ..utils.file_time import format_file_time
-from ..utils.http import get_bytes, raise_for_status, with_retries
+from ..utils.http import (
+    check_length,
+    get_bytes,
+    raise_for_status,
+    request_headers,
+    with_retries,
+)
 from ..utils.log_helper import setup_logger
 from ..utils.cleanup import STATIC_WORK_PREFIX
 from ..utils.redact import strip_query
@@ -40,6 +47,27 @@ def _http_time(value: Optional[str]) -> Optional[datetime]:
         return parsedate_to_datetime(value)
     except (TypeError, ValueError):
         return None
+
+
+# Earlier versions a manifest remembers the content of (see process)
+MAX_PREVIOUS_FILES = 50
+
+
+def _files_digest(files: Dict) -> str:
+    """Short digest of a version's file fingerprints (see _zip_fingerprint)."""
+    return hashlib.sha1(json.dumps(files, sort_keys=True).encode()).hexdigest()[:16]
+
+
+def _newest_last_modified(latest: Optional[Dict]) -> Optional[str]:
+    """Newest Last-Modified among the stored versions (the latest's, before 0.9.4)."""
+    if not latest:
+        return None
+    values = [
+        v
+        for v in (latest.get("newest_last_modified"), latest.get("last_modified"))
+        if _http_time(v)
+    ]
+    return max(values, key=_http_time, default=None)
 
 
 def _version_tuple(version: str) -> Tuple[int, ...]:
@@ -307,13 +335,24 @@ class StaticService:
             raise ValueError(f"No {kind} file found in {saved_url}")
 
         route_types = sorted(static.route_type_set()) if static else []
-        # A publisher serving two copies of its file (es-renfe-cercanias: two servers, one stale) must not
-        # make versions flip between them: a file older than the stored one is not stored
-        sent, stored = _http_time(last_modified), _http_time((latest or {}).get("last_modified"))
+        # A publisher serving two copies of its file (es-renfe-cercanias: two servers, one stale, the
+        # 24 Sep and 1 Oct files in turn) must not make versions flip between them: a file older than
+        # the newest stored one is not stored, nor the content of an earlier version
+        newest = _newest_last_modified(latest)
+        sent, stored = _http_time(last_modified), _http_time(newest)
         if sent and stored and sent < stored:
             logger.warning(
-                f"{base}: the server sent a file of {last_modified}, older than the stored "
-                f"{latest.get('version')} ({latest.get('last_modified')}): not stored"
+                f"{base}: the server sent a file of {last_modified}, older than the newest "
+                f"stored ({newest}): not stored"
+            )
+            return
+        same_filter = latest is not None and latest.get("route_types", []) == route_types
+        if same_filter and files != latest.get("files") and _files_digest(files) in latest.get(
+            "previous_files", []
+        ):
+            logger.warning(
+                f"{base}: the server sent the content of a version older than "
+                f"{latest.get('version')} (Last-Modified {last_modified}): not stored"
             )
             return
         expired = bool(
@@ -358,7 +397,6 @@ class StaticService:
             if not self._trip_signatures(converted, signatures):
                 signatures = None
 
-        same_filter = latest is not None and latest.get("route_types", []) == route_types
         if signatures and same_filter:
             share = self._changed_share(
                 storage, base, latest, converted, signatures, fetch_time.date(), logger
@@ -416,6 +454,18 @@ class StaticService:
             "tables": tables,
             "route_types": route_types,
         }
+        if latest and same_filter:
+            # Content of the earlier versions (most recent first), never stored again
+            manifest["previous_files"] = (
+                [_files_digest(latest["files"])] if latest.get("files") else []
+            ) + latest.get("previous_files", [])[: MAX_PREVIOUS_FILES - 1]
+        newest = max(
+            (v for v in (_newest_last_modified(latest), last_modified) if _http_time(v)),
+            key=_http_time,
+            default=None,
+        )
+        if newest:
+            manifest["newest_last_modified"] = newest
         if signatures:
             # Compared with the next check's, for min_change
             path = f"{base}/{version}/_trip_signatures.parquet"
@@ -437,13 +487,18 @@ class StaticService:
         url: str, headers: Dict[str, str], zip_path: str
     ) -> Optional[Tuple[Optional[str], Optional[str]]]:
         """Download url to zip_path; return (ETag, Last-Modified), or None on 304."""
-        with requests.get(url, headers=headers, stream=True, timeout=300) as response:
+        with requests.get(
+            url, headers=request_headers(headers), stream=True, timeout=300
+        ) as response:
             if response.status_code == 304:
                 return None
             raise_for_status(response)
+            size = 0
             with open(zip_path, "wb") as f:
                 for chunk in response.iter_content(chunk_size=1 << 20):
                     f.write(chunk)
+                    size += len(chunk)
+            check_length(response, size)
             return response.headers.get("ETag"), response.headers.get("Last-Modified")
 
     @staticmethod

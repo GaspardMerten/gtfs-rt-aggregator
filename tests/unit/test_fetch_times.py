@@ -55,11 +55,49 @@ def _fetch(entities, fetch_time, *more):
     return buffer.getvalue()
 
 
+def _unchanged(hour, minutes):
+    """A file with no rows recording unchanged fetches, as the worker writes it."""
+    table = pa.table(
+        {
+            "entityId": pa.array([], pa.string()),
+            "contentHash": pa.array([], pa.string()),
+            "fetchTime": pa.array([], TIMESTAMP),
+            "feedId": pa.array([], pa.string()),
+        }
+    )
+    state = {}
+    fetch_times.note_unchanged(
+        state, [(hour + timedelta(minutes=m)).isoformat() for m in minutes]
+    )
+    table = fetch_times.with_times(
+        table, {}, fetch_times.pending_unchanged(state, FEED)
+    )
+    buffer = io.BytesIO()
+    pq.write_table(table, buffer)
+    return buffer.getvalue()
+
+
 class TestEncoding(unittest.TestCase):
     def test_round_trip(self):
         times = {"a": {3, 1, 2_000_000}, None: {5}}
         self.assertEqual(fetch_times.decode(fetch_times.encode(times)), times)
         self.assertIsNone(fetch_times.decode({}))
+
+    def test_unchanged_fetches_apart(self):
+        table = fetch_times.with_times(pa.table({"a": [1]}), {"f": {1}}, {"f": {2, 3}})
+        metadata = table.schema.metadata
+        self.assertEqual(fetch_times.decode(metadata), {"f": {1}})
+        self.assertEqual(
+            fetch_times.decode(metadata, fetch_times.UNCHANGED_TIMES_METADATA),
+            {"f": {2, 3}},
+        )
+        # Rewritten without: not carried over
+        table = fetch_times.with_times(table, {"f": {1}})
+        self.assertIsNone(
+            fetch_times.decode(
+                table.schema.metadata, fetch_times.UNCHANGED_TIMES_METADATA
+            )
+        )
 
 
 class TestAggregation(unittest.TestCase):
@@ -162,6 +200,36 @@ class TestAggregation(unittest.TestCase):
         self.assertEqual(self._output()["entityId"].to_pylist(), ["a"])
         self.assertFalse(self.storage.file_exists(bad))
         self.assertTrue(self.storage.file_exists(bad.replace("individual", "error")))
+
+    def test_outage_ends_run(self):
+        # Not read for 40 minutes (an outage): "a" is not known to have stayed
+        self._put(["a"], 0)
+        self._put(["a"], 40)
+        self._run()
+        self.assertEqual(self._runs(self._output()), [("a", 0, 0), ("a", 40, 40)])
+
+    def test_unchanged_fetches_bridge_the_wait(self):
+        # Read every minute in between, unchanged: a file with no rows records
+        # those fetches (see worker.process_item)
+        self._put(["a"], 0)
+        self._put(None, 20, _unchanged(self.hour, range(1, 20)))
+        self._put(None, 39, _unchanged(self.hour, range(20, 40)))
+        self._put(["a"], 40)
+        self._run()
+        output = self._output()
+        self.assertEqual(self._runs(output), [("a", 0, 40)])
+        unchanged = fetch_times.decode(
+            output.schema.metadata, fetch_times.UNCHANGED_TIMES_METADATA
+        )
+        self.assertEqual(len(unchanged[FEED]), 39)
+
+        # Kept when the day is compacted
+        self.aggregator.compact_once(
+            "p", [SERVICE], "UTC", deduplicate=True, days_back=None
+        )
+        folder = f"provider=p/service={SERVICE}/date={self.hour:%Y-%m-%d}"
+        day = pq.read_table(io.BytesIO(self.storage.get_bytes(f"{folder}/day.parquet")))
+        self.assertEqual(self._runs(day), [("a", 0, 40)])
 
     def test_only_empty_fetches(self):
         self._put([], 0)

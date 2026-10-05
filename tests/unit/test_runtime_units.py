@@ -8,7 +8,7 @@ import time
 import unittest
 from pathlib import Path
 from datetime import datetime, timezone
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from src.gtfs_rt_aggregator.config.models import (
     ApiConfig,
@@ -251,6 +251,114 @@ class TestHeavyTasks(unittest.TestCase):
         self.assertEqual(self.runtime._window_failures, {"/w": 1})
 
 
+class TestFetchLane(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp)
+        config = GtfsRtConfig(
+            storage=StorageConfig(type="filesystem", params={"base_directory": tmp}),
+            providers=[
+                ProviderConfig(
+                    name="p",
+                    realtime=[ApiConfig(url="https://x.org/a", services=["TripUpdate"])],
+                )
+            ],
+            runtime=RuntimeConfig(spool_dir=os.path.join(tmp, "spool")),
+        )
+        self.runtime = Runtime(config, {"global": MagicMock()})
+        self.feed = next(iter(self.runtime.feeds))
+        self.fast, self.slow = [], []
+        self.runtime._fetch_pool = MagicMock(submit=lambda f, feed: self.fast.append(feed))
+        self.runtime._slow_fetch_pool = MagicMock(
+            submit=lambda f, feed: self.slow.append(feed)
+        )
+
+    def _download(self, body=b"feed"):
+        def download(url, headers, path, *args, **kwargs):
+            Path(path).write_bytes(body)
+            import hashlib
+
+            return len(body), hashlib.sha256(body).hexdigest()
+
+        return patch("src.gtfs_rt_aggregator.runtime.runtime.download_to", download)
+
+    def test_one_fetch_waits_behind_a_running_download(self):
+        runtime, feed = self.runtime, self.feed
+        runtime._submit_fetch(feed)
+        # Still waiting for a thread: not queued twice
+        runtime._submit_fetch(feed)
+        self.assertEqual(self.fast, [feed])
+        self.assertEqual(runtime._status[feed]["skipped_overlap"], 1)
+
+        # Its download runs: the next turn starts as soon as it ends
+        runtime._downloading.add(feed)
+        runtime._submit_fetch(feed)
+        runtime._submit_fetch(feed)
+        self.assertEqual(self.fast, [feed])
+        self.assertEqual(runtime._status[feed]["skipped_overlap"], 2)
+        runtime._downloading.discard(feed)
+        with self._download():
+            runtime._fetch(feed)
+        self.assertEqual(self.fast, [feed, feed])
+
+    def test_slow_feed_gets_the_slow_threads(self):
+        with (
+            self._download(),
+            patch("src.gtfs_rt_aggregator.runtime.runtime.SLOW_DOWNLOAD_SECONDS", -1),
+        ):
+            self.runtime._fetch(self.feed)
+        self.runtime._submit_fetch(self.feed)
+        self.assertEqual((self.fast, self.slow), ([], [self.feed]))
+
+    def test_identical_downloads_recorded(self):
+        runtime, feed = self.runtime, self.feed
+        with self._download():
+            for _ in range(3):
+                runtime._fetch(feed)
+        # The first one goes to a worker, the next two only leave their time
+        self.assertEqual(len(runtime._queues[feed]), 1)
+        self.assertEqual(len(runtime._unchanged[feed]), 2)
+
+        # Ten minutes after the oldest: the next one goes to a worker anyway,
+        # with their times
+        runtime._unchanged[feed][0] = "2026-10-04T06:00:00+00:00"
+        with self._download():
+            runtime._fetch(feed)
+        self.assertEqual(len(runtime._queues[feed]), 2)
+        meta = runtime.spool.meta(runtime._queues[feed][1])
+        self.assertEqual(len(meta["unchanged_fetch_times"]), 2)
+        self.assertEqual(runtime._unchanged[feed], [])
+
+    def test_undecodable_fetch_fetched_again_once(self):
+        from src.gtfs_rt_aggregator.runtime.runtime import Task
+
+        runtime, feed = self.runtime, self.feed
+        with self._download(b"garbage"):
+            runtime._fetch(feed)
+        for expected in ([feed], [feed]):
+            item = runtime._queues[feed].pop(0)
+            claimed = runtime.spool.claim(item)
+            runtime._finish(
+                Task("item", feed, "normal", {"item": str(claimed)}),
+                None,
+                "DecodeError: Error parsing message",
+            )
+            self.assertEqual(self.fast, expected)
+            # The fetch made again is marked: not fetched again if it fails too
+            with self._download(b"garbage"):
+                runtime._fetch(feed)
+        self.assertEqual(runtime.spool.quarantined(), 2)
+
+    def test_summary_line(self):
+        runtime = self.runtime
+        with self._download():
+            runtime._fetch(self.feed)
+        with self.assertLogs("src.gtfs_rt_aggregator.runtime.runtime", "INFO") as logs:
+            runtime._log_summary()
+        self.assertIn("1 fetches (0 changed), 0 failed", logs.output[0])
+        self.assertEqual(runtime._summary, {})
+
+
 class TestWorkerWatch(unittest.TestCase):
     def test_worker_ends_with_the_main_process(self):
         import subprocess
@@ -311,6 +419,99 @@ class TestDownload(unittest.TestCase):
             )
         # Stopped mid-body (sent in 5 s), not after it
         self.assertLess(time.monotonic() - start, 3)
+
+    def _serve(self, handler):
+        import http.server
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        return f"http://127.0.0.1:{server.server_port}/feed?key=SECRET"
+
+    def test_cut_download_retried(self):
+        import http.server
+        import logging
+
+        from src.gtfs_rt_aggregator.utils.http import download_to
+
+        calls = []
+
+        class Cut(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                calls.append(dict(self.headers))
+                self.send_response(200)
+                self.send_header("Content-Length", "20")
+                self.end_headers()
+                # The first answer stops halfway
+                self.wfile.write(b"x" * (10 if len(calls) == 1 else 20))
+                self.close_connection = True
+
+            def log_message(self, *args):
+                pass
+
+        url = self._serve(Cut)
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp)
+        size, _ = download_to(
+            url, None, os.path.join(tmp, "f"), retries=1,
+            logger=logging.getLogger(__name__), max_seconds=10,
+        )
+        self.assertEqual((size, len(calls)), (20, 2))
+        self.assertTrue(calls[0]["User-Agent"].startswith("gtfs-rt-aggregator"))
+
+    def test_length_checked_unless_compressed(self):
+        from src.gtfs_rt_aggregator.utils.http import IncompleteDownload, check_length
+
+        response = MagicMock(url="https://x.org/f?key=SECRET")
+        response.headers = {"Content-Length": "20"}
+        with self.assertRaisesRegex(IncompleteDownload, "10 of 20") as raised:
+            check_length(response, 10)
+        self.assertNotIn("SECRET", str(raised.exception))
+        check_length(response, 20)
+        # The length of a gzip body is not the length received
+        response.headers = {"Content-Length": "20", "Content-Encoding": "gzip"}
+        check_length(response, 50)
+
+    def test_user_agent_and_error_body(self):
+        import http.server
+        import logging
+
+        import requests
+
+        from src.gtfs_rt_aggregator.utils.http import get_bytes, request_headers
+
+        agents = []
+
+        class Refuse(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                agents.append(self.headers.get("User-Agent"))
+                body = (
+                    b"<html>\n  Bad request: see https://api.example.org/doc?token=T0KEN"
+                    + b" " + b"z" * 500
+                )
+                self.send_response(400)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):
+                pass
+
+        url = self._serve(Refuse)
+        with self.assertRaises(requests.HTTPError) as raised:
+            get_bytes(url, {"user-agent": "mine/1.0"}, 0, logging.getLogger(__name__))
+        message = str(raised.exception)
+        # What the server said, on one line, without keys from query strings
+        self.assertIn("400", message)
+        self.assertIn("Bad request: see https://api.example.org/doc?***", message)
+        self.assertNotIn("SECRET", message)
+        self.assertNotIn("T0KEN", message)
+        self.assertLess(len(message), 400)
+        # A User-Agent set in the configuration wins
+        self.assertEqual(agents, ["mine/1.0"])
+        self.assertEqual(request_headers({"X-Key": "k"})["X-Key"], "k")
+        self.assertIn("User-Agent", request_headers(None))
 
 
 if __name__ == "__main__":

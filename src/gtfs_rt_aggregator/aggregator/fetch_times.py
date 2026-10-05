@@ -7,6 +7,12 @@ merged, the fetch times where an entity was missing are no longer in the rows
 them again would find no 10:01 fetch between them). So every file written
 since 0.7.4 lists all its fetch times, including fetches with no entity, in its
 metadata; files merged together carry the union of their lists.
+
+Fetches whose entities were the same as the previous fetch's (skip_unchanged)
+write no rows. Their times are kept apart, in a second metadata entry
+(UNCHANGED_TIMES_METADATA, since 0.9.4): every entity of the previous fetch
+was still there, so they are not gaps, but they tell a feed that was read
+and did not change from one that was not read at all (see dedup.py).
 """
 
 import json
@@ -17,6 +23,7 @@ import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
 FETCH_TIMES_METADATA = b"gtfs_rt_aggregator.fetch_times"
+UNCHANGED_TIMES_METADATA = b"gtfs_rt_aggregator.unchanged_fetch_times"
 # Random id of each written file: tells apart two files with the same name
 # and size (see service.SOURCES_METADATA)
 WRITE_ID_METADATA = b"gtfs_rt_aggregator.write_id"
@@ -26,7 +33,7 @@ TIMESTAMP = pa.timestamp("us", tz="UTC")
 TimeSets = Dict[Optional[str], Set[int]]
 
 
-def encode(times: TimeSets) -> Dict[bytes, bytes]:
+def encode(times: TimeSets, key: bytes = FETCH_TIMES_METADATA) -> Dict[bytes, bytes]:
     """Metadata entry holding times (each list delta-encoded, to stay small)."""
     value = {}
     for feed, values in times.items():
@@ -34,12 +41,14 @@ def encode(times: TimeSets) -> Dict[bytes, bytes]:
         value["" if feed is None else feed] = ordered[:1] + [
             b - a for a, b in zip(ordered, ordered[1:])
         ]
-    return {FETCH_TIMES_METADATA: json.dumps(value, separators=(",", ":")).encode()}
+    return {key: json.dumps(value, separators=(",", ":")).encode()}
 
 
-def decode(metadata: Optional[Dict[bytes, bytes]]) -> Optional[TimeSets]:
+def decode(
+    metadata: Optional[Dict[bytes, bytes]], key: bytes = FETCH_TIMES_METADATA
+) -> Optional[TimeSets]:
     """Times recorded in a schema's metadata (None if the file has none)."""
-    raw = (metadata or {}).get(FETCH_TIMES_METADATA)
+    raw = (metadata or {}).get(key)
     if raw is None:
         return None
     times = {}
@@ -114,6 +123,12 @@ def of_file(path: str, times: Optional[TimeSets] = None) -> TimeSets:
     return times
 
 
+def unchanged_of_file(path: str, times: Optional[TimeSets] = None) -> TimeSets:
+    """Add a local Parquet file's unchanged fetch times (none before 0.9.4)."""
+    times = {} if times is None else times
+    return merge(times, decode(pq.read_schema(path).metadata, UNCHANGED_TIMES_METADATA))
+
+
 def of_fetch(feed: Optional[str], fetch_time) -> TimeSets:
     """Times of a single fetch (fetch_time: an aware datetime)."""
     return {feed: _epoch_us(pa.array([fetch_time], TIMESTAMP))}
@@ -133,12 +148,45 @@ def write_id() -> Dict[bytes, bytes]:
     return {WRITE_ID_METADATA: uuid.uuid4().hex.encode()}
 
 
-def with_times(table: pa.Table, times: Optional[TimeSets]) -> pa.Table:
-    """table with times (and a new write id) added to its schema metadata."""
+def with_times(
+    table: pa.Table, times: Optional[TimeSets], unchanged: Optional[TimeSets] = None
+) -> pa.Table:
+    """table with times, unchanged fetch times (and a new write id) added to its schema metadata."""
     metadata = dict(table.schema.metadata or {})
+    metadata.pop(UNCHANGED_TIMES_METADATA, None)
     metadata.update(encode(times or {}))
+    if unchanged:
+        metadata.update(encode(unchanged, UNCHANGED_TIMES_METADATA))
     metadata.update(write_id())
     return table.replace_schema_metadata(metadata)
+
+
+# Unchanged fetches wait in the feed's state for the next file written; a feed
+# that stays unchanged writes a file with no rows holding them this often, so
+# they reach the files of their own period
+UNCHANGED_FLUSH_SECONDS = 600
+
+
+def note_unchanged(state: dict, fetch_times_iso: Iterable[str]) -> None:
+    """Remember unchanged fetches (ISO times) in a feed's state, until written."""
+    pending = state.setdefault("unchanged", [])
+    for value in fetch_times_iso:
+        pending.extend(_epoch_us(pa.array([value], pa.string()).cast(TIMESTAMP)))
+
+
+def pending_unchanged(state: dict, feed: Optional[str]) -> Optional[TimeSets]:
+    """The unchanged fetches waiting in a feed's state, as TimeSets (None if none)."""
+    values = state.get("unchanged")
+    return {feed: set(values)} if values else None
+
+
+def unchanged_flush_due(state: dict, fetch_time) -> bool:
+    """Whether the oldest unchanged fetch waiting is UNCHANGED_FLUSH_SECONDS old."""
+    values = state.get("unchanged")
+    return bool(values) and (
+        fetch_time.timestamp() * 1_000_000 - min(values)
+        >= UNCHANGED_FLUSH_SECONDS * 1_000_000
+    )
 
 
 def worth_storing(tables: Dict[str, pa.Table], state: dict) -> Dict[str, pa.Table]:

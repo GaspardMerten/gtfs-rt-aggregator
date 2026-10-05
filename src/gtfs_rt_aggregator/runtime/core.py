@@ -146,6 +146,7 @@ def process_payload(
     static_version, tables = static_versions.get(provider, api)
 
     entities = list(message.entity)
+    filtered = {}
     if api.filter:
         entity_filter = build_filter(
             api.filter,
@@ -158,7 +159,18 @@ def process_payload(
                 f"{provider.name}: the filter of {api.source} needs a "
                 "static version, none can be read yet"
             )
-        entities = [e for e in entities if entity_filter.keep(e)]
+        kept, unknown = [], 0
+        for entity in entities:
+            if entity_filter.keep(entity):
+                kept.append(entity)
+            elif entity_filter.unknown(entity):
+                unknown += 1
+        filtered = {
+            "dropped_count": len(entities) - len(kept),
+            # Trips the static version does not know (see EntityFilter.unknown)
+            "dropped_unknown": unknown,
+        }
+        entities = kept
 
     # Same entities as the previous fetch (in any order): nothing new
     hashes = [GtfsRtFetcher.entity_hash(e) for e in entities]
@@ -175,6 +187,7 @@ def process_payload(
         "kept_count": len(entities),
         "unchanged": unchanged,
         "static_version": static_version,
+        **filtered,
     }
     if unchanged and api.skip_unchanged:
         return ProcessResult(snapshot, True, None, summary)

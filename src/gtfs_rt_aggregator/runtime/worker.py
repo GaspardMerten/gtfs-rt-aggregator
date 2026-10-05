@@ -13,7 +13,7 @@ import tarfile
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -22,7 +22,6 @@ import pytz
 from ..aggregator.service import AggregatorService
 from ..config.models import GtfsRtConfig
 from ..runtime.core import (
-    StaticNotReady,
     StaticVersions,
     feed_hash,
     feed_slug,
@@ -61,9 +60,6 @@ class _Context:
     def storage(self, provider_name: str):
         return storage_for(self.storages, provider_name)
 
-
-# How long a fetch waits for the static version its filter needs
-STATIC_WAIT_MAX_SECONDS = 3 * 3600
 
 _CTX: Optional[_Context] = None
 # Arguments of init_worker, to build the context on first use
@@ -184,6 +180,12 @@ def process_item(item_path: str) -> Dict:
     """
     Process one fetch from processing/: parse, skip if unchanged, filter,
     write Parquet (to ready/, or to its accumulate_minutes window).
+
+    A fetch whose filter needs a static version not readable yet raises
+    StaticNotReady: it stays in the spool, however long (see Runtime._finish).
+    Unchanged fetches (this one, or those the runtime skipped as identical
+    bytes, listed in its sidecar) are recorded in the next file written, or
+    in a file with no rows every UNCHANGED_FLUSH_SECONDS (see fetch_times.py).
     """
     ctx = _ctx()
     item = Path(item_path)
@@ -194,31 +196,31 @@ def process_item(item_path: str) -> Dict:
     fetch_time = datetime.fromisoformat(meta["fetch_time"]).astimezone(tz)
     state = ctx.spool.state(feed)
 
-    try:
-        result = process_payload(
-            item.read_bytes(),
-            fetch_time,
-            provider,
-            api,
-            ctx.storage(provider.name),
-            ctx.static_versions,
-            state.get("snapshot"),
-            logger,
-        )
-    except StaticNotReady as e:
-        age = (datetime.now(timezone.utc) - fetch_time).total_seconds()
-        if age < STATIC_WAIT_MAX_SECONDS:
-            raise  # kept in the spool, tried again (see Runtime._finish)
-        # Never stored unfiltered: dropped after waiting that long
-        logger.error(f"{e}; fetch of {fetch_time.isoformat()} dropped")
-        return {"feed": feed, "summary": {"dropped_no_static": True}, "written": []}
+    result = process_payload(
+        item.read_bytes(),
+        fetch_time,
+        provider,
+        api,
+        ctx.storage(provider.name),
+        ctx.static_versions,
+        state.get("snapshot"),
+        logger,
+    )
+    fetch_times.note_unchanged(state, meta.get("unchanged_fetch_times") or [])
+    tables, times = result.tables, fetch_times.of_fetch(feed_hash(api), fetch_time)
+    if tables is None:
+        fetch_times.note_unchanged(state, [fetch_time.isoformat()])
+        if fetch_times.unchanged_flush_due(state, fetch_time):
+            # Files with no rows, holding only the unchanged fetches
+            tables, times = _empty_tables(provider, api, fetch_time), {}
     written = []
-    if result.tables is not None:
-        times = fetch_times.of_fetch(feed_hash(api), fetch_time)
-        tables = fetch_times.worth_storing(result.tables, state)
+    if tables is not None:
+        unchanged = fetch_times.pending_unchanged(state, feed_hash(api))
+        if times:
+            tables = fetch_times.worth_storing(tables, state)
         for service_type, table in tables.items():
             data = ParquetSerializer.pyarrow_table_to_bytes(
-                fetch_times.with_times(table, times), compression="snappy"
+                fetch_times.with_times(table, times, unchanged), compression="snappy"
             )
             if api.accumulate_minutes:
                 written.append(
@@ -238,12 +240,27 @@ def process_item(item_path: str) -> Dict:
                 path = f"{provider.name}/{service_type}/individual/{name}.parquet"
                 ctx.spool.put_ready(provider.name, path, data)
                 written.append(path)
+        if written:
+            state.pop("unchanged", None)
     if result.tables is not None and ctx.config.output.live_snapshot:
         _write_live(ctx, provider.name, api, result.tables, fetch_time, state)
     # Only once written: after a failure, the same content is tried again
     state["snapshot"] = result.snapshot
     ctx.spool.save_state(feed, state)
     return {"feed": feed, "summary": result.summary, "written": written}
+
+
+def _empty_tables(provider, api, fetch_time) -> Dict[str, pa.Table]:
+    """A table with no rows (but the columns) for each service of a feed."""
+    from ..fetcher.gtfs_rt import GtfsRtFetcher, row_metadata
+
+    return GtfsRtFetcher.build_tables(
+        [],
+        [],
+        api.services,
+        fetch_time,
+        row_metadata(provider.name, fetch_time, None, None, feed_hash(api)),
+    )
 
 
 def _write_live(ctx, provider_name, api, tables, fetch_time, state) -> None:
@@ -312,12 +329,16 @@ def close_window(folder: str) -> Dict:
     if window is None or not parts:
         shutil.rmtree(folder, ignore_errors=True)
         return {"parts": 0}
-    tables, times = [], {}
+    tables, times, unchanged = [], {}, {}
     for part in parts:
         tables.append(pq.read_table(part))
-        fetch_times.merge(times, fetch_times.decode(tables[-1].schema.metadata))
+        metadata = tables[-1].schema.metadata
+        fetch_times.merge(times, fetch_times.decode(metadata))
+        fetch_times.merge(
+            unchanged, fetch_times.decode(metadata, fetch_times.UNCHANGED_TIMES_METADATA)
+        )
     table = fetch_times.with_times(
-        pa.concat_tables(tables, promote_options="default"), times
+        pa.concat_tables(tables, promote_options="default"), times, unchanged
     )
     first = datetime.strptime(
         parts[0].stem[len("part-") :], "%Y%m%dT%H%M%S.%fZ"
@@ -338,11 +359,18 @@ def close_window(folder: str) -> Dict:
 
 
 @_timed
-def adapter_fetch(feed: str, previous_sha256: Optional[str]) -> Dict:
+def adapter_fetch(
+    feed: str,
+    previous_sha256: Optional[str],
+    unchanged: Optional[List[str]] = None,
+    force: bool = False,
+) -> Dict:
     """
     One poll of a realtime adapter (see adapters.py): the fetch goes to the
     spool like a download, then its state is saved. Unchanged bytes (with
-    skip_unchanged) are not stored.
+    skip_unchanged) are not stored, unless force. unchanged: times of the
+    feed's earlier unchanged polls, recorded with this fetch (see
+    fetch_times.py).
     """
     import hashlib
 
@@ -360,26 +388,25 @@ def adapter_fetch(feed: str, previous_sha256: Optional[str]) -> Dict:
         "size": len(data),
         "sha256": sha256,
     }
-    if api.skip_unchanged and sha256 == previous_sha256:
+    if api.skip_unchanged and sha256 == previous_sha256 and not force:
         result["unchanged"] = True
     else:
         item = ctx.spool.new_item(feed, fetch_time)
         tmp = item.with_name(item.name + ".part")
         tmp.write_bytes(data)
-        ctx.spool.commit_item(
-            item,
-            tmp,
-            {
-                "feed": feed,
-                "provider": provider.name,
-                "url": api.source,
-                "services": api.services,
-                "fetch_time": fetch_time.isoformat(),
-                "size": len(data),
-                "sha256": sha256,
-                "attempt": 1,
-            },
-        )
+        meta = {
+            "feed": feed,
+            "provider": provider.name,
+            "url": api.source,
+            "services": api.services,
+            "fetch_time": fetch_time.isoformat(),
+            "size": len(data),
+            "sha256": sha256,
+            "attempt": 1,
+        }
+        if unchanged:
+            meta["unchanged_fetch_times"] = list(unchanged)
+        ctx.spool.commit_item(item, tmp, meta)
         result["item"] = str(item)
     # Only once the fetch is in the spool: after a failure, the adapter is
     # called again with the same state
@@ -490,6 +517,23 @@ def iceberg_maintain() -> Dict:
 
     IcebergSink(_ctx().config, _ctx().storages).maintain()
     return {}
+
+
+@_timed
+def prune_raw(provider_name: str, prefix: str, retention_days: int) -> Dict:
+    """Delete a provider's raw bundles of days (UTC) older than retention_days."""
+    import re
+
+    storage = _ctx().storage(provider_name)
+    cutoff = (datetime.now(timezone.utc).date() - timedelta(days=retention_days)).isoformat()
+    deleted = 0
+    for path in storage.walk_files(f"{prefix}/provider={provider_name}/"):
+        day = re.search(r"/date=(\d{4}-\d{2}-\d{2})/", path)
+        if day and day.group(1) < cutoff and storage.delete_file(path) is not False:
+            deleted += 1
+    if deleted:
+        logger.info(f"Raw archive of {provider_name}: deleted {deleted} bundles before {cutoff}")
+    return {"deleted": deleted}
 
 
 @_timed

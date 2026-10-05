@@ -75,6 +75,29 @@ class EntityFilter:
         # Other entity types (trip modifications, shapes, stops) are kept
         return True
 
+    def unknown(self, entity) -> bool:
+        """
+        Whether a dropped entity's trip is unknown to the static version (its
+        trip id is not a kept trip, its route is missing or unknown), rather
+        than a trip of another mode. Many unknown trips mean the static
+        version is behind the realtime feed. A static version stored for
+        route_types only (rail) knows no trip of the other modes: they are
+        unknown too.
+        """
+        if entity.HasField("trip_update"):
+            trip = entity.trip_update.trip
+        elif entity.HasField("vehicle") and entity.vehicle.HasField("trip"):
+            trip = entity.vehicle.trip
+        else:
+            return False
+        if not (trip.trip_id or trip.route_id):
+            return False
+        return (
+            trip.route_id not in self.known_routes
+            and trip.trip_id not in self.trips
+            and (not self.known_trips or trip.trip_id not in self.known_trips)
+        )
+
     def _keep_trip(self, trip) -> bool:
         if trip.trip_id in self.trips or trip.route_id in self.routes:
             return True

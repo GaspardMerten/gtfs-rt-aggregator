@@ -240,7 +240,11 @@ class TestFilter(_FetcherTest):
         self.assertEqual(
             set(rows["staticVersion"].to_pylist()), {"2026-01-01_00-00-00Z"}
         )
-        self.assertEqual(self._status()["kept_count"], rail)
+        status = self._status()
+        self.assertEqual(status["kept_count"], rail)
+        # Every trip is in the static version: none dropped as unknown
+        self.assertEqual(status["dropped_count"], status["entity_count"] - rail)
+        self.assertEqual(status["dropped_unknown"], 0)
 
     def test_extended_route_type(self):
         api = ApiConfig(
@@ -404,6 +408,22 @@ class TestKeepUnmatchedAdded(unittest.TestCase):
 
         without = EntityFilter({2}, {"rail"}, set(), known_routes={"rail"})
         self.assertFalse(without.keep(self._entity("ADDED", "")))
+
+    def test_unknown_trips_counted(self):
+        from src.gtfs_rt_aggregator.fetcher.filter import EntityFilter
+
+        entity_filter = EntityFilter({2}, {"rail"}, {"T-rail"}, known_routes={"rail", "bus"})
+        cases = [
+            ("bus", "T-bus", False),  # a known route of another mode
+            ("", "T-new", True),  # a trip the static version does not have
+            ("new-route", "T-new", True),
+            ("", "", False),  # nothing to match
+        ]
+        for route, trip, expected in cases:
+            with self.subTest(route=route, trip=trip):
+                entity = self._entity("SCHEDULED", route, trip)
+                self.assertFalse(entity_filter.keep(entity))
+                self.assertEqual(entity_filter.unknown(entity), expected)
 
     def test_needs_a_route_filter(self):
         with self.assertRaises(ValueError):

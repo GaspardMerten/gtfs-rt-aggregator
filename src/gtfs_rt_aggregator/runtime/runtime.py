@@ -34,6 +34,7 @@ from typing import Callable, Dict, List, Optional
 
 import pytz
 
+from ..aggregator import fetch_times
 from ..aggregator.service import AggregatorService
 from ..config.models import GtfsRtConfig
 from ..runtime import worker
@@ -64,8 +65,17 @@ RETRY_MAX_SECONDS = 300
 SHUTDOWN_WAIT_SECONDS = 30
 # Longest a realtime download may take (each attempt)
 REALTIME_DOWNLOAD_MAX_SECONDS = 300
-# Fetches waiting for the static version their filter needs are retried this often
+# Fetches waiting for the static version their filter needs are retried this often,
+# and a warning repeated this often while they wait (they are never dropped)
 STATIC_RETRY_SECONDS = 30
+STATIC_WAIT_WARN_SECONDS = 1800
+# A realtime download taking longer than this runs on the slow download threads
+# next time, so slow servers do not hold the threads of the other feeds
+SLOW_DOWNLOAD_SECONDS = 10
+# How often a summary of the fetches is logged (per-fetch lines are DEBUG)
+SUMMARY_EVERY_SECONDS = 600
+# How often raw bundles older than raw.retention_days are deleted
+RAW_PRUNE_EVERY_SECONDS = 6 * 3600
 # Errors that another attempt cannot fix: quarantined right away
 PERMANENT_ERRORS = ("DecodeError",)
 
@@ -89,6 +99,17 @@ def _filesystem_type(path: str) -> Optional[str]:
         ):
             best = (mount_point, fs_type)
     return best[1] if best else None
+
+
+def _unchanged_due(unchanged: List[str], now: datetime) -> bool:
+    """
+    Whether the oldest unchanged fetch not handed to a worker yet is
+    UNCHANGED_FLUSH_SECONDS old: the next fetch then goes to a worker even if
+    identical, so their times reach storage (see fetch_times.py).
+    """
+    return bool(unchanged) and (
+        now - datetime.fromisoformat(unchanged[0])
+    ).total_seconds() >= fetch_times.UNCHANGED_FLUSH_SECONDS
 
 
 def _retry_delay(attempt: int) -> float:
@@ -163,7 +184,20 @@ class Runtime:
         self._stop = threading.Event()
         self._lock = threading.Lock()
         self._jobs: List[Job] = []
-        self._fetching: set = set()  # feeds (realtime and static) being downloaded
+        self._fetching: set = set()  # feeds (realtime and static) queued or being downloaded
+        self._downloading: set = set()  # realtime feeds whose download has started
+        self._fetch_next: set = set()  # feeds to fetch again as soon as their download ends
+        self._slow_feeds: set = set()  # feeds whose last download was slow
+        self._refetch: set = set()  # feeds fetched again after an undecodable fetch
+        self._undecodable: set = set()  # feeds whose last processed fetch could not be decoded
+        # Unchanged fetches not handed to a worker (identical bytes): ISO times by
+        # feed, sent with the feed's next fetch (see fetch_times.py)
+        self._unchanged: Dict[str, List[str]] = {}
+        # Counts since the last summary line (see _log_summary)
+        self._summary: Dict[str, int] = {}
+        self._failed_feeds: set = set()
+        # Entities of unknown trips the filter dropped, per feed: [since, fetches, entities]
+        self._dropped: Dict[str, List] = {}
         # Fetches waiting, per feed, oldest first (kept in memory: no directory
         # scan per tick); fetch threads add to it under _lock
         self._queues: Dict[str, List[Path]] = {}
@@ -186,7 +220,8 @@ class Runtime:
         self._started = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         self._window_failures: Dict[str, int] = {}
         self._rerun: Dict[str, Task] = {}  # heavy tasks to run again once done
-        self._waiting_static: set = set()  # feeds waiting for a static version
+        # Feeds waiting for a static version -> when that was last logged
+        self._waiting_static: Dict[str, float] = {}
         self._statics_checked: set = set()  # static adapter feeds run since start
         self._spool_lock = None
         self._paused: set = set()
@@ -196,6 +231,7 @@ class Runtime:
         self._fetch_pool = self._normal_pool = self._heavy_pool = self._static_pool = (
             None
         )
+        self._slow_fetch_pool = None
         self._uploader = None
 
     # Lifecycle ---------------------------------------------------------------
@@ -257,6 +293,9 @@ class Runtime:
                     self._suspects.add(str(item))
 
         self._fetch_pool = _DaemonThreadPool(self.runtime.fetch_threads, "fetch")
+        self._slow_fetch_pool = _DaemonThreadPool(
+            max(2, self.runtime.fetch_threads // 4), "fetch-slow"
+        )
         self._normal_pool = self._new_pool(self.runtime.worker_count())
         self._heavy_pool = self._new_pool(self.runtime.heavy_slots)
         self._static_pool = self._new_pool(self.runtime.heavy_slots, tasks_per_worker=1)
@@ -283,6 +322,7 @@ class Runtime:
             # Downloads cannot be interrupted: wait a while, then leave them
             # (daemon threads: they do not keep the process alive)
             self._fetch_pool.shutdown()
+            self._slow_fetch_pool.shutdown()
             while self._fetching and time.monotonic() < deadline:
                 # Adapter fetches run in the worker pools: they leave _fetching once collected
                 self._collect(stopping=True)
@@ -406,6 +446,13 @@ class Runtime:
         self._jobs += [
             Job("windows", WINDOWS_EVERY_SECONDS, self._close_windows, now),
             Job("raw", RAW_EVERY_SECONDS, self._bundle_raw, now),
+            Job("raw retention", RAW_PRUNE_EVERY_SECONDS, self._prune_raw, now + 60),
+            Job(
+                "summary",
+                SUMMARY_EVERY_SECONDS,
+                self._log_summary,
+                now + SUMMARY_EVERY_SECONDS,
+            ),
             Job("spool size", SPOOL_SIZE_EVERY_SECONDS, self._check_spool_size, now),
             Job(
                 "status",
@@ -444,38 +491,65 @@ class Runtime:
     # Fetch lane ----------------------------------------------------------------
 
     def _submit_fetch(self, feed: str):
+        """
+        Queue a fetch of feed. A feed is fetched once at a time: while its
+        download runs, one more fetch waits and starts as soon as it ends (a
+        download slower than refresh_seconds no longer skips every other
+        turn); a fetch still waiting for a free thread is not queued twice.
+        """
         with self._lock:
             status = self._status.get(feed, {})
             if feed in self._paused:
                 self._update_status(
                     feed, skipped_spool_full=status.get("skipped_spool_full", 0) + 1
                 )
+                self._add_summary("skipped")
                 return
             if feed in self._fetching:
+                if feed in self._downloading and feed not in self._fetch_next:
+                    self._fetch_next.add(feed)
+                    return
                 logger.warning(
-                    f"{feed}: previous download still running, fetch skipped"
+                    f"{feed}: previous fetch still "
+                    + ("running" if feed in self._downloading else "waiting for a download thread")
+                    + ", fetch skipped"
                 )
                 self._update_status(
                     feed, skipped_overlap=status.get("skipped_overlap", 0) + 1
                 )
+                self._add_summary("skipped")
                 return
             self._fetching.add(feed)
         _, api = self.feeds[feed]
         if api.adapter:
             self._submit_adapter_fetch(feed)
         else:
-            self._fetch_pool.submit(self._fetch, feed)
+            pool = (
+                self._slow_fetch_pool
+                if feed in self._slow_feeds
+                else self._fetch_pool
+            )
+            pool.submit(self._fetch, feed)
 
     def _submit_adapter_fetch(self, feed: str):
         """An adapter runs in a worker process (see adapters.py)."""
         provider, _ = self.feeds[feed]
         now = datetime.now(pytz.timezone(provider.timezone))
+        with self._lock:
+            unchanged = list(self._unchanged.get(feed, []))
         try:
             self._submit(
-                Task("adapter", f"adapter {feed}", "normal", {"feed": feed}),
+                Task(
+                    "adapter",
+                    f"adapter {feed}",
+                    "normal",
+                    {"feed": feed, "unchanged": unchanged},
+                ),
                 worker.adapter_fetch,
                 feed,
                 self._last_sha.get(feed),
+                unchanged,
+                _unchanged_due(unchanged, now),
             )
         except Exception:
             with self._lock:
@@ -505,16 +579,26 @@ class Runtime:
         with self._lock:
             if error is None and result.get("item"):
                 bisect.insort(self._queues.setdefault(feed, []), Path(result["item"]))
+                # Sent with this fetch: the worker records them
+                sent = task.info.get("unchanged") or []
+                self._unchanged[feed] = self._unchanged.get(feed, [])[len(sent) :]
+            elif error is None:
+                self._unchanged.setdefault(feed, []).append(result["fetch_time"])
             self._fetching.discard(feed)
             self._update_status(feed, **status)
             self._count_fetch(feed, datetime.now(timezone.utc), "failed" if error is not None else "ok")
 
     def _fetch(self, feed: str):
         provider, api = self.feeds[feed]
+        with self._lock:
+            self._downloading.add(feed)
+            refetch = feed in self._refetch
+            self._refetch.discard(feed)
         fetch_time = datetime.now(pytz.timezone(provider.timezone))
         status = {"last_attempt": fetch_time.isoformat()}
         item = self.spool.new_item(feed, fetch_time)
         tmp = item.with_name(item.name + ".part")
+        started = time.monotonic()
         try:
             size, sha256 = download_to(
                 api.url,
@@ -527,28 +611,38 @@ class Runtime:
             status.update(last_success=fetch_time.isoformat(), size=size)
             with self._lock:
                 self._count_fetch(feed, fetch_time, "ok")
-            if api.skip_unchanged and self._last_sha.get(feed) == sha256:
-                # Byte for byte the previous fetch: nothing to process
+                unchanged = list(self._unchanged.get(feed, []))
+            if (
+                api.skip_unchanged
+                and self._last_sha.get(feed) == sha256
+                and not _unchanged_due(unchanged, fetch_time)
+            ):
+                # Byte for byte the previous fetch: nothing to process, only its
+                # time to record (sent with the next fetch handed to a worker)
                 tmp.unlink(missing_ok=True)
                 status["unchanged"] = True
+                with self._lock:
+                    self._unchanged.setdefault(feed, []).append(fetch_time.isoformat())
                 return
-            self.spool.commit_item(
-                item,
-                tmp,
-                {
-                    "feed": feed,
-                    "provider": provider.name,
-                    "url": strip_query(api.url),
-                    "services": api.services,
-                    "fetch_time": fetch_time.isoformat(),
-                    "size": size,
-                    "sha256": sha256,
-                    "attempt": 1,
-                },
-            )
+            meta = {
+                "feed": feed,
+                "provider": provider.name,
+                "url": strip_query(api.url),
+                "services": api.services,
+                "fetch_time": fetch_time.isoformat(),
+                "size": size,
+                "sha256": sha256,
+                "attempt": 1,
+            }
+            if unchanged:
+                meta["unchanged_fetch_times"] = unchanged
+            if refetch:
+                meta["refetch"] = True
+            self.spool.commit_item(item, tmp, meta)
             # Only once on disk: after a failed commit, the same bytes are kept next time
             self._last_sha[feed] = sha256
             with self._lock:
+                self._unchanged[feed] = self._unchanged.get(feed, [])[len(unchanged) :]
                 self._queues.setdefault(feed, []).append(item)
         except Exception as e:
             tmp.unlink(missing_ok=True)
@@ -559,9 +653,19 @@ class Runtime:
                 self._count_fetch(feed, fetch_time, "failed")
             logger.error(f"Fetching {redact(api.url)} failed: {redact(str(e))}")
         finally:
+            seconds = time.monotonic() - started
             with self._lock:
+                if seconds > SLOW_DOWNLOAD_SECONDS:
+                    self._slow_feeds.add(feed)
+                else:
+                    self._slow_feeds.discard(feed)
+                self._downloading.discard(feed)
                 self._fetching.discard(feed)
+                again = feed in self._fetch_next
+                self._fetch_next.discard(feed)
                 self._update_status(feed, **status)
+            if again and not self._stop.is_set():
+                self._submit_fetch(feed)
 
     def _submit_static_download(self, feed: str):
         provider, static = self.statics[feed]
@@ -832,7 +936,9 @@ class Runtime:
             back = self.spool.path("incoming", item.parent.name, item.name)
             self._retry_at.pop(str(back), None)
             if error is not None and error.startswith("StaticNotReady"):
-                # Not the fetch's fault: waits, in order, for the static version
+                # Not the fetch's fault: waits, in order, for the static version,
+                # however long (bounded by spool_max_gb: never stored unfiltered,
+                # never dropped)
                 self.spool.release(
                     item,
                     error,
@@ -844,29 +950,50 @@ class Runtime:
                 with self._lock:
                     bisect.insort(self._queues.setdefault(task.key, []), back)
                     self._update_status(task.key, waiting_for_static=True)
-                if task.key not in self._waiting_static:
-                    self._waiting_static.add(task.key)
-                    logger.warning(f"{error}: fetches wait in the spool")
+                    waiting = len(self._queues[task.key])
+                    oldest = _item_time(self._queues[task.key][0])
+                logged = self._waiting_static.get(task.key)
+                if logged is None or time.monotonic() - logged >= STATIC_WAIT_WARN_SECONDS:
+                    self._waiting_static[task.key] = time.monotonic()
+                    hours = (datetime.now(timezone.utc) - oldest).total_seconds() / 3600
+                    logger.warning(
+                        f"{error}: {waiting} fetches wait in the spool "
+                        f"(oldest {hours:.1f} h ago)"
+                    )
                 return
-            self._waiting_static.discard(task.key)
+            self._waiting_static.pop(task.key, None)
             if error is None:
-                self.spool.done(item, archive=self.config.raw.enabled)
+                self._undecodable.discard(task.key)
+                provider, api = self.feeds[task.key]
+                self.spool.done(
+                    item, archive=self.config.raw.archives(provider.name, feed_slug(api))
+                )
+                summary = result.get("summary", {})
                 with self._lock:
-                    if result.get("summary", {}).get("unchanged") is False:
+                    if summary.get("unchanged") is False:
                         self._count_fetch(task.key, _item_time(item), "changed")
+                    if summary.get("dropped_unknown"):
+                        self._count_fetch(
+                            task.key,
+                            _item_time(item),
+                            "dropped_unknown",
+                            summary["dropped_unknown"],
+                        )
                     self._update_status(
                         task.key,
                         waiting_for_static=False,
-                        **result.get("summary", {}),
+                        **summary,
                         last_processed_seconds=result.get("seconds"),
                         worker_peak_memory_mb=result.get("peak_memory_mb"),
                     )
+                self._note_dropped(task.key, summary.get("dropped_unknown"))
                 return
             # Blamed if it failed by itself, or its worker died while it ran alone
             count = not cancelled and (
                 not crashed or alone or bool(task.info.get("suspect"))
             )
             permanent = count and error.startswith(PERMANENT_ERRORS)
+            refetched = self.spool.meta(item).get("refetch")
             quarantined = self.spool.release(
                 item,
                 error,
@@ -882,10 +1009,34 @@ class Runtime:
                     self._suspects.add(str(back))
                 with self._lock:
                     bisect.insort(self._queues.setdefault(task.key, []), back)
+            # An undecodable fetch (cut short, an error page): fetched again
+            # right away, once, so the feed loses one turn at most. Not when
+            # the previous one failed too (a feed always broken is not
+            # downloaded twice per turn)
+            again = (
+                permanent
+                and quarantined
+                and not refetched
+                and task.key not in self._undecodable
+                and bool(self.feeds[task.key][1].url)
+            )
+            if permanent:
+                self._undecodable.add(task.key)
             logger.error(
                 f"{task.key}: processing {item.name} failed ({error})"
                 + ("; moved to quarantine/" if quarantined else "; will retry")
+                + ("; fetching the feed again" if again else "")
             )
+            if quarantined:
+                with self._lock:
+                    # The next download is processed even if it has the same
+                    # bytes: identical fetches since were not unchanged ones
+                    self._last_sha.pop(task.key, None)
+                    self._unchanged.pop(task.key, None)
+            if again:
+                with self._lock:
+                    self._refetch.add(task.key)
+                self._submit_fetch(task.key)
             with self._lock:
                 self._update_status(
                     task.key,
@@ -950,7 +1101,10 @@ class Runtime:
                 # The compaction rewrote day files in place: the tables must
                 # point to the new ones before readers see a size mismatch
                 self._queue_heavy("iceberg_sync", "Iceberg sync", {}, rerun=True)
-            logger.info(
+            # Routine tasks (every few minutes per provider and service, per
+            # window, per raw hour): DEBUG
+            routine = task.kind in ("aggregate", "window", "raw")
+            (logger.debug if routine else logger.info)(
                 f"{task.kind} {task.key} done in {result.get('seconds')}s, "
                 f"worker peak memory {result.get('peak_memory_mb')} MB"
             )
@@ -1031,6 +1185,23 @@ class Runtime:
             queue = self._queues.get(feed)
             return bool(queue) and _item_time(queue[0]) < end
 
+    def _prune_raw(self):
+        """Delete raw bundles older than raw.retention_days, in a worker."""
+        raw = self.config.raw
+        if not raw.enabled or not raw.retention_days:
+            return
+        for provider in self.config.providers:
+            key = f"raw retention {provider.name}"
+            if key in self._keys_in_flight or "normal" in self._probing:
+                continue
+            self._submit(
+                Task("raw", key, "normal"),
+                worker.prune_raw,
+                provider.name,
+                raw.prefix,
+                raw.retention_days,
+            )
+
     def _bundle_raw(self):
         if not self.config.raw.enabled:
             return
@@ -1089,16 +1260,69 @@ class Runtime:
             if 0.8 <= ratio < 1:
                 logger.warning(f"Spool at {ratio:.0%} of spool_max_gb")
 
-    def _count_fetch(self, feed: str, when: datetime, kind: str):
-        """One fetch of feed at when (aware): kind is ok, changed or failed. Call with the lock held."""
+    def _count_fetch(self, feed: str, when: datetime, kind: str, count: int = 1):
+        """
+        One fetch of feed at when (aware): kind is ok, changed or failed; or
+        dropped_unknown, entities of unknown trips its filter dropped (count).
+        Call with the lock held.
+        """
         provider, _ = self.feeds[feed]
         local = when.astimezone(pytz.timezone(provider.timezone))
         days = self._health.setdefault(feed, {})
         hour = days.setdefault(local.date().isoformat(), {}).setdefault(f"{local.hour:02d}", {"ok": 0, "changed": 0, "failed": 0})
-        hour[kind] += 1
+        hour[kind] = hour.get(kind, 0) + count
+        if kind != "dropped_unknown":
+            self._add_summary(kind)
+        if kind == "failed":
+            self._failed_feeds.add(feed)
         for old in sorted(days)[:-2]:  # today and yesterday are enough: older days are written already
             del days[old]
         self._health_dirty.add(feed)
+
+    def _add_summary(self, kind: str):
+        """Count a fetch (ok, changed, failed, skipped) for the next summary line. Call with the lock held."""
+        self._summary[kind] = self._summary.get(kind, 0) + 1
+
+    def _log_summary(self):
+        """One line every SUMMARY_EVERY_SECONDS instead of one per fetch."""
+        with self._lock:
+            counts, self._summary = self._summary, {}
+            failed, self._failed_feeds = sorted(self._failed_feeds), set()
+            waiting = sum(len(items) for items in self._queues.values())
+        line = (
+            f"Last {SUMMARY_EVERY_SECONDS // 60} min: {counts.get('ok', 0)} fetches "
+            f"({counts.get('changed', 0)} changed), {counts.get('failed', 0)} failed"
+        )
+        if failed:
+            line += f" ({len(failed)} feeds: {', '.join(failed[:5])}{', ...' if len(failed) > 5 else ''})"
+        line += (
+            f", {counts.get('skipped', 0)} skipped; {waiting} waiting, "
+            f"spool {self._spool_size / 1024**3:.2f} GB, "
+            f"{self.spool.quarantined()} quarantined"
+        )
+        logger.info(line)
+
+    def _note_dropped(self, feed: str, unknown: Optional[int]):
+        """
+        Entities of unknown trips a feed's filter dropped (see
+        EntityFilter.unknown): logged once per window (accumulate_minutes, or
+        15 minutes), not per fetch. Many mean its static version is behind.
+        """
+        if unknown is None:
+            return
+        _, api = self.feeds[feed]
+        now = time.monotonic()
+        since, fetches, entities = self._dropped.setdefault(feed, [now, 0, 0])
+        fetches, entities = fetches + 1, entities + unknown
+        if now - since < (api.accumulate_minutes or 15) * 60:
+            self._dropped[feed] = [since, fetches, entities]
+            return
+        self._dropped[feed] = [now, 0, 0]
+        if entities:
+            logger.info(
+                f"{feed}: the filter dropped {entities} entities of trips unknown to "
+                f"the static version in {fetches} fetches ({entities / fetches:.0f} a fetch)"
+            )
 
     def _update_status(self, feed: str, **fields):
         self._status.setdefault(feed, {}).update(fields)

@@ -48,7 +48,8 @@ class MinioStorage(StorageInterface):
         # Checked on the first write, not here: creating a storage must not
         # need the network (the pipeline starts during an outage too)
         self._bucket_checked = False
-        self.logger.info(
+        # DEBUG: every worker process creates its storages
+        self.logger.debug(
             f"Initialized MinIO storage with endpoint: {endpoint}, bucket: {bucket_name}"
         )
 

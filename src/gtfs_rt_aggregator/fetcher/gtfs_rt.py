@@ -172,7 +172,7 @@ class GtfsRtFetcher:
         result = {}
         for service_type, builder in builders.values():
             table = result[service_type] = flat(builder.finish(constants))
-            cls.logger.info(
+            cls.logger.debug(
                 f"Processed {table.num_rows} records for service type {service_type}"
             )
         return result

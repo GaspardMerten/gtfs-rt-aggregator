@@ -10,7 +10,7 @@ import pytz
 
 from . import fetch_times
 from ..aggregator.compaction import compact_files, sorted_by, write_sorted
-from ..aggregator.dedup import deduplicate as deduplicate_rows
+from ..aggregator.dedup import deduplicate as deduplicate_rows, max_gap_seconds
 from ..aggregator.paths import aggregated_root, day_files, day_folder
 from ..config.models import GtfsRtConfig
 from ..schema.conform import conform
@@ -142,7 +142,8 @@ class AggregatorService:
             deduplicate: Merge consecutive identical rows (firstSeen / lastSeen)
         """
         job_logger = setup_logger(f"{__name__}.AggregatorService.job.{provider_name}")
-        job_logger.info(
+        # Routine lines (every check_interval_seconds, every period) are DEBUG
+        job_logger.debug(
             f"Starting aggregation job for {provider_name}, service types: {service_types}"
         )
 
@@ -162,7 +163,7 @@ class AggregatorService:
                     deduplicate=deduplicate,
                 )
 
-            job_logger.info(f"Completed aggregation job for {provider_name}")
+            job_logger.debug(f"Completed aggregation job for {provider_name}")
         except Exception as e:
             job_logger.error(f"Error in aggregation job: {str(e)}", exc_info=True)
 
@@ -208,7 +209,7 @@ class AggregatorService:
         files = storage.list_files(directory, "*.parquet")
 
         if not files:
-            logger.info(f"No individual files found {directory}")
+            logger.debug(f"No individual files found {directory}")
             return
 
         logger.debug(f"Found {len(files)} individual files for {directory}")
@@ -246,7 +247,7 @@ class AggregatorService:
             if latest < next_period and datetime.now(
                 timezone
             ) < next_period + timedelta(seconds=PERIOD_GRACE_SECONDS):
-                logger.info(
+                logger.debug(
                     f"Skipping group {group_time} for {service_type} - no files from next period yet"
                 )
                 continue
@@ -335,7 +336,7 @@ class AggregatorService:
             deduplicate: Merge consecutive identical rows (firstSeen / lastSeen)
         """
         logger = logger or self.logger
-        logger.info(
+        logger.debug(
             f"Aggregating {len(files)} files for {provider_name}/{service_type} at {group_time}"
         )
         path = self.output_path(provider_name, service_type, group_time, next_period)
@@ -363,7 +364,7 @@ class AggregatorService:
         for file_path in merged["merged"] + merged["skipped"]:
             if storage.delete_file(file_path) is False:
                 logger.error(f"Could not delete aggregated file {file_path}")
-        logger.info(
+        logger.debug(
             f"Grouped {len(merged['merged'])} files with {merged['rows']} records to {path}"
         )
 
@@ -548,6 +549,10 @@ class AggregatorService:
             for found in file_times.values():
                 fetch_times.merge(every_time, found)
             every_time = fetch_times.to_arrays(every_time)
+            unchanged = {}
+            for _, local in inputs:
+                fetch_times.unchanged_of_file(local, unchanged)
+            max_gap = self._max_gaps(provider_name)
 
             merged, sorted_paths = [], []
             for index, (path, local) in enumerate(inputs):
@@ -570,7 +575,12 @@ class AggregatorService:
                     # Times of files written before 0.6.0 (Unix seconds)
                     fetch_times.from_table(table, file_times[path])
                     if deduplicate:
-                        table = deduplicate_rows(table, every_time)
+                        table = deduplicate_rows(
+                            table,
+                            every_time,
+                            fetch_times.to_arrays(unchanged),
+                            max_gap,
+                        )
                     prepared = os.path.join(tmp, f"sorted-{index}.parquet")
                     write_sorted(table, keys, prepared)
                     del table
@@ -595,9 +605,18 @@ class AggregatorService:
                 times=fetch_times.to_arrays(times) if deduplicate else None,
                 metadata={
                     **fetch_times.encode(times),
+                    **(
+                        fetch_times.encode(
+                            unchanged, fetch_times.UNCHANGED_TIMES_METADATA
+                        )
+                        if unchanged
+                        else {}
+                    ),
                     **fetch_times.write_id(),
                     SOURCES_METADATA: json.dumps(sources).encode(),
                 },
+                unchanged=fetch_times.to_arrays(unchanged) if deduplicate else None,
+                max_gap=max_gap,
             )
             storage.save_file(result, output)
             return {
@@ -606,6 +625,21 @@ class AggregatorService:
                 "skipped": skipped,
                 "failed": failed,
             }
+
+    def _max_gaps(self, provider_name: str) -> Dict[Optional[str], float]:
+        """Longest wait between two fetches of each feed of a provider, by feedId
+        (see dedup.max_gap_seconds); rows without feedId get the longest."""
+        from ..runtime.core import feed_hash
+
+        provider = next(
+            (p for p in self.config.providers if p.name == provider_name), None
+        )
+        gaps = {
+            feed_hash(api): max_gap_seconds(api.refresh_seconds)
+            for api in (provider.realtime if provider else [])
+        }
+        gaps[None] = max(gaps.values(), default=max_gap_seconds(0))
+        return gaps
 
     def _extract_datetime_from_filename(
         self, filename: str, timezone: Optional[pytz.BaseTzInfo] = None
