@@ -21,6 +21,7 @@ from ..config.models import GtfsRtConfig
 from ..storage.base import StorageInterface, storage_for
 from ..utils.file_time import format_file_time
 from ..utils.http import (
+    check_gzip,
     check_length,
     get_bytes,
     raise_for_status,
@@ -499,6 +500,7 @@ class StaticService:
                     f.write(chunk)
                     size += len(chunk)
             check_length(response, size)
+            check_gzip(zip_path, url)
             return response.headers.get("ETag"), response.headers.get("Last-Modified")
 
     @staticmethod

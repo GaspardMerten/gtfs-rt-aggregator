@@ -473,6 +473,27 @@ class TestDownload(unittest.TestCase):
         response.headers = {"Content-Length": "20", "Content-Encoding": "gzip"}
         check_length(response, 50)
 
+    def test_cut_gzip_is_incomplete(self):
+        import gzip
+
+        from src.gtfs_rt_aggregator.utils.http import IncompleteDownload, check_gzip
+
+        folder = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, folder)
+        whole = gzip.compress(os.urandom(200_000))
+        path = os.path.join(folder, "feed")
+        with open(path, "wb") as f:
+            f.write(whole)
+        check_gzip(path)
+        with open(path, "wb") as f:
+            f.write(whole[: len(whole) // 2])
+        with self.assertRaises(IncompleteDownload):
+            check_gzip(path, "https://x.org/f.gz")
+        # Not a gzip: not checked
+        with open(path, "wb") as f:
+            f.write(b"PK\x03\x04 a zip")
+        check_gzip(path)
+
     def test_user_agent_and_error_body(self):
         import http.server
         import logging

@@ -68,6 +68,26 @@ def check_length(response: requests.Response, size: int):
         )
 
 
+def check_gzip(path: str, url: str = ""):
+    """
+    Raise IncompleteDownload if the file at path is a gzip that ends before its
+    end-of-stream marker: a body cut without a Content-Length to tell (chunked
+    transfer). Other files are not checked.
+    """
+    import gzip
+    import zlib
+
+    with open(path, "rb") as f:
+        if f.read(2) != b"\x1f\x8b":
+            return
+    try:
+        with gzip.open(path, "rb") as f:
+            while f.read(1 << 20):
+                pass
+    except (EOFError, zlib.error, gzip.BadGzipFile) as e:
+        raise IncompleteDownload(f"GET {strip_query(url)} sent a cut gzip file ({e})")
+
+
 def with_retries(
     action: Callable[[], T],
     retries: int,

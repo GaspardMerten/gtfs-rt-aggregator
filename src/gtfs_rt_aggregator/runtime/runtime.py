@@ -222,7 +222,7 @@ class Runtime:
         self._rerun: Dict[str, Task] = {}  # heavy tasks to run again once done
         # Feeds waiting for a static version -> when that was last logged
         self._waiting_static: Dict[str, float] = {}
-        self._statics_checked: set = set()  # static adapter feeds run since start
+        self._statics_checked: set = set()  # static feeds checked since start
         self._spool_lock = None
         self._paused: set = set()
         self._pause_level = -1
@@ -667,8 +667,40 @@ class Runtime:
             if again and not self._stop.is_set():
                 self._submit_fetch(feed)
 
+    @staticmethod
+    def _static_config_key(static) -> str:
+        """What a stored static version depends on in the config: a change reads the feed again."""
+        return "|".join(
+            str(v)
+            for v in (
+                strip_query(static.url or ""),
+                strip_query(static.index_url or ""),
+                static.url_pattern,
+                sorted(static.route_type_set()),
+                static.format,
+            )
+        )
+
+    def _static_checked_recently(self, feed: str, static) -> bool:
+        """At the first check after a start: whether the feed's URL was read less
+        than check_minutes ago (by an earlier run of the process) with the same
+        config. Without this, every restart downloads every static feed again: a
+        feed with no ETag or Last-Modified is then read in full each time."""
+        saved = read_json(self.spool.path("state", f"{feed}.static-check.json")) or {}
+        try:
+            checked = datetime.fromisoformat(saved["checked_at"])
+        except (ValueError, KeyError, TypeError):
+            return False
+        return saved.get("config") == self._static_config_key(static) and (
+            datetime.now(timezone.utc) - checked
+        ).total_seconds() < static.check_minutes * 60
+
     def _submit_static_download(self, feed: str):
         provider, static = self.statics[feed]
+        if not static.adapter and feed not in self._statics_checked:
+            self._statics_checked.add(feed)
+            if self._static_checked_recently(feed, static):
+                return
         if static.adapter:
             # Built by its adapter in a fresh process, like a conversion
             self._queue_heavy(
@@ -717,6 +749,13 @@ class Runtime:
             else:
                 # meta.json marks the download complete
                 write_json(folder / "meta.json", {**meta, "attempt": 1})
+            write_json(
+                self.spool.path("state", f"{feed}.static-check.json"),
+                {
+                    "checked_at": datetime.now(timezone.utc).isoformat(),
+                    "config": self._static_config_key(static),
+                },
+            )
         except Exception as e:
             shutil.rmtree(folder, ignore_errors=True)
             logger.error(f"Downloading static feed {feed} failed: {redact(str(e))}")
