@@ -5,7 +5,6 @@ take and return only plain values, so they work with any start method.
 """
 
 import functools
-import pickle
 import gc
 import logging
 import os
@@ -83,11 +82,12 @@ def init_worker(
         faulthandler.register(signal.SIGUSR1, all_threads=True)
     # A crash in native code (segfault, abort) prints the Python stacks
     faulthandler.enable(all_threads=True)
-    # Ctrl+C and SIGTERM reach the whole process group: the main process
-    # stops the workers itself, once running tasks had time to finish
+    # Ctrl+C reaches the whole process group: the main process stops the
+    # workers itself, once running tasks had time to finish. SIGTERM still
+    # ends a worker: a broken pool terminates its workers with it, and waits
+    # for them while holding its lock (7 Oct 2026: ignoring it froze the
+    # pipeline). Run under systemd with KillSignal=SIGINT.
     signal.signal(signal.SIGINT, signal.SIG_IGN)
-    if hasattr(signal, "SIGTERM"):
-        signal.signal(signal.SIGTERM, signal.SIG_IGN)
     if main_pid is not None:
         _exit_with(main_pid)
     root = logging.getLogger()
@@ -109,8 +109,7 @@ def init_worker(
 def _exit_with(main_pid: int, every_seconds: float = 2.0):
     """
     End this worker when the main process is gone (killed, out of memory):
-    it ignores SIGTERM, so it would otherwise outlive it, beside the
-    pipeline started next.
+    it would otherwise outlive it, beside the pipeline started next.
     """
     import threading
 
@@ -141,7 +140,12 @@ def _ctx() -> _Context:
 
 
 def _timed(task):
-    """Add the task's duration and the worker's peak memory to its result."""
+    """
+    Add the task's duration and the worker's peak memory to its result. An
+    error comes back as {"error": "<class>: <message>"}, never as an
+    exception: one the main process cannot unpickle (minio's S3Error, a class
+    defined by an adapter) breaks the whole pool, as if a worker had died.
+    """
 
     # Same name as the task: the main process sends tasks by name
     @functools.wraps(task)
@@ -153,7 +157,7 @@ def _timed(task):
             result["peak_memory_mb"] = round(_peak_memory_mb())
             return result
         except Exception as error:
-            raise _portable(error) from None
+            return {"error": f"{type(error).__name__}: {error}"}
         finally:
             # Hand memory back to the system between tasks, failed ones too:
             # Arrow's allocator keeps freed memory otherwise (a static feed
@@ -165,21 +169,6 @@ def _timed(task):
                 pass
 
     return wrapper
-
-
-def _portable(error: Exception) -> Exception:
-    """
-    The exception a task sends back to the main process: itself if it can be
-    pickled and unpickled, else a RuntimeError with its class and message.
-    The main process failing to unpickle one (minio's S3Error and ServerError:
-    their __init__ takes several arguments) breaks the whole worker pool, as
-    if a worker had died.
-    """
-    try:
-        pickle.loads(pickle.dumps(error))
-        return error
-    except Exception:
-        return RuntimeError(f"{type(error).__name__}: {error}")
 
 
 def _peak_memory_mb() -> float:

@@ -63,14 +63,14 @@ class TestSpoolRecovery(unittest.TestCase):
         (back,) = self.spool.queued_items()["f"]
         self.assertEqual(self.spool.meta(back)["attempt"], 2)
 
-    def test_failure_on_its_own_clears_suspect(self):
+    def test_release_without_blame_counts_no_attempt(self):
         item = self.spool.claim(self._item())
         self.spool.release(item, "worker died", 3, count_attempt=False)
         (back,) = self.spool.queued_items()["f"]
-        self.assertTrue(self.spool.meta(back)["suspect"])
+        self.assertEqual(self.spool.meta(back)["attempt"], 1)
         self.spool.release(self.spool.claim(back), "boom", 3)
         (back,) = self.spool.queued_items()["f"]
-        self.assertNotIn("suspect", self.spool.meta(back))
+        self.assertEqual(self.spool.meta(back)["attempt"], 2)
 
     def test_orphan_sidecar_removed(self):
         item = self._item()
@@ -244,7 +244,7 @@ class TestHeavyTasks(unittest.TestCase):
 
         task = Task("window", "window /w", "normal", {"base": "/w"})
         for _ in range(5):
-            self.runtime._finish(task, None, "worker died", crashed=True, alone=False)
+            self.runtime._finish(task, None, "worker died", blame=False)
             self.runtime._finish(task, None, "cancelled", cancelled=True)
         self.assertEqual(self.runtime._window_failures, {})
         self.runtime._finish(task, None, "boom")

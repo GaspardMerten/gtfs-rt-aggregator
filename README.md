@@ -72,7 +72,8 @@ gtfs-rt-pipeline configuration.toml
 ```
 
 Each job first runs within a minute of startup (see `startup_jitter_seconds`), then at its interval. The pipeline
-stops cleanly on Ctrl+C or SIGTERM.
+stops cleanly on Ctrl+C, or SIGTERM sent to its main process. Under systemd, set `KillSignal=SIGINT`: systemd
+signals every process of the service, and worker processes end at once on SIGTERM.
 
 Any string in the file can read an environment variable with `${NAME}`. Loading fails if the variable is not set.
 Write `$${` for a literal `${`.

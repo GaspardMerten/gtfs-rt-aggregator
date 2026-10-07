@@ -188,13 +188,13 @@ class TestWorkerTasks(unittest.TestCase):
         )
         worker.init_worker(self.config, str(self.tmp / "spool"), logging.INFO)
         # No static version stored yet: nothing written, the fetch waits
-        with self.assertRaises(StaticNotReady):
-            worker.process_item(str(self._item(datetime.now(timezone.utc))))
+        result = worker.process_item(str(self._item(datetime.now(timezone.utc))))
+        self.assertTrue(result["error"].startswith(StaticNotReady.__name__))
         self.assertEqual(list(self.spool.path("windows").rglob("*.parquet")), [])
         # However long it waited: never dropped, never stored unfiltered
         old = datetime.now(timezone.utc) - timedelta(hours=30)
-        with self.assertRaises(StaticNotReady):
-            worker.process_item(str(self._item(old)))
+        result = worker.process_item(str(self._item(old)))
+        self.assertTrue(result["error"].startswith(StaticNotReady.__name__))
         self.assertEqual(list(self.spool.path("windows").rglob("*.parquet")), [])
 
     def test_fetch_after_close_gets_its_own_window(self):

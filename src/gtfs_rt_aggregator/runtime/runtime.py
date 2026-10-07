@@ -10,8 +10,9 @@ The pipeline's runtime:
   per feed and in fetch order. Memory-heavy work (large fetches, static feeds,
   aggregation, compaction) goes to a separate heavy pool (1 process by default).
 - A failed item is retried later (backoff), then quarantined after
-  max_attempts. When a worker dies (e.g. out of memory), the fetches that ran
-  beside it are not blamed: they next run alone, one at a time.
+  max_attempts. When a worker dies (e.g. out of memory), every task of its
+  pool counts an attempt. A task running past its deadline is stopped by
+  killing its pool's workers: it alone is blamed.
 - The upload thread moves results to storage; during an outage they wait on disk.
 """
 
@@ -25,6 +26,7 @@ import signal
 import tempfile
 import threading
 import time
+import weakref
 from concurrent.futures import Future, ProcessPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
 from dataclasses import dataclass, field
@@ -78,6 +80,10 @@ SUMMARY_EVERY_SECONDS = 600
 RAW_PRUNE_EVERY_SECONDS = 6 * 3600
 # Errors that another attempt cannot fix: quarantined right away
 PERMANENT_ERRORS = ("DecodeError",)
+# Longest a task may run, by kind (others: TASK_DEADLINE_SECONDS_HEAVY). Past
+# it, its pool's workers are killed: a hung task never holds a worker for good
+TASK_DEADLINE_SECONDS = {"item": 600, "adapter": 600, "window": 900, "raw": 3600}
+TASK_DEADLINE_SECONDS_HEAVY = 4 * 3600
 
 
 def default_spool_dir() -> str:
@@ -144,6 +150,21 @@ class Task:
     # Heavy tasks with the same lock never run at once (e.g. the aggregation
     # and the compaction of one provider's service: both rewrite its files)
     lock: Optional[str] = None
+    started: float = 0.0  # time.monotonic() when submitted
+    overdue: bool = False  # stopped for running past its deadline
+
+
+def _deadline(kind: str) -> int:
+    return TASK_DEADLINE_SECONDS.get(kind, TASK_DEADLINE_SECONDS_HEAVY)
+
+
+def _kill_workers(pool: ProcessPoolExecutor):
+    for process in list((getattr(pool, "_processes", None) or {}).values()):
+        try:
+            if process.exitcode is None:
+                process.kill()
+        except (OSError, ValueError, AttributeError):
+            pass
 
 
 def _pool_context():
@@ -164,36 +185,6 @@ def _pool_context():
 
 
 
-def _abandon_pool(pool: ProcessPoolExecutor, lane: str = "pool") -> str:
-    """
-    Leave a broken pool without ever blocking: kill its remaining workers,
-    and let a daemon thread finish its shutdown. The exit codes of its dead
-    workers, as "pid: code" (negative: killed by that signal).
-
-    The workers ignore SIGTERM (see worker.init_worker). When a worker dies,
-    the pool's manager thread sends the others SIGTERM and joins them while
-    holding the pool's shutdown lock: they never end, so shutdown(), even
-    with wait=False, waited for that lock forever and the whole pipeline
-    stopped (7 Oct 2026, four times in four hours).
-    """
-    processes = list((getattr(pool, "_processes", None) or {}).values())
-    codes = []
-    for process in processes:
-        try:
-            code = process.exitcode
-            if code is None:
-                process.kill()
-            else:
-                codes.append(f"{process.pid}: {code}")
-        except (OSError, ValueError, AttributeError):
-            pass
-    threading.Thread(
-        target=pool.shutdown,
-        kwargs={"wait": False, "cancel_futures": True},
-        name=f"{lane}-pool-shutdown",
-        daemon=True,
-    ).start()
-    return ", ".join(codes)
 
 class Runtime:
     def __init__(self, config: GtfsRtConfig, storages=None):
@@ -234,9 +225,9 @@ class Runtime:
         # scan per tick); fetch threads add to it under _lock
         self._queues: Dict[str, List[Path]] = {}
         self._retry_at: Dict[str, float] = {}  # item or static folder -> time
-        self._suspects: set = set()  # items to run alone (their worker died)
         self._busy_feeds: Dict[str, Path] = {}  # feed -> item in a worker
-        self._probing: set = set()  # lanes running a suspect item alone
+        # Pools whose workers were killed for a task past its deadline
+        self._stopped_pools = weakref.WeakSet()
         self._heavy_queue: List[Task] = []  # timed heavy tasks waiting for a slot
         self._in_flight: Dict[Future, Task] = {}
         self._keys_in_flight: set = set()
@@ -319,10 +310,6 @@ class Runtime:
                 f"{self.spool.path('incoming')}: {', '.join(orphans)} "
                 "(delete them, or add the feeds back)"
             )
-        for items in self._queues.values():
-            for item in items:
-                if self.spool.meta(item).get("suspect"):
-                    self._suspects.add(str(item))
 
         self._fetch_pool = _DaemonThreadPool(self.runtime.fetch_threads, "fetch")
         self._slow_fetch_pool = _DaemonThreadPool(
@@ -365,13 +352,9 @@ class Runtime:
             time.sleep(0.2)
         for pool in (self._normal_pool, self._heavy_pool, self._static_pool):
             if pool is not None:
-                # Workers ignore SIGINT and SIGTERM (see init_worker): tasks
-                # still running now are stopped; their items stay on disk
-                processes = list((getattr(pool, "_processes", None) or {}).values())
+                # Tasks still running now are stopped; their items stay on disk
+                _kill_workers(pool)
                 pool.shutdown(wait=False, cancel_futures=True)
-                for process in processes:
-                    if process.is_alive():
-                        process.kill()
         if self._uploader is not None:
             self._uploader.join(timeout=SHUTDOWN_WAIT_SECONDS)
             self._uploader.drain(timeout=30)
@@ -827,19 +810,14 @@ class Runtime:
                 with self._lock:
                     self._queues[feed].remove(item)
                 continue
-            suspect = str(item) in self._suspects
-            if lane in self._probing or free[lane] <= 0:
+            if free[lane] <= 0:
                 continue
-            if suspect and self._count(lane) > 0:
-                continue  # runs alone: wait until its lane is empty
             with self._lock:
                 self._queues[feed].pop(0)
             claimed = self.spool.claim(item)
             try:
                 self._submit(
-                    Task(
-                        "item", feed, lane, {"item": str(claimed), "suspect": suspect}
-                    ),
+                    Task("item", feed, lane, {"item": str(claimed)}),
                     worker.process_item,
                     str(claimed),
                 )
@@ -853,12 +831,8 @@ class Runtime:
                 raise
             self._busy_feeds[feed] = claimed
             free[lane] -= 1
-            if suspect:
-                self._probing.add(lane)
 
         # Static feeds downloaded, then timed heavy tasks
-        if "heavy" in self._probing or "static" in self._probing:
-            return
         for feed in self.statics:
             if free["heavy"] <= 0:
                 break
@@ -937,6 +911,7 @@ class Runtime:
             self._replace_pool(task.lane)
             future = self._pool(task.lane).submit(function, *args, **kwargs)
         task.pool = self._pool(task.lane)
+        task.started = time.monotonic()
         self._in_flight[future] = task
         self._keys_in_flight.add(task.key)
         logger.debug(f"Submitted {task.kind} {task.key} to the {task.lane} pool")
@@ -945,14 +920,34 @@ class Runtime:
         return sum(1 for task in self._in_flight.values() if task.lane == lane)
 
     def _collect(self, stopping: bool = False):
-        """Handle finished tasks."""
-        finished = [(f, self._in_flight[f]) for f in self._in_flight if f.done()]
-        # A dead worker fails every task of its pool: only a task that ran alone
-        # is known to be the cause
-        in_pool = {}
-        for task in self._in_flight.values():
-            in_pool[id(task.pool)] = in_pool.get(id(task.pool), 0) + 1
+        """
+        Handle finished tasks, and stop a task past its deadline. A pool runs
+        its tasks in order: its oldest unfinished one is running.
+        """
+        now = time.monotonic()
+        oldest = {}
+        for future, task in self._in_flight.items():
+            if not stopping and not future.done() and (
+                task.pool not in oldest or task.started < oldest[task.pool].started
+            ):
+                oldest[task.pool] = task
+        for pool, task in oldest.items():
+            if not task.overdue and now - task.started > _deadline(task.kind):
+                task.overdue = True
+                self._stopped_pools.add(pool)
+                logger.error(
+                    f"{task.kind} {task.key} still running after "
+                    f"{_deadline(task.kind)} s: killing the {task.lane} workers"
+                )
+                _kill_workers(pool)
+                # Right away: shutdown() wakes the pool's manager thread. A
+                # worker started by submit() may be missing from what it
+                # waits on (CPython wakes it before starting the worker): with
+                # no other task to wake it, it would never see the deaths
+                if pool is self._pool(task.lane):
+                    self._replace_pool(task.lane)
 
+        finished = [(f, self._in_flight[f]) for f in self._in_flight if f.done()]
         replace = set()
         for future, task in finished:
             del self._in_flight[future]
@@ -963,22 +958,32 @@ class Runtime:
                 continue
             error = future.exception()
             if isinstance(error, BrokenProcessPool):
-                alone = in_pool.get(id(task.pool)) == 1
                 if task.pool is self._pool(task.lane):
                     replace.add(task.lane)
-                self._finish(
-                    task,
-                    None,
-                    "worker process died (out of memory?)",
-                    crashed=True,
-                    alone=alone,
-                )
+                if task.overdue:
+                    self._finish(task, None, f"stopped after {_deadline(task.kind)} s")
+                else:
+                    # A worker that died by itself (out of memory?) could have
+                    # run any task of its pool: all are blamed. Not those
+                    # stopped with a task past its deadline, or by a shutdown
+                    self._finish(
+                        task,
+                        None,
+                        "worker process died (out of memory?)",
+                        blame=not stopping and task.pool not in self._stopped_pools,
+                    )
             elif error is not None:
+                # Tasks return their errors (see worker._timed): this one could
+                # not be sent to the worker
                 self._finish(
                     task, None, f"{error.__class__.__name__}: {redact(str(error))}"
                 )
             else:
-                self._finish(task, future.result(), None)
+                result = future.result()
+                if "error" in result:
+                    self._finish(task, None, redact(result["error"]))
+                else:
+                    self._finish(task, result, None)
         if not stopping:
             for lane in replace:
                 self._replace_pool(lane)
@@ -988,22 +993,16 @@ class Runtime:
         task: Task,
         result: Optional[Dict],
         error: Optional[str],
-        crashed: bool = False,
-        alone: bool = False,
+        blame: bool = True,
         cancelled: bool = False,
     ):
         logger.debug(f"Finished {task.kind} {task.key}: {error or 'ok'}")
         again = self._rerun.pop(task.key, None)
         if again is not None:
             self._heavy_queue.append(again)
-        if task.info.get("suspect"):
-            self._probing.discard(task.lane)
         if task.kind == "item":
             self._busy_feeds.pop(task.key, None)
             item = Path(task.info["item"])
-            self._suspects.discard(
-                str(self.spool.path("incoming", item.parent.name, item.name))
-            )
             back = self.spool.path("incoming", item.parent.name, item.name)
             self._retry_at.pop(str(back), None)
             if error is not None and error.startswith("StaticNotReady"):
@@ -1015,7 +1014,6 @@ class Runtime:
                     error,
                     self.runtime.max_attempts,
                     count_attempt=False,
-                    suspect=False,
                 )
                 self._retry_at[str(back)] = time.monotonic() + STATIC_RETRY_SECONDS
                 with self._lock:
@@ -1059,10 +1057,7 @@ class Runtime:
                     )
                 self._note_dropped(task.key, summary.get("dropped_unknown"))
                 return
-            # Blamed if it failed by itself, or its worker died while it ran alone
-            count = not cancelled and (
-                not crashed or alone or bool(task.info.get("suspect"))
-            )
+            count = blame and not cancelled
             permanent = count and error.startswith(PERMANENT_ERRORS)
             refetched = self.spool.meta(item).get("refetch")
             quarantined = self.spool.release(
@@ -1076,8 +1071,6 @@ class Runtime:
                 self._retry_at[str(back)] = time.monotonic() + (
                     _retry_delay(attempt) if count else 0
                 )
-                if not count and not cancelled:
-                    self._suspects.add(str(back))
                 with self._lock:
                     bisect.insort(self._queues.setdefault(task.key, []), back)
             # An undecodable fetch (cut short, an error page): fetched again
@@ -1122,16 +1115,14 @@ class Runtime:
             self._retry_at.pop(task.info["folder"], None)
         elif task.kind == "window" and error is not None:
             # Blamed as fetches are: not when another task killed its worker
-            if cancelled or (crashed and not alone):
+            if cancelled or not blame:
                 self._retry_at.pop(task.key, None)
             else:
                 self._window_failed(task, error)
         elif task.kind == "static" and error is not None:
             folder = Path(task.info["folder"])
             meta = read_json(folder / "meta.json") or {}
-            meta["attempt"] = meta.get("attempt", 1) + (
-                0 if crashed and not alone else 1
-            )
+            meta["attempt"] = meta.get("attempt", 1) + (1 if blame else 0)
             meta["last_error"] = error
             if meta["attempt"] > self.runtime.max_attempts:
                 target = self.spool.path(
@@ -1203,11 +1194,18 @@ class Runtime:
         logger.error(f"Closing {base} failed ({error}); will retry")
 
     def _replace_pool(self, lane: str):
-        codes = _abandon_pool(self._pool(lane), lane)
-        logger.error(
-            f"A {lane} worker process died (exit codes: {codes or 'unknown'}; "
-            f"negative = killed by that signal): replacing the pool"
+        pool = self._pool(lane)
+        codes = ", ".join(
+            f"{p.pid}: {p.exitcode}"
+            for p in list((getattr(pool, "_processes", None) or {}).values())
+            if p.exitcode is not None
         )
+        logger.error(
+            f"Replacing the {lane} worker pool (exit codes of its workers: "
+            f"{codes or 'unknown'}; negative = killed by that signal)"
+        )
+        # Its workers end on SIGTERM (see worker.init_worker): never blocks long
+        pool.shutdown(wait=False, cancel_futures=True)
         if lane == "heavy":
             self._heavy_pool = self._new_pool(self.runtime.heavy_slots)
         elif lane == "static":
@@ -1237,10 +1235,7 @@ class Runtime:
             end = datetime.fromisoformat(window["end"])
             if end > now or self._has_older(window["feed"], end):
                 continue
-            if (
-                "normal" in self._probing
-                or self._count("normal") >= self.runtime.worker_count() * 2
-            ):
+            if self._count("normal") >= self.runtime.worker_count() * 2:
                 return
             self._submit(
                 Task("window", key, "normal", {"base": base}),
@@ -1264,7 +1259,7 @@ class Runtime:
             return
         for provider in self.config.providers:
             key = f"raw retention {provider.name}"
-            if key in self._keys_in_flight or "normal" in self._probing:
+            if key in self._keys_in_flight:
                 continue
             self._submit(
                 Task("raw", key, "normal"),
@@ -1282,8 +1277,6 @@ class Runtime:
             feed, day, hour = folder.parent.parent.name, folder.parent.name, folder.name
             key = f"raw {folder}"
             end = datetime.strptime(day + hour, "%Y%m%d%H").replace(tzinfo=timezone.utc)
-            if "normal" in self._probing:
-                return  # a suspect fetch runs alone
             if (
                 key in self._keys_in_flight
                 or (now - end).total_seconds() < 3600 + RAW_GRACE_SECONDS

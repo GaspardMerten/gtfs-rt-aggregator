@@ -197,8 +197,8 @@ class TestRealtimeAdapter(_WorkerTest):
         self._start(self.config)
         worker.adapter_fetch(self.feed, None)
         with patch.dict(os.environ, {"ADAPTER_FAIL": "1"}):
-            with self.assertRaisesRegex(RuntimeError, "API down"):
-                worker.adapter_fetch(self.feed, None)
+            result = worker.adapter_fetch(self.feed, None)
+        self.assertEqual(result["error"], "RuntimeError: API down")
         self.assertEqual(self._state(), {"polls": 1})
 
     def test_unchanged_bytes_not_stored(self):

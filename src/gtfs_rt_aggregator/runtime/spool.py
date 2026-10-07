@@ -106,22 +106,15 @@ class Spool:
         error: str,
         max_attempts: int,
         count_attempt: bool = True,
-        suspect: Optional[bool] = None,
     ) -> bool:
         """
         A fetch failed: back to incoming/ for another try, or to quarantine/
-        after max_attempts. With count_attempt False (its worker died while
-        other fetches ran beside it, so it may not be the cause), the fetch is
-        marked "suspect" instead (unless suspect is False): it will next run
-        alone. Returns True if quarantined.
+        after max_attempts. With count_attempt False (not its fault), no
+        attempt is counted. Returns True if quarantined.
         """
         meta = self.meta(item)
         if count_attempt:
             meta["attempt"] = meta.get("attempt", 1) + 1
-            # Blamed on its own: no longer needs to run alone
-            meta.pop("suspect", None)
-        elif suspect if suspect is not None else error != "cancelled":
-            meta["suspect"] = True
         meta["last_error"] = error
         quarantined = meta.get("attempt", 1) > max_attempts
         target = self.path(
@@ -214,7 +207,6 @@ class Spool:
                 "interrupted (restart)",
                 max_attempts,
                 count_attempt=not clean,
-                suspect=False,
             ):
                 counts["quarantined"] += 1
             else:
