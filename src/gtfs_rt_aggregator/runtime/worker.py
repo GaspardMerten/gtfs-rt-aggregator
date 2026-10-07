@@ -5,6 +5,7 @@ take and return only plain values, so they work with any start method.
 """
 
 import functools
+import pickle
 import gc
 import logging
 import os
@@ -80,6 +81,8 @@ def init_worker(
 
     if hasattr(signal, "SIGUSR1"):
         faulthandler.register(signal.SIGUSR1, all_threads=True)
+    # A crash in native code (segfault, abort) prints the Python stacks
+    faulthandler.enable(all_threads=True)
     # Ctrl+C and SIGTERM reach the whole process group: the main process
     # stops the workers itself, once running tasks had time to finish
     signal.signal(signal.SIGINT, signal.SIG_IGN)
@@ -149,6 +152,8 @@ def _timed(task):
             result["seconds"] = round(time.monotonic() - start, 3)
             result["peak_memory_mb"] = round(_peak_memory_mb())
             return result
+        except Exception as error:
+            raise _portable(error) from None
         finally:
             # Hand memory back to the system between tasks, failed ones too:
             # Arrow's allocator keeps freed memory otherwise (a static feed
@@ -160,6 +165,21 @@ def _timed(task):
                 pass
 
     return wrapper
+
+
+def _portable(error: Exception) -> Exception:
+    """
+    The exception a task sends back to the main process: itself if it can be
+    pickled and unpickled, else a RuntimeError with its class and message.
+    The main process failing to unpickle one (minio's S3Error and ServerError:
+    their __init__ takes several arguments) breaks the whole worker pool, as
+    if a worker had died.
+    """
+    try:
+        pickle.loads(pickle.dumps(error))
+        return error
+    except Exception:
+        return RuntimeError(f"{type(error).__name__}: {error}")
 
 
 def _peak_memory_mb() -> float:

@@ -163,6 +163,38 @@ def _pool_context():
     return multiprocessing.get_context("spawn")
 
 
+
+def _abandon_pool(pool: ProcessPoolExecutor, lane: str = "pool") -> str:
+    """
+    Leave a broken pool without ever blocking: kill its remaining workers,
+    and let a daemon thread finish its shutdown. The exit codes of its dead
+    workers, as "pid: code" (negative: killed by that signal).
+
+    The workers ignore SIGTERM (see worker.init_worker). When a worker dies,
+    the pool's manager thread sends the others SIGTERM and joins them while
+    holding the pool's shutdown lock: they never end, so shutdown(), even
+    with wait=False, waited for that lock forever and the whole pipeline
+    stopped (7 Oct 2026, four times in four hours).
+    """
+    processes = list((getattr(pool, "_processes", None) or {}).values())
+    codes = []
+    for process in processes:
+        try:
+            code = process.exitcode
+            if code is None:
+                process.kill()
+            else:
+                codes.append(f"{process.pid}: {code}")
+        except (OSError, ValueError, AttributeError):
+            pass
+    threading.Thread(
+        target=pool.shutdown,
+        kwargs={"wait": False, "cancel_futures": True},
+        name=f"{lane}-pool-shutdown",
+        daemon=True,
+    ).start()
+    return ", ".join(codes)
+
 class Runtime:
     def __init__(self, config: GtfsRtConfig, storages=None):
         from ..pipeline import create_storages
@@ -1171,10 +1203,11 @@ class Runtime:
         logger.error(f"Closing {base} failed ({error}); will retry")
 
     def _replace_pool(self, lane: str):
+        codes = _abandon_pool(self._pool(lane), lane)
         logger.error(
-            f"A {lane} worker process died (out of memory?): replacing the pool"
+            f"A {lane} worker process died (exit codes: {codes or 'unknown'}; "
+            f"negative = killed by that signal): replacing the pool"
         )
-        self._pool(lane).shutdown(wait=False, cancel_futures=True)
         if lane == "heavy":
             self._heavy_pool = self._new_pool(self.runtime.heavy_slots)
         elif lane == "static":
