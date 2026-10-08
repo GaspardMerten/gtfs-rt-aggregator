@@ -157,6 +157,21 @@ class TestMatching(_Case):
         self.assertEqual([(r["stop_id"], r["departure_delay"], r["route_id"]) for r in rows], [("A", 30, "R1")])
         self.assertEqual(stats["trips_matched_by_id_before_date"], 1)
 
+    def test_trip_dated_by_its_running_day(self):
+        # es-renfe-ld: the live id ends in the running day, the timetable's in the start of each period
+        trips = pa.table({"trip_id": ["0029312026-10-01", "0029312026-10-04"], "route_id": ["R1", "R2"],
+                          "service_id": ["P1", "P2"]})
+        calendar = pa.table({"service_id": ["P1", "P2"], **{d: pa.array([1, 1], pa.int8()) for d in
+                             ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")},
+                             "start_date": pa.array([date(2026, 10, 1), date(2026, 10, 4)], pa.date32()),
+                             "end_date": pa.array([date(2026, 10, 3), date(2026, 10, 9)], pa.date32())})
+        tt = {"v1": {"stop_times": stop_times([("0029312026-10-01", 1, "A", 7, True), ("0029312026-10-04", 1, "A", 8, True)]),
+                     "trips": trips, "calendar": calendar}}
+        calls, stats = self.run_calls([trip_row("0029312026-10-05", [stu(stop="A", dep_delay=30)])], tt)
+        rows = self.of(calls, "0029312026-10-05")
+        self.assertEqual([(r["stop_id"], r["departure_delay"], r["route_id"]) for r in rows], [("A", 30, "R2")])
+        self.assertEqual(stats["trips_matched_by_id_before_date"], 1)
+
     def test_trip_only_in_a_newer_version(self):
         tt = {"v1": {"stop_times": stop_times([("OTHER", 1, "A", 8, True)])},
               "v2": {"stop_times": stop_times([("T", 1, "A", 8, True)])}}

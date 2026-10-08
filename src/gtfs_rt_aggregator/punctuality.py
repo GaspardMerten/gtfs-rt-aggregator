@@ -318,14 +318,14 @@ def _final_calls(con, files: List[Path], schema: pa.Schema, service_day: str, tz
             dest = tmp / f"static-{i}-{table}.parquet"
             return dest if timetable(version, table, dest) else None
 
-        # A live trip id ending in a date (…:1813:20271210) missing from the timetable, which lists the train
-        # under another last part (…:1813:20261211): it takes the only trip with the same id up to that date
-        # that runs on the day
+        # A live trip id ending in a date (…:1813:20271210, or es-renfe-ld's 0029312026-10-08: the running day)
+        # missing from the timetable, which lists the train under another date (…:1813:20261211, 0029312026-10-06:
+        # the start of its period): it takes the only trip with the same id up to that date that runs on the day
         trips_path = get("trips")
         if trips_path:
             con.execute(f"""CREATE OR REPLACE TEMP TABLE missing AS
-                SELECT DISTINCT trip, regexp_replace(trip, ':[0-9]{{8}}$', '') AS prefix FROM t
-                WHERE version = ? AND regexp_matches(trip, ':[0-9]{{8}}$')
+                SELECT DISTINCT trip, regexp_replace(trip, '(:[0-9]{{8}}|[0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}})$', '') AS prefix FROM t
+                WHERE version = ? AND regexp_matches(trip, '(:[0-9]{{8}}|[0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}})$')
                   AND trip NOT IN (SELECT trim(CAST(trip_id AS VARCHAR)) FROM read_parquet({_quote(str(trips_path))}))""", [version])
             if con.execute("SELECT count(*) FROM missing").fetchone()[0]:
                 runs = []
@@ -349,7 +349,7 @@ def _final_calls(con, files: List[Path], schema: pa.Schema, service_day: str, tz
                     con.execute(f"""INSERT INTO alias
                         SELECT ?, m.trip, any_value(s.trip), any_value(s.route_id) FROM missing m
                         JOIN (SELECT trim(CAST(trip_id AS VARCHAR)) AS trip, trim(CAST(route_id AS VARCHAR)) AS route_id,
-                                     regexp_replace(trim(CAST(trip_id AS VARCHAR)), ':[0-9]{{8}}$', '') AS prefix
+                                     regexp_replace(trim(CAST(trip_id AS VARCHAR)), '(:[0-9]{{8}}|[0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}})$', '') AS prefix
                               FROM read_parquet({_quote(str(trips_path))})
                               WHERE trim(CAST(service_id AS VARCHAR)) IN ({' UNION '.join(runs)})) s USING (prefix)
                         GROUP BY m.trip HAVING count(*) = 1""", [version])
