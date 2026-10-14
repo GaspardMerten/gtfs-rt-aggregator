@@ -489,6 +489,20 @@ class TestStaticChangeRules(_StaticTestCase):
         # Unfiltered and unchanged: reused
         self.assertTrue(latest["tables"]["stops"].startswith("nl/static/2026-09-28_01-00-00Z/"))
 
+    def test_filtered_tables_reused_when_only_other_modes_change(self):
+        self._configure(route_types=[2])
+        self._run(1, reuse_unchanged_tables=True)
+        # Only the buses change: trips.txt and stop_times.txt differ, their rail rows do not
+        _FeedHandler.body = _make_zip(_mixed_feed(buses=50))
+        self._run(2, reuse_unchanged_tables=True)
+
+        self.assertEqual(len(self._versions()), 2)
+        latest = json.loads(self.storage.get_bytes("nl/static/latest.json"))
+        for table in ("routes", "trips", "stop_times", "calendar", "shapes", "stops"):
+            self.assertTrue(latest["tables"][table].startswith("nl/static/2026-09-28_01-00-00Z/"), table)
+        self.assertEqual(len(self._table("trips")), 20)
+        self.assertEqual(set(latest["table_digests"]), set(latest["tables"]))
+
     def test_new_route_types_on_unchanged_feed_stored(self):
         self._run(1)
         self._configure(route_types=[2])

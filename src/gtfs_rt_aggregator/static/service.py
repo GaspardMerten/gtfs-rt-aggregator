@@ -59,6 +59,15 @@ def _files_digest(files: Dict) -> str:
     return hashlib.sha1(json.dumps(files, sort_keys=True).encode()).hexdigest()[:16]
 
 
+def _file_digest(path: str) -> str:
+    """SHA-256 of a stored table file: equal for the same rows written the same way."""
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        while chunk := f.read(1 << 20):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def _newest_last_modified(latest: Optional[Dict]) -> Optional[str]:
     """Newest Last-Modified among the stored versions (the latest's, before 0.9.4)."""
     if not latest:
@@ -424,18 +433,27 @@ class StaticService:
 
         version = format_file_time(fetch_time)
         tables = {}
+        digests = {name: _file_digest(str(local_path)) for name, local_path in converted.items()}
+        stored_digests = (latest or {}).get("table_digests", {})
         for table_name, local_path in converted.items():
             source = f"{table_name}.txt"
             if (
                 reuse_unchanged_tables
                 and same_filter
-                and unchanged(source)
-                # A filtered table also depends on which routes and trips are kept
-                and (
-                    table_name not in filtered
-                    or (unchanged("routes.txt") and unchanged("trips.txt"))
-                )
                 and table_name in manifest_tables(latest, base)
+                and (
+                    # The same file as the stored one: also a filtered table whose source changed
+                    # elsewhere (no-entur: bus shapes change daily, the rail ones kept are the same)
+                    digests[table_name] == stored_digests.get(table_name)
+                    or (
+                        unchanged(source)
+                        # A filtered table also depends on which routes and trips are kept
+                        and (
+                            table_name not in filtered
+                            or (unchanged("routes.txt") and unchanged("trips.txt"))
+                        )
+                    )
+                )
             ):
                 tables[table_name] = manifest_tables(latest, base)[table_name]
                 continue
@@ -453,6 +471,8 @@ class StaticService:
             # Storage path of each table; with reuse_unchanged_tables, some
             # point to an earlier version's folder
             "tables": tables,
+            # SHA-256 of each table's file, compared by the next version (reuse_unchanged_tables)
+            "table_digests": digests,
             "route_types": route_types,
         }
         if latest and same_filter:
