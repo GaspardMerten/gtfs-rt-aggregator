@@ -10,6 +10,7 @@ import logging
 import os
 import shutil
 import tarfile
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -64,6 +65,10 @@ class _Context:
 _CTX: Optional[_Context] = None
 # Arguments of init_worker, to build the context on first use
 _INIT: Optional[tuple] = None
+# The adapter process runs tasks in threads: its context is built once
+_CTX_LOCK = threading.Lock()
+# Whether this is the adapter process (see adapter_process)
+_ADAPTER_PROCESS = False
 
 
 def init_worker(
@@ -132,11 +137,43 @@ def _ctx() -> _Context:
     breaking the whole pool.
     """
     global _CTX
-    if _CTX is None:
-        if _INIT is None:
-            raise RuntimeError("init_worker was not called in this process")
-        _CTX = _Context(*_INIT)
-    return _CTX
+    with _CTX_LOCK:
+        if _CTX is None:
+            if _INIT is None:
+                raise RuntimeError("init_worker was not called in this process")
+            _CTX = _Context(*_INIT)
+        return _CTX
+
+
+def adapter_process(conn, initargs: tuple):
+    """
+    Main of the adapter process (see runtime._AdapterProcess): every task
+    received on conn runs in a thread of its own, and its result is sent back
+    as (id, result). Tasks are the functions of this module, by name; they
+    return their errors (see _timed), so a thread never dies with one.
+    """
+    global _ADAPTER_PROCESS
+    _ADAPTER_PROCESS = True
+    init_worker(*initargs)
+    send = threading.Lock()
+
+    def run(task_id, name, args, kwargs):
+        result = globals()[name](*args, **kwargs)
+        with send:
+            conn.send((task_id, result))
+
+    while True:
+        try:
+            message = conn.recv()
+        except (EOFError, OSError):
+            break  # the main process closed its end (or is gone)
+        if message is None:
+            break
+        threading.Thread(
+            target=run, args=message, name=f"adapter-{message[0]}", daemon=True
+        ).start()
+    # Polls still running are abandoned: the main process counts them failed
+    os._exit(0)
 
 
 def _timed(task):
@@ -161,12 +198,15 @@ def _timed(task):
         finally:
             # Hand memory back to the system between tasks, failed ones too:
             # Arrow's allocator keeps freed memory otherwise (a static feed
-            # can leave ~1 GB held)
-            gc.collect()
-            try:
-                pa.default_memory_pool().release_unused()
-            except AttributeError:  # older pyarrow
-                pass
+            # can leave ~1 GB held). Not after each poll of the adapter
+            # process: a full collection of every adapter's timetables, under
+            # the GIL, dozens of times a minute, would stall the other polls
+            if not _ADAPTER_PROCESS:
+                gc.collect()
+                try:
+                    pa.default_memory_pool().release_unused()
+                except AttributeError:  # older pyarrow
+                    pass
 
     return wrapper
 

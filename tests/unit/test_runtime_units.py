@@ -593,3 +593,125 @@ class TestStaticSlots(unittest.TestCase):
         job.run.assert_called_once()
         expected = next_slot(7200, self.feed, time.time()) - time.time()
         self.assertAlmostEqual(job.next_run - time.monotonic(), expected, delta=2)
+
+
+class TestWindows(unittest.TestCase):
+    """
+    Closing windows (0.12.4): oldest first across every feed, with their own
+    share of the normal workers. Until 0.12.3 they had what the fetches left,
+    in folder order: with the lane full, the same 15 feeds were never reached
+    (22 Oct 2026).
+    """
+
+    def setUp(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp)
+        config = GtfsRtConfig(
+            storage=StorageConfig(type="filesystem", params={"base_directory": tmp}),
+            providers=[
+                ProviderConfig(
+                    name="p",
+                    realtime=[
+                        ApiConfig(url=f"https://x.org/{name}", services=["TripUpdate"])
+                        for name in "ab"
+                    ],
+                )
+            ],
+            runtime=RuntimeConfig(spool_dir=os.path.join(tmp, "spool"), workers=1),
+        )
+        self.runtime = Runtime(config, {"global": MagicMock()})
+        self.a, self.b = sorted(self.runtime.feeds)
+        self.submitted = []
+        self.runtime._normal_pool = MagicMock()
+
+        def submit(task, *args, **kwargs):
+            self.submitted.append(task.key)
+            self.runtime._in_flight[object()] = task
+            self.runtime._keys_in_flight.add(task.key)
+
+        self.runtime._submit = submit
+
+    def _window(self, feed, start):
+        from src.gtfs_rt_aggregator.runtime.spool import write_json
+
+        begin = datetime(2026, 10, 22, *start, tzinfo=timezone.utc)
+        folder = self.runtime.spool.path("windows", feed, "TripUpdate", begin.strftime("%H%M"))
+        folder.mkdir(parents=True)
+        write_json(
+            folder / "window.json",
+            {
+                "feed": feed,
+                "end": begin.replace(minute=begin.minute + 15).isoformat(),
+            },
+        )
+        return f"window {folder}"
+
+    def _item(self, feed, *when):
+        item = self.runtime.spool.new_item(feed, datetime(2026, 10, 22, *when, tzinfo=timezone.utc))
+        item.write_bytes(b"x")
+        self.runtime._queues.setdefault(feed, []).append(item)
+        return item
+
+    def test_oldest_first_across_feeds_even_with_the_lane_full(self):
+        from src.gtfs_rt_aggregator.runtime.runtime import Task
+
+        # Fetches fill the normal lane (2 tasks a worker)
+        for index in range(2):
+            self.runtime._in_flight[object()] = Task("item", f"x{index}", "normal")
+        late_b = self._window(self.b, (6, 0))
+        early_b = self._window(self.b, (5, 15))
+        late_a = self._window(self.a, (5, 30))
+        early_a = self._window(self.a, (5, 0))
+        self.runtime._close_windows()
+        # Two at a time (their own share), the oldest of any feed first
+        self.assertEqual(self.submitted, [early_a, early_b])
+        self.runtime._close_windows()
+        self.assertEqual(len(self.submitted), 2)
+        # One done: the next oldest
+        done = next(f for f, t in self.runtime._in_flight.items() if t.key == early_a)
+        del self.runtime._in_flight[done]
+        self.runtime._close_windows()
+        self.assertEqual(self.submitted, [early_a, early_b, late_a])
+        self.assertNotIn(late_b, self.submitted)
+
+    def test_fetches_keep_their_slots_beside_windows(self):
+        self._window(self.a, (5, 0))
+        self._window(self.b, (5, 0))
+        self.runtime._close_windows()
+        self._item(self.a, 9, 0)
+        self._item(self.b, 9, 0)
+        self.runtime.spool.claim = lambda item: item
+        self.runtime._dispatch()
+        self.assertEqual(self.submitted[2:], [self.a, self.b])
+
+    def test_window_waits_for_older_fetches_of_its_feed(self):
+        key = self._window(self.a, (5, 0))
+        item = self._item(self.a, 5, 10)
+        self.runtime._close_windows()
+        self.assertEqual(self.submitted, [])
+        # A fetch gone from disk holds nothing back
+        item.unlink()
+        self.runtime._close_windows()
+        self.assertEqual(self.submitted, [key])
+
+    def test_stale_busy_entry_holds_nothing_back(self):
+        key = self._window(self.a, (5, 0))
+        self.runtime._busy_feeds[self.a] = self.runtime.spool.path(
+            "processing", self.a, "20261022T051000.000000Z.pb"
+        )
+        self.runtime._keys_in_flight.add(self.a)
+        self.runtime._close_windows()
+        self.assertEqual(self.submitted, [])
+        # Its task is no longer running
+        self.runtime._keys_in_flight.discard(self.a)
+        self.runtime._close_windows()
+        self.assertEqual(self.submitted, [key])
+
+    def test_window_closed_after_waiting_too_long(self):
+        key = self._window(self.a, (5, 0))
+        self._item(self.a, 5, 10)
+        with patch(
+            "src.gtfs_rt_aggregator.runtime.runtime.WINDOW_MAX_WAIT_SECONDS", 60
+        ), self.assertLogs("src.gtfs_rt_aggregator.runtime.runtime", "WARNING"):
+            self.runtime._close_windows()
+        self.assertEqual(self.submitted, [key])

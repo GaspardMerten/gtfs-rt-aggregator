@@ -575,6 +575,11 @@ class RuntimeConfig(_Model):
     max_tasks_per_worker: int = Field(
         200, ge=1, description="A worker process is replaced after this many tasks"
     )
+    adapter_max_memory_mb: float = Field(
+        1024,
+        gt=0,
+        description="The adapter process (every realtime adapter poll, a thread each) is replaced once its peak memory passes this",
+    )
 
     @field_validator("workers")
     @classmethod

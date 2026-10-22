@@ -14,8 +14,16 @@ GTFS URL (e.g. a JSON API polled with its own change ids).
 
 state is the adapter's own JSON-serialisable dict, kept between calls and
 across restarts (spool/state/<feed>.adapter.json), and saved only after a
-successful call. env is os.environ. Adapters run in the worker processes;
-a file is loaded once per process, and again when it changes.
+successful call. env is os.environ. A file is loaded once per process, and
+again when it changes.
+
+Realtime adapters run in one long-lived adapter process, each poll in a thread
+of its own (since 0.12.4; before, in the worker processes that also process
+the fetches): what a module keeps between polls (a timetable, a session) stays
+until that process is replaced. A feed is polled once at a time, but the
+functions of one file serving several feeds may run at the same time: keep
+module-level state per feed (or safe to share). Static adapters run in a fresh
+process each time.
 """
 
 import copy
@@ -25,12 +33,16 @@ import importlib.util
 import json
 import os
 import sys
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional, Tuple
 
 # Loaded adapter files: path -> (modification time, module)
 _LOADED: Dict[str, Tuple[int, Any]] = {}
+# Polls run in threads: two first polls of one file must not load it twice
+# (each would keep its own module state)
+_LOAD_LOCK = threading.RLock()
 
 
 def parse_spec(spec: str) -> Tuple[str, str]:
@@ -46,6 +58,11 @@ def parse_spec(spec: str) -> Tuple[str, str]:
 def load(spec: str, base_dir: Optional[str] = None) -> Callable:
     """The adapter function; a relative file path starts from base_dir."""
     target, function = parse_spec(spec)
+    with _LOAD_LOCK:
+        return _load(spec, target, function, base_dir)
+
+
+def _load(spec: str, target: str, function: str, base_dir: Optional[str]) -> Callable:
     if target.endswith(".py"):
         path = Path(target)
         if not path.is_absolute():

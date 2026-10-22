@@ -1,11 +1,13 @@
 """
 The pipeline's runtime:
 
-    scheduler ─▶ fetch threads ─▶ spool/incoming ─▶ worker processes ─▶ spool/ready ─▶ upload thread ─▶ storage
-                                                     (normal + heavy)
+    scheduler ─▶ fetch threads   ─▶ spool/incoming ─▶ worker processes ─▶ spool/ready ─▶ upload thread ─▶ storage
+              ─▶ adapter process ─┘                   (normal + heavy)
 
 - Fetch threads only download, streaming to disk: a fetch is never skipped
-  or lost because processing is slow, and never held in memory.
+  or lost because processing is slow, and never held in memory. Adapters
+  (Python polls instead of a URL) run in one adapter process, a thread per
+  poll (see _AdapterProcess): waiting on a slow API never holds a worker.
 - A fixed pool of long-lived worker processes processes fetches, one at a time
   per feed and in fetch order. Memory-heavy work (large fetches, static feeds,
   aggregation, compaction) goes to a separate heavy pool (1 process by default).
@@ -86,6 +88,15 @@ PERMANENT_ERRORS = ("DecodeError",)
 # it, its pool's workers are killed: a hung task never holds a worker for good
 TASK_DEADLINE_SECONDS = {"item": 600, "adapter": 600, "window": 900, "raw": 3600}
 TASK_DEADLINE_SECONDS_HEAVY = 4 * 3600
+# Windows close oldest first, with their own share of the normal workers (as
+# many tasks in flight as the fetches get): processing the fetches never holds
+# them back. Until 0.12.3 they had only what the fetches left, in folder order:
+# with the lane full, the same feeds were never reached (22 Oct 2026)
+WINDOW_TASKS_PER_WORKER = 2
+# A window waits for the older fetches of its feed (they may add to it), but
+# not past this: a fetch waiting that long (e.g. for a static version) adds to
+# the window again later, as a second file of it
+WINDOW_MAX_WAIT_SECONDS = 24 * 3600
 
 
 def default_spool_dir() -> str:
@@ -195,6 +206,89 @@ def _pool_context():
     return multiprocessing.get_context("spawn")
 
 
+class _AdapterProcess:
+    """
+    The adapter lane: one long-lived worker process running every realtime
+    adapter poll in a thread of its own, used like a ProcessPoolExecutor
+    (submit() returns a Future; a dead process fails its futures with
+    BrokenProcessPool).
+
+    Until 0.12.3 polls ran in the normal worker processes, one at a time each:
+    a poll mostly waits on HTTP or AMQP, and a few slow ones held the slots
+    that process fetches and close windows (22 Oct 2026: windows of 15 feeds
+    left unclosed for hours, workers 82 % idle). Threads let polls wait side
+    by side; one process keeps one copy of what the adapter modules hold (a
+    pool of processes would load every timetable once per process, and the
+    memory is tight); and processing never waits for a poll. The cost: a poll
+    past its deadline cannot be stopped alone, so the whole process is killed
+    (the others' polls fail and run again at their next turn), and CPU-bound
+    adapter code shares one core.
+    """
+
+    def __init__(self, context, initargs: tuple):
+        self._conn, child = context.Pipe()
+        self._process = context.Process(
+            target=worker.adapter_process,
+            args=(child, initargs),
+            name="adapter",
+            daemon=True,
+        )
+        self._process.start()
+        child.close()
+        # Like ProcessPoolExecutor._processes, for _kill_workers and _replace_pool
+        self._processes = {self._process.pid: self._process}
+        self._futures: Dict[int, Future] = {}
+        self._lock = threading.Lock()
+        self._next_id = 0
+        self._broken = False
+        threading.Thread(target=self._read, name="adapter-results", daemon=True).start()
+
+    def _read(self):
+        while True:
+            try:
+                task_id, result = self._conn.recv()
+            except (EOFError, OSError):
+                break
+            except Exception as e:  # a result that cannot be unpickled
+                logger.error(f"Adapter process: unreadable result: {redact(str(e))}")
+                continue
+            with self._lock:
+                future = self._futures.pop(task_id, None)
+            if future is not None:
+                future.set_result(result)
+        self._fail("the adapter process ended")
+
+    def _fail(self, why: str):
+        with self._lock:
+            self._broken = True
+            futures, self._futures = list(self._futures.values()), {}
+        for future in futures:
+            future.set_exception(BrokenProcessPool(why))
+
+    def submit(self, function, *args, **kwargs) -> Future:
+        future = Future()
+        with self._lock:
+            if self._broken or not self._process.is_alive():
+                raise BrokenProcessPool("the adapter process ended")
+            self._next_id += 1
+            task_id = self._next_id
+            self._futures[task_id] = future
+            try:
+                self._conn.send((task_id, function.__name__, args, kwargs))
+            except (OSError, ValueError):
+                del self._futures[task_id]
+                raise BrokenProcessPool("the adapter process ended")
+        return future
+
+    def shutdown(self, wait: bool = False, cancel_futures: bool = True):
+        """Stop the process now: polls still running fail (BrokenProcessPool)."""
+        try:
+            self._process.kill()
+        except (OSError, ValueError, AttributeError):
+            pass
+        self._fail("the adapter process was stopped")
+        if wait:
+            self._process.join(timeout=10)
 
 
 class Runtime:
@@ -266,6 +360,11 @@ class Runtime:
             None
         )
         self._slow_fetch_pool = None
+        self._adapter_pool = None
+        # Adapter processes replaced for their memory, ended once their polls are done
+        self._retired_pools: List[_AdapterProcess] = []
+        # Windows already warned about closing despite older fetches waiting
+        self._window_warned: set = set()
         self._uploader = None
 
     # Lifecycle ---------------------------------------------------------------
@@ -329,6 +428,8 @@ class Runtime:
         self._normal_pool = self._new_pool(self.runtime.worker_count())
         self._heavy_pool = self._new_pool(self.runtime.heavy_slots)
         self._static_pool = self._new_pool(self.runtime.heavy_slots, tasks_per_worker=1)
+        if any(api.adapter for _, api in self.feeds.values()):
+            self._adapter_pool = self._new_adapter_pool()
         self._uploader = Uploader(self.spool, self.storages, self._stop)
         self._uploader.start()
         self._schedule_jobs()
@@ -342,6 +443,12 @@ class Runtime:
             initializer=worker.init_worker,
             initargs=(self.config, str(self.spool.root), self._log_level, os.getpid()),
             max_tasks_per_child=tasks_per_worker or self.runtime.max_tasks_per_worker,
+        )
+
+    def _new_adapter_pool(self) -> _AdapterProcess:
+        return _AdapterProcess(
+            _pool_context(),
+            (self.config, str(self.spool.root), self._log_level, os.getpid()),
         )
 
     def _shutdown(self):
@@ -361,7 +468,13 @@ class Runtime:
         while self._in_flight and time.monotonic() < deadline:
             self._collect(stopping=True)
             time.sleep(0.2)
-        for pool in (self._normal_pool, self._heavy_pool, self._static_pool):
+        for pool in (
+            self._normal_pool,
+            self._heavy_pool,
+            self._static_pool,
+            self._adapter_pool,
+            *self._retired_pools,
+        ):
             if pool is not None:
                 # Tasks still running now are stopped; their items stay on disk
                 _kill_workers(pool)
@@ -561,11 +674,14 @@ class Runtime:
                 if feed in self._downloading and feed not in self._fetch_next:
                     self._fetch_next.add(feed)
                     return
-                logger.warning(
-                    f"{feed}: previous fetch still "
-                    + ("running" if feed in self._downloading else "waiting for a download thread")
-                    + ", fetch skipped"
-                )
+                if self.feeds[feed][1].adapter:
+                    # One poll at a time; never queued behind a slow one
+                    running = "adapter poll still running"
+                elif feed in self._downloading:
+                    running = "fetch still running"
+                else:
+                    running = "fetch still waiting for a download thread"
+                logger.warning(f"{feed}: previous {running}, fetch skipped")
                 self._update_status(
                     feed, skipped_overlap=status.get("skipped_overlap", 0) + 1
                 )
@@ -584,7 +700,7 @@ class Runtime:
             pool.submit(self._fetch, feed)
 
     def _submit_adapter_fetch(self, feed: str):
-        """An adapter runs in a worker process (see adapters.py)."""
+        """An adapter runs in the adapter process (see _AdapterProcess, adapters.py)."""
         provider, _ = self.feeds[feed]
         now = datetime.now(pytz.timezone(provider.timezone))
         with self._lock:
@@ -594,7 +710,7 @@ class Runtime:
                 Task(
                     "adapter",
                     f"adapter {feed}",
-                    "normal",
+                    "adapter",
                     {"feed": feed, "unchanged": unchanged},
                 ),
                 worker.adapter_fetch,
@@ -611,13 +727,26 @@ class Runtime:
             self._update_status(feed, last_attempt=now.isoformat())
 
     def _adapter_fetched(
-        self, task: Task, result: Optional[Dict], error: Optional[str]
+        self,
+        task: Task,
+        result: Optional[Dict],
+        error: Optional[str],
+        quiet: bool = False,
     ):
-        """Like the end of _fetch, for a fetch made by an adapter."""
+        """
+        Like the end of _fetch, for a fetch made by an adapter. quiet: stopped
+        with its process (another poll past its deadline, a replacement), not
+        failed by itself: not an error of the feed.
+        """
         feed = task.info["feed"]
         provider, api = self.feeds[feed]
         now = datetime.now(pytz.timezone(provider.timezone)).isoformat()
         status = {}
+        if error is not None and quiet:
+            logger.warning(f"Fetching {feed} ({api.source}) stopped: {error}")
+            with self._lock:
+                self._fetching.discard(feed)
+            return
         if error is not None:
             status.update(last_error=error, last_error_at=now)
             logger.error(f"Fetching {feed} ({api.source}) failed: {error}")
@@ -819,7 +948,13 @@ class Runtime:
             return
         now = time.monotonic()
         free = {
-            "normal": self.runtime.worker_count() * 2 - self._count("normal"),
+            # Windows have their own share (see _close_windows)
+            "normal": self.runtime.worker_count() * 2
+            - sum(
+                1
+                for task in self._in_flight.values()
+                if task.lane == "normal" and task.kind != "window"
+            ),
             # Static conversions run in their own pool, but take a heavy slot
             "heavy": self.runtime.heavy_slots
             - self._count("heavy")
@@ -933,9 +1068,11 @@ class Runtime:
         self._heavy_queue.append(Task(kind, name, lane, dict(args), lock=lock))
 
     def _pool(self, lane: str) -> ProcessPoolExecutor:
-        return {"heavy": self._heavy_pool, "static": self._static_pool}.get(
-            lane, self._normal_pool
-        )
+        return {
+            "heavy": self._heavy_pool,
+            "static": self._static_pool,
+            "adapter": self._adapter_pool,
+        }.get(lane, self._normal_pool)
 
     def _submit(self, task: Task, function, *args, **kwargs):
         try:
@@ -1020,6 +1157,11 @@ class Runtime:
         if not stopping:
             for lane in replace:
                 self._replace_pool(lane)
+        # A replaced adapter process ends once its last poll is collected
+        for pool in list(self._retired_pools):
+            if not any(task.pool is pool for task in self._in_flight.values()):
+                pool.shutdown()
+                self._retired_pools.remove(pool)
 
     def _finish(
         self,
@@ -1141,7 +1283,21 @@ class Runtime:
                     quarantined=self.spool.quarantined(),
                 )
         elif task.kind == "adapter":
-            self._adapter_fetched(task, result, error)
+            self._adapter_fetched(task, result, error, quiet=cancelled or not blame)
+            limit = self.runtime.adapter_max_memory_mb
+            if (
+                result is not None
+                and (result.get("peak_memory_mb") or 0) > limit
+                and task.pool is self._adapter_pool
+            ):
+                # Not killed: its running polls end first (see _collect). The
+                # new process loads the adapters again as their feeds are polled
+                logger.warning(
+                    f"Adapter process at {result['peak_memory_mb']} MB (more than "
+                    f"adapter_max_memory_mb = {limit:g}): replaced"
+                )
+                self._retired_pools.append(self._adapter_pool)
+                self._adapter_pool = self._new_adapter_pool()
         elif task.kind == "static" and cancelled:
             pass  # still waiting in spool/static, dispatched again
         elif task.kind == "static" and error is None:
@@ -1245,13 +1401,25 @@ class Runtime:
             self._static_pool = self._new_pool(
                 self.runtime.heavy_slots, tasks_per_worker=1
             )
+        elif lane == "adapter":
+            self._adapter_pool = self._new_adapter_pool()
         else:
             self._normal_pool = self._new_pool(self.runtime.worker_count())
 
     # Windows and raw archive ------------------------------------------------------
 
     def _close_windows(self):
+        """
+        Close the finished windows, oldest first across every feed, with their
+        own share of the normal workers (see WINDOW_TASKS_PER_WORKER).
+        """
+        free = self.runtime.worker_count() * WINDOW_TASKS_PER_WORKER - sum(
+            1 for task in self._in_flight.values() if task.kind == "window"
+        )
+        if free <= 0:
+            return
         now = datetime.now(timezone.utc)
+        due = []
         for window_json in self.spool.path("windows").glob("*/*/*/window.json"):
             folder = window_json.parent
             # A window that failed to close keeps its .closing-<pid> name
@@ -1266,23 +1434,41 @@ class Runtime:
             if window is None:
                 continue
             end = datetime.fromisoformat(window["end"])
-            if end > now or self._has_older(window["feed"], end):
-                continue
-            if self._count("normal") >= self.runtime.worker_count() * 2:
+            if end <= now:
+                due.append((end, base, folder, window["feed"]))
+        for end, base, folder, feed in sorted(due):
+            if free <= 0:
                 return
+            if f"window {base}" in self._keys_in_flight:
+                continue  # its folder and its .closing- one (parts added after a failed close)
+            if self._has_older(feed, end):
+                if (now - end).total_seconds() < WINDOW_MAX_WAIT_SECONDS:
+                    continue
+                if base not in self._window_warned:
+                    self._window_warned.add(base)
+                    logger.warning(
+                        f"Closing {base}: {feed} still has fetches from before its end "
+                        f"waiting after {WINDOW_MAX_WAIT_SECONDS // 3600} h; they will "
+                        "add a second file to it"
+                    )
             self._submit(
-                Task("window", key, "normal", {"base": base}),
+                Task("window", f"window {base}", "normal", {"base": base}),
                 worker.close_window,
                 str(folder),
             )
+            free -= 1
 
     def _has_older(self, feed: str, end: datetime) -> bool:
         """Whether the feed still has a fetch from before end to process."""
         busy = self._busy_feeds.get(feed)
-        if busy is not None and _item_time(busy) < end:
+        # Only while its task runs: a stale entry must not hold the windows
+        if busy is not None and feed in self._keys_in_flight and _item_time(busy) < end:
             return True
         with self._lock:
-            queue = self._queues.get(feed)
+            queue = self._queues.get(feed) or []
+            # A fetch gone from disk (deleted by hand) holds nothing back
+            while queue and not queue[0].exists():
+                queue.pop(0)
             return bool(queue) and _item_time(queue[0]) < end
 
     def _prune_raw(self):

@@ -224,8 +224,10 @@ def timetable(state: dict, env, out_dir: Path) -> Path: ...     # a GTFS zip or 
 
 What they return is handled like a download: filter, deduplication, versions, and so on. `state` is the adapter's
 own dict (JSON values only). It is kept between calls and across restarts, and saved only after a call that succeeds.
-Use it for things like a change id. `env` is `os.environ`, for API keys. Adapters run in the worker processes, and a
-file is loaded again when it changes. An adapter that raises counts as a failed fetch, and it is called again at the
+Use it for things like a change id. `env` is `os.environ`, for API keys. Realtime adapters run in one adapter process,
+each poll in a thread of its own: what a module keeps between polls stays, and the functions of one file serving several
+feeds may run at the same time (keep module-level state per feed). Static adapters run in a fresh process. A file is
+loaded again when it changes. An adapter that raises counts as a failed fetch, and it is called again at the
 next refresh. `feedId` is computed from the `adapter` text as written. After a restart, a static adapter is not
 called again before `check_minutes` if a version is already stored.
 
@@ -259,6 +261,7 @@ is picked up again after a restart, and waits there while storage is down.
 | `max_attempts` | `3` | Tries per fetch before it is moved to the spool's `quarantine/` folder. A fetch that is not valid GTFS-RT goes there at once. |
 | `startup_jitter_seconds` | `60` | Each job first runs at a random time within this delay, so they do not all start at once. |
 | `max_tasks_per_worker` | `200` | A worker process is replaced after this many tasks. |
+| `adapter_max_memory_mb` | `1024` | Realtime adapters run in one long-lived process, each poll in a thread of its own, so a slow API never holds the workers that process fetches. That process is replaced (once its running polls end) when its peak memory passes this. |
 
 ### `[raw]`
 
