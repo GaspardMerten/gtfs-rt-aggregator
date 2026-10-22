@@ -133,7 +133,7 @@ class TestIcebergSink(unittest.TestCase):
             self.skipTest("DuckDB or its iceberg extension not available")
         count = connection.sql(
             f"SELECT count(*) FROM iceberg_scan('{location}')"
-        ).fetchone()[0]
+        ).fetchall()[0][0]  # newer DuckDB relations have no fetchone()
         self.assertEqual(count, expected)
         try:
             import polars as pl
@@ -226,11 +226,11 @@ class TestIcebergSink(unittest.TestCase):
         url = f"{base}/iceberg-public/VehiclePosition"
         count = connection.sql(
             f"SELECT count(*) FROM iceberg_scan('{url}')"
-        ).fetchone()[0]
+        ).fetchall()[0][0]  # newer DuckDB relations have no fetchone()
         self.assertEqual(count, expected)
         count = connection.sql(
             f"SELECT count(*) FROM iceberg_scan('{url}') WHERE provider = 'be'"
-        ).fetchone()[0]
+        ).fetchall()[0][0]  # newer DuckDB relations have no fetchone()
         self.assertEqual(count, be)
 
     def test_concurrent_registration(self):
