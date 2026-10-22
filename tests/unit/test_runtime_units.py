@@ -15,9 +15,10 @@ from src.gtfs_rt_aggregator.config.models import (
     GtfsRtConfig,
     ProviderConfig,
     RuntimeConfig,
+    StaticConfig,
     StorageConfig,
 )
-from src.gtfs_rt_aggregator.runtime.runtime import Runtime, Uploader
+from src.gtfs_rt_aggregator.runtime.runtime import Runtime, Uploader, next_slot
 from src.gtfs_rt_aggregator.runtime.spool import Spool
 from src.gtfs_rt_aggregator.storage.filesystem import FileSystemStorage
 
@@ -537,3 +538,58 @@ class TestDownload(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestStaticSlots(unittest.TestCase):
+    """URL static feeds are checked at fixed times of the UTC day, whatever the restart time."""
+
+    def setUp(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp)
+        config = GtfsRtConfig(
+            storage=StorageConfig(type="filesystem", params={"base_directory": tmp}),
+            providers=[
+                ProviderConfig(
+                    name="p",
+                    static=[StaticConfig(url="https://x.org/gtfs.zip", check_minutes=120)],
+                )
+            ],
+            runtime=RuntimeConfig(spool_dir=os.path.join(tmp, "spool"), startup_jitter_seconds=0),
+        )
+        self.runtime = Runtime(config, {"global": MagicMock()})
+        self.feed = next(iter(self.runtime.statics))
+
+    def _job(self):
+        self.runtime._jobs = []
+        self.runtime._schedule_jobs()
+        return next(j for j in self.runtime._jobs if j.name.startswith("static"))
+
+    def test_next_slot(self):
+        day = datetime(2026, 10, 22, tzinfo=timezone.utc).timestamp()
+        offset = next_slot(7200, "k", day) - day
+        self.assertTrue(0 <= offset < 600)
+        # Every 2 h from 00:00 UTC (+ the key's offset), whatever the time asked
+        self.assertEqual(next_slot(7200, "k", day + 9.5 * 3600), day + 10 * 3600 + offset)
+        self.assertEqual(next_slot(7200, "k", day + 10 * 3600 + offset), day + 12 * 3600 + offset)
+        self.assertEqual(next_slot(86400, "k", day + 9.5 * 3600) - day, 86400 + offset % 600)
+
+    def test_never_checked_feed_checked_at_once(self):
+        job = self._job()
+        self.assertLessEqual(job.next_run, time.monotonic())
+        self.assertEqual(job.slot_key, self.feed)
+
+    def test_recently_checked_feed_waits_for_its_slot(self):
+        with patch.object(Runtime, "_static_checked_recently", return_value=True):
+            job = self._job()
+        wait = job.next_run - time.monotonic()
+        expected = next_slot(7200, self.feed, time.time()) - time.time()
+        self.assertAlmostEqual(wait, expected, delta=2)
+
+    def test_after_a_run_the_next_is_the_slot(self):
+        job = self._job()
+        self.runtime._jobs = [job]
+        job.run = MagicMock()
+        self.runtime._tick()
+        job.run.assert_called_once()
+        expected = next_slot(7200, self.feed, time.time()) - time.time()
+        self.assertAlmostEqual(job.next_run - time.monotonic(), expected, delta=2)

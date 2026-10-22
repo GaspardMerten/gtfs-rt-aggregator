@@ -428,6 +428,45 @@ class TestStaticChangeRules(_StaticTestCase):
 
         self.assertEqual(len(self._versions()), 2)
 
+    def test_max_days_stores_small_change_hidden_by_304(self):
+        # The checked file keeps its ETag: the server answers 304 to every later check, until max_days
+        # has passed and the file is read again (ee-elron, Oct 2026: unstored 21 days before 0.12.3)
+        _FeedHandler.etag = '"v1"'
+        self._configure(min_change=0.5, max_days=7)
+        self._run(1)
+        _FeedHandler.body = _make_zip(_mixed_feed(retimed=1))
+        _FeedHandler.etag = '"v2"'
+        self._run(2)
+        _FakeDatetime.current = datetime(2026, 10, 1, 1, 0, 0, tzinfo=pytz.UTC)
+        self._run()
+        self.assertEqual(_FeedHandler.requests[-1].get("If-None-Match"), '"v2"')
+        self.assertEqual(len(self._versions()), 1)
+        _FakeDatetime.current = datetime(2026, 10, 5, 1, 0, 0, tzinfo=pytz.UTC)
+        self._run()
+        self.assertNotIn("If-None-Match", _FeedHandler.requests[-1])
+        self.assertEqual(len(self._versions()), 2)
+        # Stored: the checks are conditional again
+        _FakeDatetime.current = datetime(2026, 10, 6, 1, 0, 0, tzinfo=pytz.UTC)
+        self._run()
+        self.assertEqual(_FeedHandler.requests[-1].get("If-None-Match"), '"v2"')
+        self.assertEqual(len(self._versions()), 2)
+
+    def test_extension_of_an_ending_timetable_stored(self):
+        # The stored version ends within EXTEND_DAYS; the new file adds the next timetable, the coming
+        # days unchanged (0 %): stored at once
+        self._configure(min_change=0.1, max_days=7)
+        files = _mixed_feed()
+        files["calendar.txt"] = files["calendar.txt"].replace("20261231", "20261005")
+        _FeedHandler.body = _make_zip(files)
+        self._run(1)
+        files["calendar.txt"] += "DEC,1,1,1,1,1,1,1,20261006,20271211\n"
+        files["trips.txt"] += "RAIL,DEC,X1,SH1\n"
+        files["stop_times.txt"] += "X1,07:00:00,07:00:00,S1,1\nX1,07:10:00,07:10:00,S2,2\n"
+        _FeedHandler.body = _make_zip(files)
+        self._run(2)
+
+        self.assertEqual(len(self._versions()), 2)
+
     def test_version_without_signatures_gets_them(self):
         # Stored without min_change: no signatures
         self._run(1)

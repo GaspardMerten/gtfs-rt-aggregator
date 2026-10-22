@@ -182,14 +182,14 @@ not change.
 | `index_url`, `url_pattern` | | Instead of `url`, for feeds published under a new URL for each version. The page at `index_url` (HTML or JSON) is read and the greatest link matching the regex `url_pattern` is downloaded. |
 | `adapter` | | Instead of `url`: a Python function that builds the GTFS. See [Adapters](#adapters). |
 | `format` | `gtfs` | `netex` for a NeTEx timetable (`.xml`, `.xml.gz` or a zip of XML files), such as the ones published on national access points: it is stored as the same GTFS tables (needs gtfs-parquet 0.7). |
-| `check_minutes` | `60` | How often to check for a new version. |
+| `check_minutes` | `60` | How often to check for a new version: every `check_minutes` from 00:00 UTC (plus a few minutes per feed), whatever the start time; URL feeds send the stored ETag/Last-Modified, so an unchanged file is a 304. |
 | `name` | `"static"` | Folder the versions are stored in. Only needed if the provider has several static feeds. |
 | `headers` | none | HTTP headers. |
 | `retries` | `3` | As for realtime feeds. |
 | `reuse_unchanged_tables` | `false` | Point to the previous version's file for tables that did not change, instead of storing them again. `manifest.json` then gives each table's path. |
 | `route_types` | none | Keep only the routes of these GTFS route types, e.g. `[2, "100-199"]` for rail, and the trips, stop times, frequencies, services and shapes they use (stops are all kept). For a mixed-mode feed whose realtime is filtered to the same route types. |
 | `min_change` | `0` | Store a changed feed only if at least this share of the trips running in the next 7 days was added, removed or changed (route, running days or stop times), e.g. `0.01`. Renumbered services do not count; renamed trips do, since realtime feeds use the new names. A skipped feed is remembered in `latest.json` (`checked_files`, `checked_change`) so it is not converted again. |
-| `max_days` | none | With `min_change`: store a changed feed anyway once the stored version is this many days old. |
+| `max_days` | none | With `min_change`: store a changed feed anyway once the stored version is this many days old (the file is then read again, without the validators). A change below `min_change` is also stored when the stored version ends within 14 days and the new one runs further. |
 
 ```toml
 [[providers.static]]

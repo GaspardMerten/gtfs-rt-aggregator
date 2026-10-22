@@ -36,6 +36,10 @@ from ..utils.redact import strip_query
 # min_change compares the trips running in the coming days: a stored version
 # is kept while it still describes them
 CHANGE_DAYS = 7
+# ... unless the stored version runs out within EXTEND_DAYS and the new file runs further: a timetable extended
+# (e.g. the December timetable change added to the file) changes none of the coming days' trips, and its new
+# days must be stored before the stored version ends
+EXTEND_DAYS = 14
 
 
 def _http_time(value: Optional[str]) -> Optional[datetime]:
@@ -283,7 +287,24 @@ class StaticService:
         saved_url = strip_query(url)
         static = self._static_config(provider_name, feed_name)
         route_types = sorted(static.route_type_set()) if static else []
-        if latest and strip_query(latest.get("url")) == saved_url and latest.get("route_types", []) == route_types:
+        # A change checked and found below min_change keeps its validators (no download a check while the file
+        # stays the same); once max_days has passed since the stored version, the file is read again so that
+        # process() stores it. Before 0.12.3 the 304s then hid it for good (ee-elron: 1 Oct file unstored 21 days)
+        pending = bool(
+            latest
+            and latest.get("checked_files")
+            and static
+            and static.max_days
+            and latest.get("fetched_at")
+            and (fetch_time - datetime.fromisoformat(latest["fetched_at"])).total_seconds()
+            >= static.max_days * 86400
+        )
+        if (
+            latest
+            and not pending
+            and strip_query(latest.get("url")) == saved_url
+            and latest.get("route_types", []) == route_types
+        ):
             if latest.get("etag"):
                 request_headers["If-None-Match"] = latest["etag"]
             if latest.get("last_modified"):
@@ -408,10 +429,12 @@ class StaticService:
                 signatures = None
 
         if signatures and same_filter:
-            share = self._changed_share(
+            share, extended = self._changed_share(
                 storage, base, latest, converted, signatures, fetch_time.date(), logger
             )
-            if share is not None and share < static.min_change and not expired:
+            if extended:
+                logger.info(f"{base}: runs past the end of {latest.get('version')} ({extended}): stored")
+            if share is not None and share < static.min_change and not expired and not extended:
                 logger.info(
                     f"{base}: {share:.1%} of trips changed since {latest.get('version')}, "
                     f"below min_change {static.min_change:.1%}: not stored"
@@ -752,11 +775,13 @@ class StaticService:
         new_path: str,
         first: date,
         logger,
-    ) -> Optional[float]:
+    ) -> Tuple[Optional[float], Optional[str]]:
         """
         Share of the trips running in the CHANGE_DAYS days from first that
         were added, removed or changed (route, days or stop times) since the
-        latest stored version, or None if its trips cannot be read. Feeds that
+        latest stored version, or None if its trips cannot be read; and, if the
+        latest version's last service day is within EXTEND_DAYS of first and the
+        new feed runs later, "<old last day> → <new last day>". Feeds that
         renumber their services, or put the date in their trip ids, only
         change with their timetable. The latest version's signatures are
         computed and saved if it has none (stored before 0.7.8, or with another
@@ -767,12 +792,16 @@ class StaticService:
         folder = os.path.dirname(new_path)
         stored = manifest_tables(latest, base)
         if "trips" not in stored or "stop_times" not in stored:
-            return None
+            return None, None
         old = {}
         for name in ("calendar", "calendar_dates"):
             if name in stored:
                 old[name] = os.path.join(folder, f"latest_{name}.parquet")
                 _fetch(storage, stored[name], old[name])
+        old_end, new_end = self._last_service_day(old), self._last_service_day(tables)
+        extended = None
+        if old_end and new_end and new_end > old_end and old_end < first + timedelta(days=EXTEND_DAYS):
+            extended = f"{old_end} → {new_end}"
         old_path = os.path.join(folder, "latest_signatures.parquet")
         if (
             latest.get("signatures")
@@ -808,13 +837,27 @@ class StaticService:
         after = running(new_path, tables)
         both = before.join(after, on="trip_id", how="full", coalesce=True)
         if both.is_empty():
-            return 0.0
+            return 0.0, extended
         changed = ~(
             pl.col("old_route").eq_missing(pl.col("route_id"))
             & pl.col("old_stops").eq_missing(pl.col("stops"))
             & pl.col("old_days").eq_missing(pl.col("days"))
         )
-        return both.select(changed.mean()).item()
+        return both.select(changed.mean()).item(), extended
+
+    @staticmethod
+    def _last_service_day(tables: Dict[str, str]) -> Optional[date]:
+        """Last day of calendar end_date and added calendar_dates (removed days not subtracted), or None."""
+        import polars as pl
+
+        days = []
+        if "calendar" in tables:
+            days.append(pl.read_parquet(tables["calendar"], columns=["end_date"])["end_date"].max())
+        if "calendar_dates" in tables:
+            added = pl.read_parquet(tables["calendar_dates"], columns=["date", "exception_type"])
+            days.append(added.filter(pl.col("exception_type") == 1)["date"].max())
+        days = [d for d in days if d is not None]
+        return max(days) if days else None
 
     @staticmethod
     def _convert(zip_path: str, out_dir: str, netex: bool = False) -> Dict[str, str]:

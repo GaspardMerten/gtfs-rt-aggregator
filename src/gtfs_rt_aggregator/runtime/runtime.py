@@ -18,6 +18,7 @@ The pipeline's runtime:
 
 import bisect
 import logging
+import math
 import multiprocessing
 import os
 import random
@@ -27,6 +28,7 @@ import tempfile
 import threading
 import time
 import weakref
+import zlib
 from concurrent.futures import Future, ProcessPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
 from dataclasses import dataclass, field
@@ -136,6 +138,15 @@ class Job:
     interval: float
     run: Callable[[], None]
     next_run: float = 0.0
+    # Run at the wall-clock slots of next_slot(interval, slot_key) rather than interval after the last run
+    slot_key: Optional[str] = None
+
+
+def next_slot(interval: float, key: str, now: float) -> float:
+    """The first epoch time after now of the slots every interval seconds from 00:00 UTC, shifted by a
+    few minutes per key (so that the feeds checked together do not all start in the same second)."""
+    offset = zlib.crc32(key.encode()) % int(min(interval, 600))
+    return (math.floor((now - offset) / interval) + 1) * interval + offset
 
 
 @dataclass
@@ -403,10 +414,32 @@ class Runtime:
             )
         for feed in self.statics:
             _, static = self.statics[feed]
-            add(
-                f"static {feed}",
-                static.check_minutes * 60,
-                lambda feed=feed: self._submit_static_download(feed),
+            if static.adapter:
+                add(
+                    f"static {feed}",
+                    static.check_minutes * 60,
+                    lambda feed=feed: self._submit_static_download(feed),
+                )
+                continue
+            # URL feeds are checked at fixed times of the day (every check_minutes from 00:00 UTC), not
+            # check_minutes after the last restart (until 0.12.3 a daily check ran at the restart's time
+            # of day); at once after a start only if the last check is older than check_minutes. Without
+            # that, every restart would download every static feed again: a feed with no ETag or
+            # Last-Modified is then read in full each time
+            interval = static.check_minutes * 60
+            self._statics_checked.add(feed)
+            if self._static_checked_recently(feed, static):
+                first = now + next_slot(interval, feed, time.time()) - time.time()
+            else:
+                first = now + random.uniform(0, min(interval, jitter)) if jitter else now
+            self._jobs.append(
+                Job(
+                    f"static {feed}",
+                    interval,
+                    lambda feed=feed: self._submit_static_download(feed),
+                    first,
+                    slot_key=feed,
+                )
             )
 
         aggregator = AggregatorService(self.config, self.storages)
@@ -487,7 +520,11 @@ class Runtime:
         now = time.monotonic()
         for job in self._jobs:
             if now >= job.next_run:
-                job.next_run = now + job.interval
+                if job.slot_key is None:
+                    job.next_run = now + job.interval
+                else:
+                    wall = time.time()
+                    job.next_run = now + next_slot(job.interval, job.slot_key, wall) - wall
                 try:
                     job.run()
                 except Exception as e:
@@ -712,10 +749,6 @@ class Runtime:
 
     def _submit_static_download(self, feed: str):
         provider, static = self.statics[feed]
-        if not static.adapter and feed not in self._statics_checked:
-            self._statics_checked.add(feed)
-            if self._static_checked_recently(feed, static):
-                return
         if static.adapter:
             # Built by its adapter in a fresh process, like a conversion
             self._queue_heavy(
