@@ -204,9 +204,10 @@ def _update_fields(schema: pa.Schema) -> set:
 
 
 def _local_noon_minus_12h(sd: str, tz: str) -> float:
-    """GTFS times count from "noon minus 12 h" of the service day (midnight except on DST days)."""
+    """GTFS times count from "noon minus 12 h" of the service day (midnight except on DST days). The 12 h are taken
+    from the instant: aware datetime arithmetic is wall-clock arithmetic, which gives midnight on DST days too."""
     day = dt.date(int(sd[:4]), int(sd[4:6]), int(sd[6:8]))
-    return (dt.datetime.combine(day, dt.time(12), ZoneInfo(tz)) - dt.timedelta(hours=12)).timestamp()
+    return dt.datetime.combine(day, dt.time(12), ZoneInfo(tz)).timestamp() - 12 * 3600
 
 
 def _quote(value: str) -> str:

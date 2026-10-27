@@ -7,7 +7,7 @@ from pathlib import Path
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from src.gtfs_rt_aggregator.punctuality import COLUMNS, final_calls, storage_timetable
+from src.gtfs_rt_aggregator.punctuality import COLUMNS, _local_noon_minus_12h, final_calls, storage_timetable
 from tests.mocks import MockStorageInterface
 
 DAY = "2026-10-05"
@@ -193,6 +193,15 @@ class TestMatching(_Case):
         calls, stats = self.run_calls([trip_row("T", [stu(seq=1, stop="A", dep_delay=60)])], {})
         self.assertEqual([(r["stop_id"], r["departure_delay"], r["scheduled_departure"]) for r in calls], [("A", 60, None)])
         self.assertEqual(stats["trips_in_timetable"], 0.0)
+
+
+class TestServiceDayBase(unittest.TestCase):
+    def test_noon_minus_12h_on_dst_days(self):
+        # 25 Oct 2026 (clocks back): 01:00 CEST, an hour after midnight; 29 Mar 2026 (clocks forward): 23:00 CET the
+        # day before; any other day: midnight
+        self.assertEqual(_local_noon_minus_12h("20261025", "Europe/Brussels"), datetime(2026, 10, 24, 23, tzinfo=timezone.utc).timestamp())
+        self.assertEqual(_local_noon_minus_12h("20260329", "Europe/Brussels"), datetime(2026, 3, 28, 22, tzinfo=timezone.utc).timestamp())
+        self.assertEqual(_local_noon_minus_12h("20261026", "Europe/Brussels"), datetime(2026, 10, 25, 23, tzinfo=timezone.utc).timestamp())
 
 
 class TestStorageTimetable(unittest.TestCase):
