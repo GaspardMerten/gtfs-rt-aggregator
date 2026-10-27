@@ -606,6 +606,13 @@ class TestWindows(unittest.TestCase):
     def setUp(self):
         tmp = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, tmp)
+        # The windows are on 22 Oct 2026: without this, past 24 h they are
+        # closed whatever waits (test_window_closed_after_waiting_too_long)
+        patcher = patch(
+            "src.gtfs_rt_aggregator.runtime.runtime.WINDOW_MAX_WAIT_SECONDS", 10**10
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
         config = GtfsRtConfig(
             storage=StorageConfig(type="filesystem", params={"base_directory": tmp}),
             providers=[
