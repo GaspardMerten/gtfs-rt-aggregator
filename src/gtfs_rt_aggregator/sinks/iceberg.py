@@ -123,6 +123,8 @@ class IcebergSink:
             table = None
             known: Optional[Dict[str, int]] = None
             for provider in self.config.providers:
+                if provider.name in self.settings.exclude_providers:
+                    continue
                 if not self._stores(provider, service):
                     continue
                 storage = self.storages.get(provider.name, self.storage)
@@ -160,6 +162,10 @@ class IcebergSink:
                         if known is not None:
                             known[uri] = size
                         registered += 1
+            if self.settings.exclude_providers:
+                table = table or self._existing_table(service)
+                if table is not None and self._drop_excluded(service, table):
+                    registered += 1
             if table is not None and self.settings.write_version_hint:
                 self._write_version_hint(service, table)
             if self.settings.public_base_url:
@@ -167,6 +173,23 @@ class IcebergSink:
                 if table is not None:
                     self._publish(service, table)
         return registered
+
+    def _drop_excluded(self, service: str, table) -> bool:
+        """Remove the rows of exclude_providers registered before they were
+        excluded. A metadata change: the tables are partitioned by provider, so
+        whole files leave (the files themselves stay in the storage)."""
+        from pyiceberg.expressions import In
+
+        partitions = table.inspect.files().column("partition").to_pylist()
+        found = sorted(
+            {p.get("provider") for p in partitions}
+            & set(self.settings.exclude_providers)
+        )
+        if not found:
+            return False
+        table.delete(In("provider", found))
+        logger.info(f"Iceberg: removed {service} rows of {', '.join(found)} (excluded)")
+        return True
 
     def _stores(self, provider, service: str) -> bool:
         if service == "TripStopEvent":

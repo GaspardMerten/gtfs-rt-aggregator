@@ -668,6 +668,10 @@ class IcebergConfig(_Model):
         pattern=r"^[A-Za-z0-9][A-Za-z0-9._/-]*$",
         description="Folder of that public copy (default: <warehouse>-public)",
     )
+    exclude_providers: List[str] = Field(
+        default_factory=list,
+        description="Providers kept out of the tables (e.g. data that may not be given out): not registered, and their rows already registered are removed at the next sync",
+    )
 
     @model_validator(mode="after")
     def validate_public(self):

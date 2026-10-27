@@ -120,6 +120,19 @@ class TestIcebergSink(unittest.TestCase):
             )
         self.sink.maintain()
 
+    def test_excluded_providers(self):
+        be = self._day("be", 1)
+        self._day("nl", 1)
+        self.assertEqual(self.sink.sync(), 2)
+        # Excluded later: its rows leave at the next sync, its days are no longer registered
+        self.sink.settings.exclude_providers = ["nl"]
+        self._day("nl", 2)
+        self.assertEqual(self.sink.sync(), 1)
+        rows = self._rows()
+        self.assertEqual(rows.num_rows, be)
+        self.assertEqual(set(rows.column("provider").to_pylist()), {"be"})
+        self.assertEqual(self.sink.sync(), 0)
+
     def test_read_without_catalog(self):
         expected = self._day("be", 1) + self._day("nl", 1)
         self.sink.sync()

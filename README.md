@@ -301,6 +301,7 @@ services = ["TripUpdate", "VehiclePosition"]
 | `sync_minutes` | `60` | How often new compacted days are registered. |
 | `public_base_url` | none | URL under which a web server or CDN serves the storage's objects by key. When set, a copy of each table's metadata with every path rewritten to `<public_base_url>/<key>` is kept in `public_warehouse`. |
 | `public_warehouse` | `"<warehouse>-public"` | Folder of that public copy. Must differ from `warehouse`. |
+| `exclude_providers` | `[]` | Providers kept out of the tables (e.g. data that may not be given out): not registered, and rows registered before are removed at the next sync. Their files stay in the storage. |
 
 ## Command line
 
