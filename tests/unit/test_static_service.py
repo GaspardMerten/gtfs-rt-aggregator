@@ -495,6 +495,180 @@ class TestStaticChangeRules(_StaticTestCase):
         latest = json.loads(self.storage.get_bytes("nl/static/latest.json"))
         self.assertEqual(latest["route_types"][:2], [2, 100])
 
+    def _latest(self):
+        return json.loads(self.storage.get_bytes("nl/static/latest.json"))
+
+    def _other_modes(self):
+        return pd.read_parquet(io.BytesIO(self.storage.get_bytes(self._latest()["other_modes"])))
+
+    def test_route_types_store_the_other_modes(self):
+        from src.gtfs_rt_aggregator.fetcher.filter import OTHER_MODES
+        from src.gtfs_rt_aggregator.static.service import filter_tables
+
+        files = _mixed_feed()
+        # A tram route without trips is listed too, with no trip id
+        files["routes.txt"] += "TRAM,A1,1,0\n"
+        _FeedHandler.body = _make_zip(files)
+        self._configure(route_types=[2])
+        self._run(1)
+
+        latest = self._latest()
+        self.assertEqual(
+            latest["other_modes"], "nl/static/2026-09-28_01-00-00Z/_other_modes.parquet"
+        )
+        others = self._other_modes()
+        buses = others[others["route_id"] == "BUS"]
+        self.assertEqual(set(buses["trip_id"]), {f"B{i}" for i in range(5)})
+        self.assertEqual(set(buses["route_type"]), {3})
+        tram = others[others["route_id"] == "TRAM"]
+        self.assertEqual(len(tram), 1)
+        self.assertTrue(tram["trip_id"].isna().all())
+        # Not a GTFS table of the version
+        self.assertNotIn("_other_modes", latest["tables"])
+        self.assertEqual(filter_tables(latest, "nl/static")[OTHER_MODES], latest["other_modes"])
+        manifest = json.loads(
+            self.storage.get_bytes("nl/static/2026-09-28_01-00-00Z/manifest.json")
+        )
+        self.assertEqual(manifest["other_modes"], latest["other_modes"])
+
+    def test_unfiltered_version_holds_every_mode(self):
+        from src.gtfs_rt_aggregator.fetcher.filter import OTHER_MODES
+        from src.gtfs_rt_aggregator.static.service import filter_tables
+
+        self._run(1)
+        latest = self._latest()
+        self.assertNotIn("other_modes", latest)
+        # The filter drops unknown trips: a whole feed may be one operator's
+        self.assertNotIn(OTHER_MODES, filter_tables(latest, "nl/static"))
+        # A filtered version stored before 0.13.0: no side table, nothing said
+        self.assertNotIn(
+            OTHER_MODES, filter_tables({**latest, "route_types": [2]}, "nl/static")
+        )
+
+    def _store_without_other_modes(self):
+        """A version stored rail-only before 0.13.0: no side table."""
+        _FeedHandler.etag = '"same"'
+        self._configure(route_types=[2], min_change=0.1)
+        self._run(1)
+        version = self._latest()["version"]
+        for path in ("nl/static/latest.json", f"nl/static/{version}/manifest.json"):
+            manifest = json.loads(self.storage.get_bytes(path))
+            del manifest["other_modes"], manifest["other_modes_digest"]
+            self.storage.save_bytes(json.dumps(manifest).encode(), path)
+        self.storage.delete(f"nl/static/{version}/_other_modes.parquet")
+        return version
+
+    def test_other_modes_added_to_an_older_version(self):
+        version = self._store_without_other_modes()
+        # Read again despite the ETag, added to the same version
+        self._run(2)
+        self.assertNotIn("If-None-Match", _FeedHandler.requests[-1])
+        self.assertEqual(self._versions(), [version])
+        latest = self._latest()
+        self.assertEqual(latest["other_modes"], f"nl/static/{version}/_other_modes.parquet")
+        self.assertEqual(set(self._other_modes()["trip_id"]), {f"B{i}" for i in range(5)})
+        manifest = json.loads(self.storage.get_bytes(f"nl/static/{version}/manifest.json"))
+        self.assertEqual(manifest["other_modes"], latest["other_modes"])
+        # Then the validators are sent again
+        self._run(3)
+        self.assertEqual(_FeedHandler.requests[-1].get("If-None-Match"), '"same"')
+
+    def test_other_modes_not_taken_from_another_content(self):
+        version = self._store_without_other_modes()
+        stored = _FeedHandler.body
+        # 1 of 25 trips retimed and a new bus: below min_change, the version stays.
+        # Its side table would describe other trips: not written, not tried
+        _FeedHandler.body = _make_zip(_mixed_feed(retimed=1, buses=6))
+        _FeedHandler.etag = '"newer"'
+        self._run(2)
+        self.assertEqual(self._versions(), [version])
+        latest = self._latest()
+        self.assertNotIn("other_modes", latest)
+        self.assertNotIn("other_modes_attempted", latest)
+        self.assertFalse(self.storage.file_exists(f"nl/static/{version}/_other_modes.parquet"))
+        # Read again without validators while another copy is served
+        self._run(3)
+        self.assertNotIn("If-None-Match", _FeedHandler.requests[-1])
+        # The stored content again: added to that version, then validators again
+        _FeedHandler.body = stored
+        self._run(4)
+        latest = self._latest()
+        self.assertEqual(latest["other_modes"], f"nl/static/{version}/_other_modes.parquet")
+        self.assertEqual(set(self._other_modes()["trip_id"]), {f"B{i}" for i in range(5)})
+        self._run(5)
+        self.assertIn("If-None-Match", _FeedHandler.requests[-1])
+
+    def test_other_modes_not_taken_from_an_older_file(self):
+        _FeedHandler.last_modified = "Wed, 30 Sep 2026 10:00:00 GMT"
+        version = self._store_without_other_modes()
+        # A stale copy (older Last-Modified, other content) is not stored
+        _FeedHandler.last_modified = "Mon, 28 Sep 2026 10:00:00 GMT"
+        _FeedHandler.body = _make_zip(_mixed_feed(retimed=5))
+        _FeedHandler.etag = '"stale"'
+        self._run(2)
+        self.assertEqual(self._versions(), [version])
+        latest = self._latest()
+        self.assertNotIn("other_modes", latest)
+        self.assertNotIn("other_modes_attempted", latest)
+        self._run(3)
+        self.assertNotIn("If-None-Match", _FeedHandler.requests[-1])
+
+    def test_other_modes_from_an_older_copy_of_the_same_content(self):
+        _FeedHandler.last_modified = "Wed, 30 Sep 2026 10:00:00 GMT"
+        version = self._store_without_other_modes()
+        _FeedHandler.last_modified = "Mon, 28 Sep 2026 10:00:00 GMT"
+        self._run(2)
+        self.assertEqual(self._latest()["other_modes"], f"nl/static/{version}/_other_modes.parquet")
+
+    def test_failed_other_modes_never_fail_the_check(self):
+        from src.gtfs_rt_aggregator.static.service import StaticService
+
+        version = self._store_without_other_modes()
+        with patch.object(StaticService, "_add_other_modes", side_effect=RuntimeError("broken")):
+            with self.assertLogs(level="WARNING") as logs:
+                self._run(2)
+        self.assertTrue(any("other modes" in line for line in logs.output))
+        latest = self._latest()
+        self.assertNotIn("other_modes", latest)
+        self.assertEqual(latest["other_modes_attempted"], version)
+        self._run(3)
+        self.assertEqual(_FeedHandler.requests[-1].get("If-None-Match"), '"same"')
+
+    def test_next_version_carries_the_other_modes(self):
+        version = self._store_without_other_modes()
+        _FeedHandler.body = _make_zip(_mixed_feed(retimed=10))
+        _FeedHandler.etag = '"next"'
+        self._run(2)
+        latest = self._latest()
+        self.assertNotEqual(latest["version"], version)
+        self.assertEqual(
+            latest["other_modes"], f"nl/static/{latest['version']}/_other_modes.parquet"
+        )
+
+    def test_other_modes_in_a_fixed_order(self):
+        self._configure(route_types=[2])
+        self._run(1)
+        others = self._other_modes()
+        self.assertEqual(
+            list(others["trip_id"]), sorted(others["trip_id"], key=lambda t: (t is None, t))
+        )
+
+    def test_other_modes_reused_when_unchanged(self):
+        self._configure(route_types=[2])
+        self._run(1, reuse_unchanged_tables=True)
+        _FeedHandler.body = _make_zip(_mixed_feed(retimed=1))
+        self._run(2, reuse_unchanged_tables=True)
+        self.assertEqual(len(self._versions()), 2)
+        self.assertTrue(
+            self._latest()["other_modes"].startswith("nl/static/2026-09-28_01-00-00Z/")
+        )
+        # The buses change: stored with the new version
+        _FeedHandler.body = _make_zip(_mixed_feed(retimed=1, buses=7))
+        self._run(3, reuse_unchanged_tables=True)
+        latest = self._latest()
+        self.assertTrue(latest["other_modes"].startswith(f"nl/static/{latest['version']}/"))
+        self.assertEqual(len(self._other_modes()), 7)
+
     def test_route_types_ignore_other_modes_changes(self):
         self._configure(route_types=[2], min_change=0.01)
         self._run(1)

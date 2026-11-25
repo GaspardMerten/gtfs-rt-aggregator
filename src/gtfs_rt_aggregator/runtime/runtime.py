@@ -1216,13 +1216,9 @@ class Runtime:
                 with self._lock:
                     if summary.get("unchanged") is False:
                         self._count_fetch(task.key, _item_time(item), "changed")
-                    if summary.get("dropped_unknown"):
-                        self._count_fetch(
-                            task.key,
-                            _item_time(item),
-                            "dropped_unknown",
-                            summary["dropped_unknown"],
-                        )
+                    for kind in ("dropped_unknown", "kept_unknown"):
+                        if summary.get(kind):
+                            self._count_fetch(task.key, _item_time(item), kind, summary[kind])
                     self._update_status(
                         task.key,
                         waiting_for_static=False,
@@ -1230,7 +1226,9 @@ class Runtime:
                         last_processed_seconds=result.get("seconds"),
                         worker_peak_memory_mb=result.get("peak_memory_mb"),
                     )
-                self._note_dropped(task.key, summary.get("dropped_unknown"))
+                self._note_dropped(
+                    task.key, summary.get("dropped_unknown"), summary.get("kept_unknown")
+                )
                 return
             count = blame and not cancelled
             permanent = count and error.startswith(PERMANENT_ERRORS)
@@ -1547,7 +1545,8 @@ class Runtime:
     def _count_fetch(self, feed: str, when: datetime, kind: str, count: int = 1):
         """
         One fetch of feed at when (aware): kind is ok, changed or failed; or
-        dropped_unknown, entities of unknown trips its filter dropped (count).
+        dropped_unknown or kept_unknown, entities of unknown trips its filter
+        dropped or kept (count).
         Call with the lock held.
         """
         provider, _ = self.feeds[feed]
@@ -1555,7 +1554,7 @@ class Runtime:
         days = self._health.setdefault(feed, {})
         hour = days.setdefault(local.date().isoformat(), {}).setdefault(f"{local.hour:02d}", {"ok": 0, "changed": 0, "failed": 0})
         hour[kind] = hour.get(kind, 0) + count
-        if kind != "dropped_unknown":
+        if kind not in ("dropped_unknown", "kept_unknown"):
             self._add_summary(kind)
         if kind == "failed":
             self._failed_feeds.add(feed)
@@ -1586,27 +1585,35 @@ class Runtime:
         )
         logger.info(line)
 
-    def _note_dropped(self, feed: str, unknown: Optional[int]):
+    def _note_dropped(
+        self, feed: str, dropped: Optional[int], kept: Optional[int] = None
+    ):
         """
-        Entities of unknown trips a feed's filter dropped (see
-        EntityFilter.unknown): logged once per window (accumulate_minutes, or
-        15 minutes), not per fetch. Many mean its static version is behind.
+        Entities of unknown trips a feed's filter dropped, or kept (static
+        versions telling the other modes, see EntityFilter.unknown): logged
+        once per window (accumulate_minutes, or 15 minutes), not per fetch.
+        Many mean its static version is behind.
         """
-        if unknown is None:
+        if dropped is None and kept is None:
             return
         _, api = self.feeds[feed]
         now = time.monotonic()
-        since, fetches, entities = self._dropped.setdefault(feed, [now, 0, 0])
-        fetches, entities = fetches + 1, entities + unknown
+        since, fetches, entities, kept_entities = self._dropped.setdefault(feed, [now, 0, 0, 0])
+        fetches, entities, kept_entities = (
+            fetches + 1,
+            entities + (dropped or 0),
+            kept_entities + (kept or 0),
+        )
         if now - since < (api.accumulate_minutes or 15) * 60:
-            self._dropped[feed] = [since, fetches, entities]
+            self._dropped[feed] = [since, fetches, entities, kept_entities]
             return
-        self._dropped[feed] = [now, 0, 0]
-        if entities:
-            logger.info(
-                f"{feed}: the filter dropped {entities} entities of trips unknown to "
-                f"the static version in {fetches} fetches ({entities / fetches:.0f} a fetch)"
-            )
+        self._dropped[feed] = [now, 0, 0, 0]
+        for count, verb in ((entities, "dropped"), (kept_entities, "kept")):
+            if count:
+                logger.info(
+                    f"{feed}: the filter {verb} {count} entities of trips unknown to "
+                    f"the static version in {fetches} fetches ({count / fetches:.0f} a fetch)"
+                )
 
     def _update_status(self, feed: str, **fields):
         self._status.setdefault(feed, {}).update(fields)

@@ -12,7 +12,7 @@ import pyarrow as pa
 from ..config.models import ApiConfig, GtfsRtConfig, ProviderConfig
 from ..fetcher.filter import build_filter
 from ..fetcher.gtfs_rt import GtfsRtFetcher, row_metadata
-from ..static.service import manifest_tables, read_latest, static_base
+from ..static.service import filter_tables, read_latest, static_base
 from ..storage.base import StorageInterface, storage_for
 
 # How long the static version found for a provider is reused; when none is
@@ -95,7 +95,8 @@ class StaticVersions:
             self.logger.warning(f"Could not read the static version of {base}: {e}")
             return (cached[1], cached[2]) if cached else (None, None)
         version = latest.get("version") if latest else None
-        tables = manifest_tables(latest, base) if latest else None
+        # With the side table of the other modes, for the filter (see filter_tables)
+        tables = filter_tables(latest, base) if latest else None
         self._cache[base] = (time.time(), version, tables)
         return version, tables
 
@@ -159,16 +160,24 @@ def process_payload(
                 f"{provider.name}: the filter of {api.source} needs a "
                 "static version, none can be read yet"
             )
-        kept, unknown = [], 0
+        kept, dropped_unknown, kept_unknown = [], 0, 0
         for entity in entities:
-            if entity_filter.keep(entity):
+            keep, unknown = entity_filter.classify(entity)
+            if keep:
                 kept.append(entity)
-            elif entity_filter.unknown(entity):
-                unknown += 1
+            if unknown:
+                # kept_unknown: kept because the version tells the other modes
+                # (not added trips kept by keep_unmatched_added, as before 0.13.0)
+                if not keep:
+                    dropped_unknown += 1
+                elif entity_filter.knows_other_modes:
+                    kept_unknown += 1
         filtered = {
             "dropped_count": len(entities) - len(kept),
-            # Trips the static version does not know (see EntityFilter.unknown)
-            "dropped_unknown": unknown,
+            # Trips the static version does not know (see EntityFilter.unknown):
+            # kept when it tells the other modes, dropped by older versions
+            "dropped_unknown": dropped_unknown,
+            "kept_unknown": kept_unknown,
         }
         entities = kept
 

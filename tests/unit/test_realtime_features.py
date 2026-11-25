@@ -260,6 +260,113 @@ class TestFilter(_FetcherTest):
         self.assertEqual(set(rows["trip_routeId"].to_pylist()), {"126323"})
         self.assertEqual(rows.num_rows, buses)
 
+    def _filtered_static(self, other_modes=True, unknown_route="126323"):
+        """
+        Static version stored rail-only (route_types [2]): 125327 is rail; the
+        side table lists the trips and routes of the other modes, except
+        unknown_route's, which the static feed does not know (a new timetable).
+        """
+        message = GtfsRtFetcher.parse_message(_feed_bytes())
+        trips = sorted(
+            {(e.vehicle.trip.trip_id, e.vehicle.trip.route_id) for e in message.entity}
+        )
+        version = "2026-01-01_00-00-00Z"
+        base = f"p/static/{version}"
+        tables = {"routes": f"{base}/routes.parquet", "trips": f"{base}/trips.parquet"}
+        rail = [(t, r) for t, r in trips if r == "125327"]
+        others = [(t, r) for t, r in trips if r not in ("125327", unknown_route)]
+        self.storage.save_bytes(
+            _parquet(pa.table({"route_id": ["125327"], "route_type": pa.array([2], pa.int16())})),
+            tables["routes"],
+        )
+        self.storage.save_bytes(
+            _parquet(
+                pa.table({"trip_id": [t for t, _ in rail], "route_id": [r for _, r in rail]})
+            ),
+            tables["trips"],
+        )
+        manifest = {"version": version, "tables": tables, "route_types": [2]}
+        if other_modes:
+            manifest["other_modes"] = f"{base}/_other_modes.parquet"
+            self.storage.save_bytes(
+                _parquet(
+                    pa.table(
+                        {
+                            # Trip ids only: vehicles carrying a route id are matched by it too
+                            "trip_id": [t for t, _ in others] + [None],
+                            "route_id": [r for _, r in others] + ["route-without-trips"],
+                            "route_type": pa.array([3] * len(others) + [0], pa.int32()),
+                        }
+                    )
+                ),
+                manifest["other_modes"],
+            )
+        self.storage.save_bytes(json.dumps(manifest).encode(), "p/static/latest.json")
+        return len(rail), sum(1 for _, r in trips if r == unknown_route)
+
+    def test_unknown_trips_kept_with_other_modes(self):
+        api = ApiConfig(
+            url=URL, services=["VehiclePosition"], filter=FilterConfig(route_types=[2])
+        )
+        service = self._service(api, [StaticConfig(url="https://example.org/gtfs.zip")])
+        rail, unknown = self._filtered_static()
+        self.assertGreater(unknown, 0)
+        with patch("tempfile.gettempdir", return_value=self.id_tmp()):
+            self._run(service)
+        rows = self._rows()
+        # Buses known from the side table dropped, the trips nobody knows kept
+        self.assertEqual(set(rows["trip_routeId"].to_pylist()), {"125327", "126323"})
+        self.assertEqual(rows.num_rows, rail + unknown)
+        status = self._status()
+        self.assertEqual(status["kept_unknown"], unknown)
+        self.assertEqual(status["dropped_unknown"], 0)
+
+    def test_unknown_trips_dropped_without_other_modes(self):
+        # A filtered version stored before 0.13.0: unknown trips look like other modes
+        api = ApiConfig(
+            url=URL, services=["VehiclePosition"], filter=FilterConfig(route_types=[2])
+        )
+        service = self._service(api, [StaticConfig(url="https://example.org/gtfs.zip")])
+        rail, _ = self._filtered_static(other_modes=False)
+        with patch("tempfile.gettempdir", return_value=self.id_tmp()):
+            self._run(service)
+        rows = self._rows()
+        self.assertEqual(set(rows["trip_routeId"].to_pylist()), {"125327"})
+        status = self._status()
+        self.assertEqual(status["kept_unknown"], 0)
+        self.assertEqual(status["dropped_unknown"], status["entity_count"] - rail)
+
+    def test_other_modes_from_the_disk_cache(self):
+        # A second worker reads the resolution another one wrote
+        from src.gtfs_rt_aggregator.fetcher import filter as filter_module
+
+        api = ApiConfig(
+            url=URL, services=["VehiclePosition"], filter=FilterConfig(route_types=[2])
+        )
+        service = self._service(api, [StaticConfig(url="https://example.org/gtfs.zip")])
+        self._filtered_static()
+        tmp = self.id_tmp()
+        tables = {
+            "routes": "p/static/2026-01-01_00-00-00Z/routes.parquet",
+            "trips": "p/static/2026-01-01_00-00-00Z/trips.parquet",
+            filter_module.OTHER_MODES: "p/static/2026-01-01_00-00-00Z/_other_modes.parquet",
+        }
+        with patch("tempfile.gettempdir", return_value=tmp):
+            first = filter_module.build_filter(api.filter, self.storage, tables, "k")
+            filter_module._MEMO.clear()
+            with patch.object(filter_module, "_resolve", side_effect=AssertionError):
+                second = filter_module.build_filter(api.filter, self.storage, tables, "k")
+        self.assertEqual(second.other_routes, first.other_routes)
+        self.assertEqual(list(second.other_trips), list(first.other_trips))
+        self.assertIn("route-without-trips", second.other_routes)
+        # Adding the side table to the same version resolves again
+        with patch("tempfile.gettempdir", return_value=tmp):
+            old = dict(tables)
+            del old[filter_module.OTHER_MODES]
+            self.assertFalse(
+                filter_module.build_filter(api.filter, self.storage, old, "k").knows_other_modes
+            )
+
     def test_trip_ids_without_static(self):
         api = ApiConfig(
             url=URL,
@@ -425,9 +532,310 @@ class TestKeepUnmatchedAdded(unittest.TestCase):
                 self.assertFalse(entity_filter.keep(entity))
                 self.assertEqual(entity_filter.unknown(entity), expected)
 
+    def test_other_modes(self):
+        import pyarrow as pa
+
+        from src.gtfs_rt_aggregator.fetcher.filter import EntityFilter, trip_keys
+        from google.transit import gtfs_realtime_pb2
+
+        entity_filter = EntityFilter(
+            {2},
+            {"rail"},
+            {"T-rail"},
+            known_routes={"rail"},
+            other_routes={"bus"},
+            other_trips=trip_keys(pa.chunked_array([["T-bus", "T-tram", None]])),
+        )
+        cases = [
+            # relationship, route, trip, kept, unknown
+            ("SCHEDULED", "", "T-rail", True, False),
+            ("SCHEDULED", "rail", "T-new", True, False),  # a new trip of a rail route
+            ("SCHEDULED", "", "T-bus", False, False),  # a bus trip, by its id only
+            ("SCHEDULED", "bus", "", False, False),  # a bus route, no trip id
+            ("SCHEDULED", "", "T-new", True, True),  # unknown to the static feed: kept
+            ("SCHEDULED", "new-route", "", True, True),
+            ("SCHEDULED", "new-route", "T-tram", False, False),  # the trip tells the mode
+            ("ADDED", "", "T-new", True, True),
+            ("ADDED", "bus", "T-new", False, False),
+            ("DUPLICATED", "", "T-bus", False, False),  # a copy of a bus trip
+            ("DUPLICATED", "", "T-rail", True, False),
+            ("SCHEDULED", "", "", False, False),  # nothing to match
+        ]
+        for relationship, route, trip, kept, unknown in cases:
+            with self.subTest(relationship=relationship, route=route, trip=trip):
+                entity = self._entity(relationship, route, trip)
+                self.assertEqual(entity_filter.keep(entity), kept)
+                self.assertEqual(entity_filter.unknown(entity), unknown)
+
+        # Vehicle positions: matched the same way, never without a trip
+        vehicle = gtfs_realtime_pb2.FeedEntity(id="v")
+        vehicle.vehicle.vehicle.id = "1"
+        self.assertFalse(entity_filter.keep(vehicle))
+        vehicle.vehicle.trip.trip_id = "T-new"
+        self.assertTrue(entity_filter.keep(vehicle))
+        vehicle.vehicle.trip.trip_id = "T-bus"
+        self.assertFalse(entity_filter.keep(vehicle))
+
     def test_needs_a_route_filter(self):
         with self.assertRaises(ValueError):
             FilterConfig(trip_ids=["T1"], keep_unmatched_added=True)
+
+
+class TestFilterResolution(unittest.TestCase):
+    """build_filter on small static versions: which trips count as another mode."""
+
+    def setUp(self):
+        import tempfile
+
+        from src.gtfs_rt_aggregator.fetcher import filter as filter_module
+
+        self.filter_module = filter_module
+        self.storage = MockStorageInterface()
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(__import__("shutil").rmtree, tmp)
+        patcher = patch("tempfile.gettempdir", return_value=tmp)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        filter_module._MEMO.clear()
+        self.addCleanup(filter_module._MEMO.clear)
+
+    def test_unfiltered_version_of_the_wanted_mode_only(self):
+        # A rail operator's timetable next to an all-operator realtime feed: a
+        # bus missing from it is not an unknown train
+        tables = self._tables({"RAIL": 2}, {"T1": "RAIL"})
+        entity_filter = self._filter(FilterConfig(route_types=[2]), tables)
+        self.assertFalse(entity_filter.knows_other_modes)
+        self.assertTrue(entity_filter.keep(self._entity("T1")))
+        self.assertFalse(entity_filter.keep(self._entity("B-missing")))
+        self.assertTrue(entity_filter.unknown(self._entity("B-missing")))
+
+    def test_null_route_ids(self):
+        # A broken feed's null route id matches nothing, and does not fail
+        tables = self._tables({"RAIL": 2, None: 3}, {"T1": "RAIL", "X": None}, [("B1", "BUS", 3)])
+        entity_filter = self._filter(FilterConfig(route_types=[2]), tables)
+        self.assertTrue(entity_filter.keep(self._entity("T1")))
+        self.assertTrue(entity_filter.knows_other_modes)
+        self.assertEqual(entity_filter.other_routes, {"BUS"})
+
+    def test_broken_disk_cache_resolved_again(self):
+        side = [("B1", "BUS", 3)]
+        tables = self._tables({"RAIL": 2}, {"T1": "RAIL"}, side)
+        config = FilterConfig(route_types=[2])
+        self._filter(config, tables)
+        import glob
+        import tempfile
+
+        (keys,) = glob.glob(os.path.join(tempfile.gettempdir(), "gtfs_rt_aggregator-*", "*.npz"))
+        with open(keys, "wb") as f:
+            f.write(b"cut")
+        self.filter_module._MEMO.clear()
+        entity_filter = self._filter(config, tables)
+        self.assertFalse(entity_filter.keep(self._entity("B1")))
+        # Written again
+        self.filter_module._MEMO.clear()
+        with patch.object(self.filter_module, "_resolve", side_effect=AssertionError):
+            self.assertFalse(self._filter(config, tables).keep(self._entity("B1")))
+
+    def test_added_trips_kept_by_keep_unmatched_added_not_counted_kept_unknown(self):
+        from src.gtfs_rt_aggregator.fetcher.filter import EntityFilter
+
+        entity_filter = EntityFilter(
+            {2}, {"rail"}, {"T-rail"}, known_routes={"rail"}, keep_unmatched_added=True
+        )
+        # Kept and unknown, but the runtime counts kept_unknown only for versions telling the other modes
+        self.assertEqual(entity_filter.classify(self._entity("T-new", relationship="ADDED")), (True, True))
+        self.assertFalse(entity_filter.knows_other_modes)
+
+    def _tables(self, routes, trips, side=None):
+        """routes: {route_id: type}; trips: {trip_id: route_id}; side: rows of the side table."""
+        tables = {"routes": "v/routes.parquet", "trips": "v/trips.parquet"}
+        self.storage.save_bytes(
+            _parquet(
+                pa.table(
+                    {
+                        "route_id": list(routes),
+                        "route_type": pa.array(list(routes.values()), pa.int16()),
+                    }
+                )
+            ),
+            tables["routes"],
+        )
+        self.storage.save_bytes(
+            _parquet(pa.table({"trip_id": list(trips), "route_id": list(trips.values())})),
+            tables["trips"],
+        )
+        if side is not None:
+            tables[self.filter_module.OTHER_MODES] = "v/_other_modes.parquet"
+            self.storage.save_bytes(
+                _parquet(
+                    pa.table(
+                        {
+                            "trip_id": [t for t, _, _ in side],
+                            "route_id": [r for _, r, _ in side],
+                            "route_type": pa.array([k for _, _, k in side], pa.int32()),
+                        }
+                    )
+                ),
+                tables[self.filter_module.OTHER_MODES],
+            )
+        return tables
+
+    def _filter(self, config, tables):
+        return self.filter_module.build_filter(config, self.storage, tables, "k")
+
+    @staticmethod
+    def _entity(trip_id="", route_id="", relationship="SCHEDULED"):
+        from google.transit import gtfs_realtime_pb2
+
+        entity = gtfs_realtime_pb2.FeedEntity(id="e")
+        trip = entity.trip_update.trip
+        if trip_id:
+            trip.trip_id = trip_id
+        if route_id:
+            trip.route_id = route_id
+        trip.schedule_relationship = (
+            gtfs_realtime_pb2.TripDescriptor.ScheduleRelationship.Value(relationship)
+        )
+        return entity
+
+    def test_route_ids_filter_drops_unknown_trips(self):
+        # A route_ids filter asks for its routes only, also on an unfiltered version
+        tables = self._tables({"R1": 3, "R2": 3}, {"T1": "R1", "T2": "R2"})
+        entity_filter = self._filter(FilterConfig(route_ids=["R1"]), tables)
+        self.assertFalse(entity_filter.knows_other_modes)
+        self.assertTrue(entity_filter.keep(self._entity("T1")))
+        self.assertFalse(entity_filter.keep(self._entity("T2")))
+        self.assertFalse(entity_filter.keep(self._entity("T-new")))
+        self.assertFalse(entity_filter.keep(self._entity("T-new", relationship="ADDED")))
+        with_added = self._filter(
+            FilterConfig(route_ids=["R1"], keep_unmatched_added=True), tables
+        )
+        self.assertTrue(with_added.keep(self._entity("T-new", relationship="ADDED")))
+
+    def test_unfiltered_version_drops_unknown_trips_whatever_its_routes(self):
+        # A rail operator's timetable with a few replacement buses, next to a
+        # realtime feed of every operator: the other operators' buses are unknown
+        tables = self._tables({"RAIL": 2, "BUS": 3}, {"T1": "RAIL", "B1": "BUS"})
+        entity_filter = self._filter(FilterConfig(route_types=[2]), tables)
+        self.assertFalse(entity_filter.knows_other_modes)
+        self.assertTrue(entity_filter.keep(self._entity("T1")))
+        self.assertFalse(entity_filter.keep(self._entity("B1")))
+        self.assertFalse(entity_filter.keep(self._entity("B-other-operator")))
+        self.assertTrue(entity_filter.unknown(self._entity("B-other-operator")))
+        # keep_unmatched_added applies
+        with_added = self._filter(
+            FilterConfig(route_types=[2], keep_unmatched_added=True), tables
+        )
+        self.assertTrue(with_added.keep(self._entity("T-new", relationship="ADDED")))
+
+    def test_alerts_follow_the_trip_rule(self):
+        from google.transit import gtfs_realtime_pb2
+
+        tables = self._tables({"RAIL": 2}, {"T1": "RAIL"}, [("B1", "BUS", 3)])
+        entity_filter = self._filter(FilterConfig(route_types=[2]), tables)
+
+        def alert(**fields):
+            entity = gtfs_realtime_pb2.FeedEntity(id="a")
+            selector = entity.alert.informed_entity.add()
+            for name, value in fields.items():
+                if name.startswith("trip_"):
+                    setattr(selector.trip, name[5:], value)
+                else:
+                    setattr(selector, name, value)
+            return entity
+
+        cases = [
+            ({"trip_trip_id": "T1"}, True),
+            ({"trip_trip_id": "T-new"}, True),  # unknown: kept, as trips are
+            ({"route_id": "R-new"}, True),
+            ({"trip_trip_id": "B1"}, False),  # another mode
+            ({"route_id": "BUS"}, False),
+            ({"trip_route_id": "BUS", "trip_trip_id": "T-new"}, False),
+            ({"stop_id": "S1"}, False),  # nothing to match
+            ({"route_type": 3}, False),  # another route type
+            ({"route_type": 2}, True),
+        ]
+        for fields, expected in cases:
+            with self.subTest(**fields):
+                self.assertEqual(entity_filter.keep(alert(**fields)), expected)
+        # Without the side table, as before
+        old = self._filter(FilterConfig(route_types=[2]), self._tables({"RAIL": 2}, {"T1": "RAIL"}))
+        self.assertFalse(old.keep(alert(trip_trip_id="T-new")))
+
+    def test_cache_written_by_many_threads(self):
+        import glob
+        import tempfile
+        import threading
+
+        tables = self._tables({"RAIL": 2}, {"T1": "RAIL"}, [("B1", "BUS", 3)])
+        config = FilterConfig(route_types=[2])
+        errors, filters = [], []
+
+        def build():
+            try:
+                filters.append(self.filter_module.build_filter(config, self.storage, tables, "k"))
+            except Exception as e:  # pragma: no cover
+                errors.append(e)
+
+        threads = [threading.Thread(target=build) for _ in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(errors, [])
+        folder = glob.glob(os.path.join(tempfile.gettempdir(), "gtfs_rt_aggregator-*"))[0]
+        self.assertEqual([f for f in os.listdir(folder) if f.endswith(".tmp")], [])
+        self.filter_module._MEMO.clear()
+        with patch.object(self.filter_module, "_resolve", side_effect=AssertionError):
+            self.assertFalse(self._filter(config, tables).keep(self._entity("B1")))
+
+    def test_trips_of_a_missing_route_are_unknown(self):
+        # Their route is in no routes table: unknown in a filtered version (inner join)
+        # and in an unfiltered one alike
+        tables = self._tables({"RAIL": 2, "BUS": 3}, {"T1": "RAIL", "X1": "GONE"}, [])
+        entity_filter = self._filter(FilterConfig(route_types=[2]), tables)
+        self.assertTrue(entity_filter.keep(self._entity("X1")))
+        self.assertTrue(entity_filter.unknown(self._entity("X1")))
+
+    def test_side_rows_the_filter_asks_for_are_kept(self):
+        side = [("B1", "BUS1", 3), ("B2", "BUS2", 3), (None, "TRAM", 0), ("F1", "FERRY", 4)]
+        tables = self._tables({"RAIL": 2}, {"T1": "RAIL"}, side)
+        # A bus route asked by route_ids, matched by a trip id only
+        by_route = self._filter(FilterConfig(route_types=[2], route_ids=["BUS1"]), tables)
+        self.assertTrue(by_route.keep(self._entity("B1")))
+        self.assertFalse(by_route.unknown(self._entity("B1")))
+        self.assertFalse(by_route.keep(self._entity("B2")))
+        self.assertFalse(by_route.keep(self._entity("F1")))
+        # Alerts naming a side-table trip by its id only
+        from google.transit import gtfs_realtime_pb2
+
+        for trip_id, expected in (("B1", True), ("F1", False)):
+            alert = gtfs_realtime_pb2.FeedEntity(id="a")
+            alert.alert.informed_entity.add().trip.trip_id = trip_id
+            self.assertEqual(by_route.keep(alert), expected)
+        # Route types wider than the static ones
+        by_type = self._filter(FilterConfig(route_types=[2, 3]), tables)
+        for trip_id in ("B1", "B2"):
+            self.assertTrue(by_type.keep(self._entity(trip_id)))
+        self.assertTrue(by_type.keep(self._entity(route_id="BUS2")))
+        self.assertFalse(by_type.keep(self._entity("F1")))
+        self.assertFalse(by_type.keep(self._entity(route_id="TRAM")))
+        self.assertTrue(by_type.keep(self._entity("T-new")))
+        # The same from the disk cache of another worker
+        self.filter_module._MEMO.clear()
+        with patch.object(self.filter_module, "_resolve", side_effect=AssertionError):
+            cached = self._filter(FilterConfig(route_types=[2, 3]), tables)
+        self.assertTrue(cached.keep(self._entity("B1")))
+        self.assertFalse(cached.keep(self._entity("F1")))
+
+    def test_kept_route_ids_not_counted_unknown(self):
+        from src.gtfs_rt_aggregator.fetcher.filter import EntityFilter
+
+        # A version without the side table: a kept route_ids route is not unknown
+        entity_filter = EntityFilter({2}, {"rail", "asked"}, set(), known_routes={"rail"})
+        entity = self._entity("T-x", "asked")
+        self.assertTrue(entity_filter.keep(entity))
+        self.assertFalse(entity_filter.unknown(entity))
 
 
 # Integers MessageToDict writes as strings (64-bit)

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "gtfs_rt_aggregator"
-version = "0.12.6"
+version = "0.13.0"
 description = "GTFS-RT Fetcher and Aggregator to Parquet format"
 readme = "README.md"
 authors = [
@@ -19,6 +19,7 @@ classifiers = [
 requires-python = ">=3.11"
 dependencies = [
     "pandas>=2.0.0",
+    "numpy>=1.24",
     "pyarrow>=14.0.0",
     "protobuf>=4.25.0",
     "pytz>=2023.3",

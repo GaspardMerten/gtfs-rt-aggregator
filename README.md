@@ -158,16 +158,36 @@ TripUpdate rows are told apart by entity id, trip id and start date (some feeds 
 - `route_ids`: route ids
 - `trip_ids`: trip ids
 - `keep_unmatched_added`: also keep ADDED, NEW and DUPLICATED trips whose route is not in the static feed (default
-  `false`, needs `route_types` or `route_ids`)
+  `false`, needs `route_types` or `route_ids`). It applies wherever unknown trips are dropped (see below): a filter
+  by `route_ids` alone, a static version stored whole (no static `route_types`), and a version filtered before 0.13.0
+  that has no `other_modes` yet. A `route_types` filter on a version with `other_modes` keeps unknown trips anyway
 
 `route_types` and `route_ids` are resolved through the trips and routes of the provider's latest static version, so the
 provider needs a `[[providers.static]]` feed. Until a static version can be read (the first one is being downloaded,
 or storage is down), fetches wait in the spool, however long (`spool_max_gb` bounds it), never stored unfiltered, with a
-warning every 30 minutes. The status file counts the entities each fetch dropped (`dropped_count`) and those whose
-trip the static version does not know (`dropped_unknown`, also per hour in the health file and logged once per
-window): many mean the static version is behind the realtime feed. Trip
-updates and vehicle positions match by trip or route (vehicles without a trip are dropped). Alerts match by any
-informed route, route type or trip. Other entity types are always kept.
+warning every 30 minutes. Trip updates and vehicle positions match by trip or route (vehicles without a trip are
+dropped). Alerts match by any informed route, route type or trip. Other entity types are always kept.
+
+Unknown trips (a trip and route the static version does not know: a timetable not stored yet, an extra train) are
+kept only by a `route_types` filter on a static version stored with the same kind of `route_types` filter since
+0.13.0. Such a version lists the trips and routes it dropped (`other_modes`, see below): it is the same mixed feed as
+the realtime one, so it knows every trip of the other modes. Then only trip updates, vehicles and alerts the static
+feed gives another mode (by their trip or their route) are dropped. An unknown trip may also be a bus the operator
+added: it is kept too, but there are few in practice. A trip in `other_modes` whose route the filter asks for
+(`route_ids`, or `route_types` wider than the static ones) is kept.
+
+In every other case unknown trips are dropped, as they cannot be told from other modes (`keep_unmatched_added` still
+applies):
+
+- a static version stored whole: it may be one operator's timetable, perhaps with a few replacement buses, next to
+  a realtime feed of every operator;
+- a filter by `route_ids` alone: it keeps only its routes;
+- a version filtered before 0.13.0. Checks read its file again without the ETag until the server sends the stored
+  content, which adds `other_modes` to that same version, or until a new version is stored, which has it.
+
+The status file counts the entities each fetch dropped (`dropped_count`), and those whose trip the static version does
+not know: kept (`kept_unknown`, static versions telling the other modes) or dropped (`dropped_unknown`), also per hour
+in the health file and logged once per window: many mean the static version is behind the realtime feed.
 
 ### `[[providers.static]]`
 
@@ -187,7 +207,7 @@ not change.
 | `headers` | none | HTTP headers. |
 | `retries` | `3` | As for realtime feeds. |
 | `reuse_unchanged_tables` | `false` | Point to the previous version's file for tables that did not change, instead of storing them again. `manifest.json` then gives each table's path. |
-| `route_types` | none | Keep only the routes of these GTFS route types, e.g. `[2, "100-199"]` for rail, and the trips, stop times, frequencies, services and shapes they use (stops are all kept). For a mixed-mode feed whose realtime is filtered to the same route types. |
+| `route_types` | none | Keep only the routes of these GTFS route types, e.g. `[2, "100-199"]` for rail, and the trips, stop times, frequencies, services and shapes they use (stops are all kept). For a mixed-mode feed whose realtime is filtered to the same route types. The trips and routes dropped are listed in `_other_modes.parquet` (`trip_id`, `route_id`, `route_type`; no trip id for a route without trips, manifest key `other_modes`), so the realtime filter drops only trips known to be of another mode. |
 | `min_change` | `0` | Store a changed feed only if at least this share of the trips running in the next 7 days was added, removed or changed (route, running days or stop times), e.g. `0.01`. Renumbered services do not count; renamed trips do, since realtime feeds use the new names. A skipped feed is remembered in `latest.json` (`checked_files`, `checked_change`) so it is not converted again. |
 | `max_days` | none | With `min_change`: store a changed feed anyway once the stored version is this many days old (the file is then read again, without the validators). A change below `min_change` is also stored when the stored version ends within 14 days and the new one runs further. |
 
@@ -354,7 +374,7 @@ before and after the filter. URLs are stored without their query string.
 
 Each feed's health file counts, per local hour, the fetches read (`ok`), those whose entities changed (`changed`) and
 those that failed (`failed`): an hour with reads but no change is a frozen feed, an hour without reads an outage.
-Filtered feeds also count `dropped_unknown` (see Filter). Each run of the process writes its own file: add them up for
+Filtered feeds also count `kept_unknown` and `dropped_unknown` (see Filter). Each run of the process writes its own file: add them up for
 a day.
 
 At `INFO`, the pipeline logs one summary line every 10 minutes (fetches, changes, failures, skips, spool), plus

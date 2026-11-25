@@ -656,12 +656,14 @@ wheels = [
 
 [[package]]
 name = "gtfs-rt-aggregator"
-version = "0.12.6"
+version = "0.13.0"
 source = { editable = "." }
 dependencies = [
     { name = "google-cloud-storage" },
     { name = "gtfs-realtime-bindings" },
     { name = "minio" },
+    { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
+    { name = "numpy", version = "2.5.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
     { name = "pandas" },
     { name = "protobuf" },
     { name = "pyarrow" },
@@ -690,6 +692,7 @@ requires-dist = [
     { name = "gtfs-parquet", marker = "extra == 'static'", specifier = ">=0.7.2" },
     { name = "gtfs-realtime-bindings" },
     { name = "minio" },
+    { name = "numpy", specifier = ">=1.24" },
     { name = "pandas", specifier = ">=2.0.0" },
     { name = "protobuf", specifier = ">=4.25.0" },
     { name = "pyarrow", specifier = ">=14.0.0" },

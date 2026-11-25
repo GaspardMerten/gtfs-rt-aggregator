@@ -18,6 +18,7 @@ import pytz
 import requests
 
 from ..config.models import GtfsRtConfig
+from ..fetcher.filter import OTHER_MODES
 from ..storage.base import StorageInterface, storage_for
 from ..utils.file_time import format_file_time
 from ..utils.http import (
@@ -152,6 +153,35 @@ def manifest_tables(manifest: dict, base: str) -> Dict[str, str]:
     return tables
 
 
+def filter_tables(manifest: dict, base: str) -> Dict[str, str]:
+    """
+    Tables of a version as the realtime filter reads them (build_filter): the
+    manifest's tables, and under OTHER_MODES the side table of the trips and
+    routes of the other modes (a version filtered by route_types since
+    0.13.0). Without it (a version stored whole, or filtered before 0.13.0)
+    the filter drops unknown trips, as before.
+    """
+    tables = dict(manifest_tables(manifest, base))
+    if manifest.get("other_modes"):
+        tables[OTHER_MODES] = manifest["other_modes"]
+    return tables
+
+
+def _lacks_other_modes(manifest: Optional[dict]) -> bool:
+    """A version filtered by route_types stored before the side table of the
+    other modes (0.13.0), not tried yet: checks read the file again (no
+    validators) until the server sends the stored content, which adds the
+    side table to the same version, or a new version is stored (it has one).
+    Tried once per version (other_modes_attempted: the stored content was
+    converted, whether that worked or failed)."""
+    return bool(
+        manifest
+        and manifest.get("route_types")
+        and not manifest.get("other_modes")
+        and manifest.get("other_modes_attempted") != manifest.get("version")
+    )
+
+
 class StaticService:
     """Service storing a new version of each GTFS static feed when it changes.
 
@@ -160,6 +190,11 @@ class StaticService:
         nl/static/2026-09-28_01-00-00Z/stops.parquet  (one file per table)
         nl/static/2026-09-28_01-00-00Z/manifest.json
         nl/static/latest.json                         (copy of the last manifest)
+
+    With route_types, a version also holds _other_modes.parquet (manifest key
+    other_modes): trip_id, route_id and route_type of the trips and routes it
+    dropped (route_id only, null trip_id, for routes without trips), so the
+    realtime filter tells a trip of another mode from one it does not know.
     """
 
     def __init__(self, config: GtfsRtConfig, storages: Dict[str, StorageInterface]):
@@ -304,6 +339,8 @@ class StaticService:
             and not pending
             and strip_query(latest.get("url")) == saved_url
             and latest.get("route_types", []) == route_types
+            # Read once more to add the side table of the other modes (see process)
+            and not (route_types and _lacks_other_modes(latest))
         ):
             if latest.get("etag"):
                 request_headers["If-None-Match"] = latest["etag"]
@@ -366,6 +403,49 @@ class StaticService:
             raise ValueError(f"No {kind} file found in {saved_url}")
 
         route_types = sorted(static.route_type_set()) if static else []
+        work_dir = os.path.join(os.path.dirname(zip_path), "parquet")
+        # Trips and routes of the other modes, written by _keep_route_types
+        other_modes = (
+            os.path.join(os.path.dirname(zip_path), "_other_modes.parquet")
+            if route_types
+            else None
+        )
+
+        def convert() -> Tuple[Dict[str, str], set]:
+            converted = self._convert(zip_path, work_dir, netex)
+            if not converted:
+                raise ValueError(f"No GTFS table could be parsed from {saved_url}")
+            filtered = (
+                self._keep_route_types(converted, route_types, saved_url, other_modes)
+                if route_types
+                else set()
+            )
+            return converted, filtered
+
+        def add_other_modes() -> bool:
+            """
+            A file not stored as a new version: add the side table the latest
+            version lacks (see _lacks_other_modes), only from the very content
+            of that version (an older or newer file would describe other
+            trips; another copy served meanwhile: tried again at the next
+            check). Returns whether latest changed (the caller saves it).
+            """
+            if not (
+                _lacks_other_modes(latest)
+                and latest.get("route_types") == route_types
+                and files == latest.get("files")
+            ):
+                return False
+            try:
+                convert()
+                self._add_other_modes(storage, base, latest, other_modes, logger)
+            except Exception as e:
+                # Never fails the check: the next version carries the side table
+                logger.warning(f"{base}: could not add the trips of the other modes: {e}")
+            # Tried once, worked or not: download sends its validators again
+            latest["other_modes_attempted"] = latest["version"]
+            return True
+
         # A publisher serving two copies of its file (es-renfe-cercanias: two servers, one stale, the
         # 24 Sep and 1 Oct files in turn) must not make versions flip between them: a file older than
         # the newest stored one is not stored, nor the content of an earlier version
@@ -376,6 +456,8 @@ class StaticService:
                 f"{base}: the server sent a file of {last_modified}, older than the newest "
                 f"stored ({newest}): not stored"
             )
+            if add_other_modes():
+                self._save_json(storage, f"{base}/latest.json", latest)
             return
         same_filter = latest is not None and latest.get("route_types", []) == route_types
         if same_filter and files != latest.get("files") and _files_digest(files) in latest.get(
@@ -385,6 +467,8 @@ class StaticService:
                 f"{base}: the server sent the content of a version older than "
                 f"{latest.get('version')} (Last-Modified {last_modified}): not stored"
             )
+            if add_other_modes():
+                self._save_json(storage, f"{base}/latest.json", latest)
             return
         expired = bool(
             latest
@@ -397,13 +481,15 @@ class StaticService:
         # checked_files: a later check found changes too small to store
         # (min_change), which max_days eventually stores
         # A new route_types stores the feed again, filtered the new way
+
         if latest and latest.get("route_types", []) == route_types and (
             files == latest.get("files")
             or (files == latest.get("checked_files") and not expired)
         ):
             logger.info(f"{base}: unchanged since {latest.get('version')}")
+            upgraded = add_other_modes()
             # Keep the validators fresh so the next check can get a 304
-            if (etag, last_modified, saved_url) != (
+            if upgraded or (etag, last_modified, saved_url) != (
                 latest.get("etag"),
                 latest.get("last_modified"),
                 latest.get("url"),
@@ -412,16 +498,7 @@ class StaticService:
                 self._save_json(storage, f"{base}/latest.json", latest)
             return
 
-        work_dir = os.path.join(os.path.dirname(zip_path), "parquet")
-        converted = self._convert(zip_path, work_dir, netex)
-        if not converted:
-            raise ValueError(f"No GTFS table could be parsed from {saved_url}")
-
-        filtered = (
-            self._keep_route_types(converted, route_types, saved_url)
-            if route_types
-            else set()
-        )
+        converted, filtered = convert()
         signatures = None
         if static and static.min_change:
             signatures = os.path.join(os.path.dirname(zip_path), "trip_signatures.parquet")
@@ -439,6 +516,8 @@ class StaticService:
                     f"{base}: {share:.1%} of trips changed since {latest.get('version')}, "
                     f"below min_change {static.min_change:.1%}: not stored"
                 )
+                # Another content than the stored one: no side table from it, the
+                # next checks read the file again (see _lacks_other_modes)
                 # Not "files": reuse_unchanged_tables compares with what is stored
                 latest.update(
                     url=saved_url,
@@ -484,6 +563,20 @@ class StaticService:
             storage.save_file(str(local_path), path)
             tables[table_name] = path
 
+        other_modes_digest = _file_digest(other_modes) if other_modes else None
+        if other_modes is None:
+            other_modes_path = None
+        elif (
+            reuse_unchanged_tables
+            and same_filter
+            and latest.get("other_modes")
+            and other_modes_digest == latest.get("other_modes_digest")
+        ):
+            other_modes_path = latest["other_modes"]
+        else:
+            other_modes_path = f"{base}/{version}/_other_modes.parquet"
+            storage.save_file(other_modes, other_modes_path)
+
         manifest = {
             "version": version,
             "fetched_at": fetch_time.isoformat(),
@@ -498,6 +591,10 @@ class StaticService:
             "table_digests": digests,
             "route_types": route_types,
         }
+        if other_modes_path:
+            # Trips and routes route_types dropped (see the class docstring)
+            manifest["other_modes"] = other_modes_path
+            manifest["other_modes_digest"] = other_modes_digest
         if latest and same_filter:
             # Content of the earlier versions (most recent first), never stored again
             manifest["previous_files"] = (
@@ -625,12 +722,38 @@ class StaticService:
             None,
         )
 
+    def _add_other_modes(self, storage, base: str, latest: dict, local_path: str, logger):
+        """
+        Add the side table of the other modes to the latest version, stored
+        before 0.13.0 without it (latest.json is saved by the caller), from
+        the file just read, whose content is the stored version's.
+        """
+        version = latest["version"]
+        path = f"{base}/{version}/_other_modes.parquet"
+        storage.save_file(local_path, path)
+        latest.update(other_modes=path, other_modes_digest=_file_digest(local_path))
+        manifest_path = f"{base}/{version}/manifest.json"
+        try:
+            manifest = json.loads(storage.read_bytes(manifest_path))
+        except Exception as e:
+            logger.warning(f"{base}: could not read {manifest_path}: {e}")
+        else:
+            manifest.update(other_modes=path, other_modes_digest=latest["other_modes_digest"])
+            self._save_json(storage, manifest_path, manifest)
+        logger.info(f"{base}: added the trips of the other modes to {version}")
+
     @staticmethod
-    def _keep_route_types(converted: Dict[str, str], route_types, url) -> set:
+    def _keep_route_types(
+        converted: Dict[str, str], route_types, url, other_modes: Optional[str] = None
+    ) -> set:
         """
         Keep only the routes of route_types in the converted tables, and the
         trips, stop times, frequencies, services and shapes they use. Stops are
         all kept. Returns the names of the tables that were filtered.
+
+        @param other_modes: Where to write the trips and routes dropped:
+            trip_id, route_id, route_type (trip_id null for a route without
+            trips), read by the realtime filter (see filter_tables)
         """
         import polars as pl
 
@@ -642,14 +765,37 @@ class StaticService:
             frame.write_parquet(part, compression="zstd", compression_level=9)
             os.replace(part, converted[name])
 
-        routes = pl.read_parquet(converted["routes"])
-        routes = routes.filter(pl.col("route_type").cast(pl.Int32).is_in(route_types))
+        all_routes = pl.read_parquet(converted["routes"])
+        kept = pl.col("route_type").cast(pl.Int32).is_in(route_types)
+        routes = all_routes.filter(kept)
         if routes.is_empty():
             raise ValueError(f"No route of route_types {route_types} in {url}")
+        all_trips = pl.read_parquet(converted["trips"])
+        trips = all_trips.filter(pl.col("route_id").is_in(routes["route_id"].implode()))
+        if other_modes:
+            # A route without a type is not kept either: another mode for the filter
+            others = all_routes.filter(~kept.fill_null(False)).select(
+                pl.col("route_id").cast(pl.String), pl.col("route_type").cast(pl.Int32)
+            )
+            # Inner join: a trip whose route is missing from routes is not known as another mode
+            other_trips = (
+                all_trips.select(
+                    pl.col("trip_id").cast(pl.String), pl.col("route_id").cast(pl.String)
+                )
+                .join(others, on="route_id", how="inner")
+            )
+            without_trips = others.join(other_trips, on="route_id", how="anti").select(
+                pl.lit(None, pl.String).alias("trip_id"), "route_id", "route_type"
+            )
+            # Sorted: the same content gives the same file (digest, reuse_unchanged_tables)
+            pl.concat([other_trips, without_trips]).sort(
+                ["route_id", "trip_id"], nulls_last=True
+            ).write_parquet(
+                other_modes, compression="zstd", compression_level=9
+            )
+            del others, other_trips, without_trips
+        del all_trips, all_routes
         rewrite("routes", routes)
-        trips = pl.read_parquet(converted["trips"]).filter(
-            pl.col("route_id").is_in(routes["route_id"].implode())
-        )
         rewrite("trips", trips)
         keys = {
             "stop_times": "trip_id",
